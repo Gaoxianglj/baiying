@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "长期记忆 AI 伙伴：本地记忆核心 + 可替换的模型与身体"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2",
+    "python-dotenv>=1",
+]
 classifiers = ["Private :: Do Not Upload"]
 
 [project.scripts]

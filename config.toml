@@ -1,0 +1,20 @@
+# 非密钥的默认配置，进仓库。
+# 本机覆盖写在 config.local.toml（不进仓库）；API key 只能放 .env。
+
+[paths]
+# 相对路径以项目根目录为基准；记忆文件夹在 <data_dir>/memory
+data_dir = "data"
+
+[persona]
+name = "白璎"
+
+[models.subscription]
+# GPT 订阅，经 Codex app-server 调用
+enabled = true
+codex_command = "codex"
+
+[models.fallback]
+# 兜底 API（OpenAI 兼容接口），订阅的 5 小时额度耗尽后使用
+base_url = "https://api.deepseek.com"
+# model = ""  # 以 DeepSeek 文档当前列出的模型名为准，可写在 config.local.toml 或 .env
+monthly_budget_usd = 20

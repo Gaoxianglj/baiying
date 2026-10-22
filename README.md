@@ -28,9 +28,12 @@ data/        运行时记忆数据（不进仓库）
 
 ```bash
 uv sync
-uv run companion --version
+uv run companion config    # 查看生效配置（密钥打码）
+uv run companion init      # 创建记忆文件夹 data/memory/
 uv run pytest
 uv run ruff check .
 ```
 
-本机配置：复制 `.env.example` 为 `.env` 后填写。`.env` 不进仓库。
+## 配置
+
+优先级从低到高：`config.toml`（进仓库）< `config.local.toml`（本机）< `.env`（本机）< 环境变量。API key 只能放 `.env` 或环境变量；复制 `.env.example` 为 `.env` 后填写。
