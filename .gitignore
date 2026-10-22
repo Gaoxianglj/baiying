@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# 密钥与本机配置
+.env
+.env.*
+!.env.example
+config.local.toml
+
+# 运行时数据：记忆文件夹（白璎的“自我”）只存在本机，不进仓库
+data/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
