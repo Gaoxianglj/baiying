@@ -7,8 +7,13 @@ from companion.memory.layout import (
     init_memory,
     load_manifest,
 )
+from companion.memory.people import SELF_ID, PeopleError, PeopleRegistry, Person
 
 __all__ = [
+    "SELF_ID",
+    "PeopleError",
+    "PeopleRegistry",
+    "Person",
     "Actor",
     "Event",
     "EventLog",

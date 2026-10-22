@@ -12,7 +12,7 @@ def make_event(ts: datetime, content: str = "你好") -> Event:
         body="qq",
         channel="group:42",
         kind="message",
-        actor=Actor(platform_id="10001", display_name="小明"),
+        actor=Actor(platform="qq", platform_id="10001", display_name="小明"),
         content=content,
     )
 
@@ -67,7 +67,7 @@ def test_unknown_field_is_rejected():
                 "body": "qq",
                 "channel": "c",
                 "kind": "message",
-                "actor": {"platform_id": "1"},
+                "actor": {"platform": "qq", "platform_id": "1"},
                 "content": "x",
                 "mood": "?",
             }

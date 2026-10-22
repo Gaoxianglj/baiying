@@ -24,8 +24,9 @@ class Actor(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    platform_id: str  # QQ 号、MC 玩家名；伙伴自己为 "self"
-    person_id: str | None = None
+    platform: str  # 账号所属平台：qq / minecraft / cli；伙伴自己为 "self"
+    platform_id: str  # 平台内的账号：QQ 号、MC 玩家名；伙伴自己为 "self"
+    person_id: str | None = None  # 写入时解析出的人，可能日后被 merged_into 指向别人
     display_name: str | None = None
 
 

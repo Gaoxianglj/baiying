@@ -1,11 +1,3 @@
----
-person_id: $person_id
-names: [$display_name]
-accounts:
-  qq: []
-  minecraft: []
-pinned: []
----
 
 # $display_name
 
