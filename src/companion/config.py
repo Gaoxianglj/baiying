@@ -71,6 +71,8 @@ class FallbackConfig(_Section):
     price_input_per_m: float = 0.3
     price_output_per_m: float = 1.2
     timeout_seconds: float = 120.0
+    # 原样并入请求体的额外字段；DeepSeek 默认开思考模式，聊天要快，默认关掉
+    extra_body: dict[str, Any] = {"thinking": {"type": "disabled"}}
 
 
 class EmbeddingConfig(_Section):
@@ -94,9 +96,18 @@ class RetrievalConfig(_Section):
     min_relevance: float = 0.0
 
 
+class LocalChatConfig(_Section):
+    """本地对话模型（预留，阶段 3 评估）：订阅和兜底 API 都不可用时的最后一道兜底。"""
+
+    enabled: bool = False
+    base_url: str = "http://localhost:11434/v1"
+    model: str | None = None
+
+
 class ModelsConfig(_Section):
     subscription: SubscriptionConfig = SubscriptionConfig()
     fallback: FallbackConfig = FallbackConfig()
+    local: LocalChatConfig = LocalChatConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
 
 

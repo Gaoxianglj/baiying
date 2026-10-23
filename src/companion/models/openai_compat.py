@@ -44,10 +44,12 @@ class OpenAICompatClient:
         model: str | None,
         api_key: str | None = None,
         timeout: float = 120.0,
+        extra_body: dict[str, Any] | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.name = name
         self.model = model
+        self.extra_body = extra_body or {}
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport
@@ -67,6 +69,7 @@ class OpenAICompatClient:
         if not self.model:
             raise ModelError(f"{self.name} 没有配置模型名")
         body: dict[str, Any] = {
+            **self.extra_body,
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
