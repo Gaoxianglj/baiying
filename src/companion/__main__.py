@@ -53,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
     extract.add_argument("--force", action="store_true", help="不等空闲，立刻整理所有未整理的对话")
 
     sub.add_parser("status", help="模型后端状态、本月花费与记忆数量")
+    sub.add_parser("qq", help="连接 NapCat，在 QQ 上运行")
+    sub.add_parser("sleep", help="立刻做一次“睡眠”：整理、遗忘、合并、反思、写日记")
 
     args = parser.parse_args(argv)
     if args.command is None:
@@ -82,6 +84,24 @@ def main(argv: list[str] | None = None) -> int:
                 done = c.extract_pending(force=args.force)
                 facts = sum(len(x.facts) for x in done)
                 print(f"整理了 {len(done)} 段会话，{facts} 条新事实")
+        elif args.command == "qq":
+            from companion.bodies.qq.runner import run_qq
+
+            return run_qq(config)
+        elif args.command == "sleep":
+            from companion.core.companion import Companion
+            from companion.core.sleep import Sleeper
+
+            with Companion(config) as c:
+                report = Sleeper(c).run()
+            print(
+                f"整理 {report.extracted} 段会话；淡忘 {report.faded}、沉睡 {report.dormant}；"
+                f"合并 {report.merged} 条重复事实；更新了 {len(report.people_reflected)} 个人的档案"
+                + ("、自我认知" if report.identity_reflected else "")
+                + (f"；日记：{report.journal}" if report.journal else "")
+            )
+            for err in report.errors:
+                print(f"  出错：{err}")
         elif args.command == "status":
             from companion.core.companion import Companion
 

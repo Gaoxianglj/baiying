@@ -496,6 +496,60 @@ class MemoryIndex:
             raise KeyError(memory_id)
         return str(row[0])
 
+    def delete(self, kind: MemoryKind, memory_id: str) -> list[str]:
+        """彻底删除一条记忆（含向量与全文索引），返回它的出处事件 id。"""
+        table = _table(kind)
+        with self._tx() as c:
+            row = c.execute(f"SELECT event_ids FROM {table} WHERE id = ?", (memory_id,)).fetchone()
+            if row is None:
+                raise KeyError(memory_id)
+            if kind == "fact":
+                # 被它取代的旧事实恢复为“仍有效”之外的状态没有意义；只断开引用
+                c.execute(
+                    "UPDATE facts SET invalidated_by = NULL WHERE invalidated_by = ?", (memory_id,)
+                )
+            c.execute(f"DELETE FROM {table} WHERE id = ?", (memory_id,))
+            c.execute("DELETE FROM vectors WHERE kind = ? AND memory_id = ?", (kind, memory_id))
+            c.execute("DELETE FROM memory_fts WHERE kind = ? AND memory_id = ?", (kind, memory_id))
+        return list(json.loads(row[0]))
+
+    def memories_from_events(self, event_ids: set[str]) -> list[tuple[MemoryKind, str]]:
+        """出处里含有这些事件的记忆。"""
+        out: list[tuple[MemoryKind, str]] = []
+        for kind in ("episode", "fact"):
+            for mid, raw in self._conn.execute(f"SELECT id, event_ids FROM {_table(kind)}"):
+                if event_ids & set(json.loads(raw)):
+                    out.append((kind, mid))  # type: ignore[arg-type]
+        return out
+
+    def episodes_created_since(self, since: datetime) -> list[Episode]:
+        rows = self._conn.execute(
+            "SELECT * FROM episodes WHERE created_at >= ? ORDER BY started_at", (_iso(since),)
+        ).fetchall()
+        return [self._episode(r) for r in rows]
+
+    def facts_created_since(self, since: datetime) -> list[Fact]:
+        rows = self._conn.execute(
+            "SELECT * FROM facts WHERE created_at >= ? ORDER BY valid_from", (_iso(since),)
+        ).fetchall()
+        return [_fact(r) for r in rows]
+
+    def episode_ids(self, states: tuple[EpisodeState, ...]) -> list[str]:
+        marks = ",".join("?" * len(states))
+        rows = self._conn.execute(f"SELECT id FROM episodes WHERE state IN ({marks})", states)
+        return [r[0] for r in rows]
+
+    def supersede(self, old_id: str, new_id: str, at: datetime) -> None:
+        """把仍有效的旧事实标记为被新事实取代（合并重复事实时用）。"""
+        with self._tx() as c:
+            updated = c.execute(
+                "UPDATE facts SET valid_to = ?, invalidated_by = ? "
+                "WHERE id = ? AND valid_to IS NULL",
+                (_iso(at), new_id, old_id),
+            ).rowcount
+        if not updated:
+            raise MemoryIndexError(f"要取代的事实不存在或已失效：{old_id}")
+
     def counts(self) -> dict[str, int]:
         c = self._conn
         return {

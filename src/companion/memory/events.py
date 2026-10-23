@@ -62,6 +62,31 @@ class EventLog:
                 f.flush()
         return path
 
+    def redact(self, event_ids: set[str]) -> int:
+        """从日志里彻底删除这些事件（用于“忘掉这件事”），返回删除条数。
+
+        这是唯一会改写日志的操作：逐个月份文件重写，先写临时文件再原子替换。
+        """
+        removed = 0
+        with self._lock:
+            for path in sorted(self._dir.glob("*.jsonl")):
+                lines = path.read_text("utf-8").splitlines(keepends=True)
+                kept = []
+                for line in lines:
+                    try:
+                        hit = Event.model_validate_json(line).id in event_ids
+                    except ValidationError:
+                        hit = False
+                    if hit:
+                        removed += 1
+                    else:
+                        kept.append(line)
+                if len(kept) != len(lines):
+                    tmp = path.with_suffix(".jsonl.tmp")
+                    tmp.write_text("".join(kept), encoding="utf-8", newline="")
+                    tmp.replace(path)
+        return removed
+
     def iter_events(self, since: datetime | None = None) -> Iterator[Event]:
         """按文件（月份）顺序读出事件。损坏的行（如写到一半断电）记录警告后跳过。"""
         for path in sorted(self._dir.glob("*.jsonl")):

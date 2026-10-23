@@ -13,7 +13,7 @@ from companion.core.extract import Extraction, SessionExtractor, ended, split_se
 from companion.core.ingest import Ingest
 from companion.core.retrieval import Embedder, HybridRetriever, sync_vectors
 from companion.memory.events import Event
-from companion.memory.index import MemoryIndex
+from companion.memory.index import Fact, MemoryIndex, MemoryKind
 from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
@@ -107,9 +107,18 @@ class Companion:
             display_name=display_name,
             ts=now,
         )
+        return self.respond(incoming, now=now)
+
+    def respond(self, incoming: Event, now: datetime | None = None) -> Reply:
+        """对一条已经记下的消息作出回复。"""
         assert incoming.actor.person_id is not None
+        body, channel = incoming.body, incoming.channel
         bundle = self.context.build(
-            person_id=incoming.actor.person_id, body=body, channel=channel, query=text, now=now
+            person_id=incoming.actor.person_id,
+            body=body,
+            channel=channel,
+            query=incoming.content,
+            now=now,
         )
         result = self.gateway.chat(bundle.messages, purpose="chat")
         self.context.mark_recalled(bundle, now=now)
@@ -125,6 +134,84 @@ class Companion:
             },
         )
         return Reply(result.text, result, bundle, event)
+
+    def observe(
+        self,
+        *,
+        body: str,
+        channel: str,
+        account: str,
+        text: str,
+        display_name: str | None = None,
+        platform: str | None = None,
+        now: datetime | None = None,
+        meta: dict[str, object] | None = None,
+    ) -> Event:
+        """只记下来、不回复（如群里别人之间的聊天）。"""
+        return self.ingest.record(
+            body=body,
+            channel=channel,
+            kind="message",
+            account=account,
+            content=text,
+            platform=platform,
+            display_name=display_name,
+            ts=now,
+            meta=dict(meta or {}),
+        )
+
+    # ---- “记住这个”与“忘掉这件事” ----
+
+    def remember(self, source: Event, note: str, now: datetime | None = None) -> Fact:
+        """立刻记下并钉住一条内容，不等会话结束、也不参与遗忘。"""
+        assert source.actor.person_id is not None
+        pid = self.people.canonical(source.actor.person_id)
+        who = self._display(pid)
+        fact = Fact(
+            subject=pid,
+            predicate="asked_to_remember",
+            statement=f"{who}让我记住：{note}",
+            valid_from=source.ts,
+            event_ids=[source.id],
+            confidence=1.0,
+            importance=1.0,
+            pinned=True,
+        )
+        self.index.add_fact(fact, now=now)
+        self.sync_vectors()
+        return fact
+
+    def forget_candidates(
+        self, person_id: str, keyword: str, limit: int = 5
+    ) -> list[tuple[MemoryKind, str, str]]:
+        """和某人有关、与关键词相关的记忆，供 ta 挑选要忘掉的。"""
+        pid = self.people.canonical(person_id)
+        out: list[tuple[MemoryKind, str, str]] = []
+        for c in self.retriever.search(keyword, person_id=pid, limit=limit * 2):
+            text = self.index.text_of(c.kind, c.memory_id)
+            if c.in_text or (c.cosine is not None and c.cosine >= self.retriever.min_cosine):
+                out.append((c.kind, c.memory_id, text))
+            if len(out) >= limit:
+                break
+        return out
+
+    def forget(self, items: list[tuple[MemoryKind, str]]) -> tuple[int, int]:
+        """彻底删除记忆及其出处消息；出处消息还支撑着的其他记忆一并删除。返回（记忆数，消息数）。"""
+        to_delete = set(items)
+        event_ids: set[str] = set()
+        for kind, mid in items:
+            event_ids |= set(self.index.delete(kind, mid))
+        for kind, mid in self.index.memories_from_events(event_ids):
+            if (kind, mid) not in to_delete:
+                to_delete.add((kind, mid))
+                event_ids |= set(self.index.delete(kind, mid))
+        removed = self.log.redact(event_ids)
+        commit_memory(self.layout, self.name, f"按要求忘掉了 {len(to_delete)} 条记忆")
+        return len(to_delete), removed
+
+    def _display(self, person_id: str) -> str:
+        person = self.people.get(person_id)
+        return person.names[0] if person and person.names else person_id
 
     # ---- 整理记忆 ----
 

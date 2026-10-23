@@ -29,7 +29,10 @@ from typing import Any
 FORMAT_NAME = "companion-memory"
 FORMAT_VERSION = 1
 
-_GITIGNORE = "# 派生层可随时重建，不做版本记录\nindex.sqlite\nindex.sqlite-*\ncache/\n"
+_GITIGNORE = (
+    "# 派生层可随时重建，不做版本记录\nindex.sqlite\nindex.sqlite-*\ncache/\n"
+    "# 原始事件只追加、不需要版本记录；不进 git 也保证“忘掉这件事”能真正删除\nevents/*.jsonl\n"
+)
 _SELF_TEMPLATES = ("seed.md", "identity.md", "style.md")
 
 

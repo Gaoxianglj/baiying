@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
 CONFIG_FILE = "config.toml"
 LOCAL_CONFIG_FILE = "config.local.toml"
@@ -27,10 +27,17 @@ ENV_MAP: dict[str, tuple[str, ...]] = {
     "FALLBACK_MODEL": ("models", "fallback", "model"),
     "FALLBACK_MONTHLY_BUDGET_USD": ("models", "fallback", "monthly_budget_usd"),
     "QQ_BOT_ACCOUNT": ("qq", "bot_account"),
+    "NAPCAT_TOKEN": ("qq", "access_token"),
+    "QQ_WS_URL": ("qq", "ws_url"),
+    "QQ_OWNER_ACCOUNTS": ("qq", "owner_accounts"),
+    "QQ_GROUPS": ("qq", "groups"),
 }
 
 # 只允许出现在环境变量里的配置路径
-SECRET_PATHS: set[tuple[str, ...]] = {("models", "fallback", "api_key")}
+SECRET_PATHS: set[tuple[str, ...]] = {
+    ("models", "fallback", "api_key"),
+    ("qq", "access_token"),
+}
 
 
 class ConfigError(ValueError):
@@ -117,7 +124,32 @@ class ModelsConfig(_Section):
 
 
 class QQConfig(_Section):
+    """QQ 身体：经 NapCat 的 OneBot 11 正向 WebSocket 接入。"""
+
     bot_account: str | None = None
+    ws_url: str = "ws://127.0.0.1:3001"
+    access_token: SecretStr | None = None  # NapCat WebSocket 服务的 token，只能放 .env
+    owner_accounts: list[str] = []  # 你的 QQ 号：可以确认绑定、删除任何人的记忆
+    groups: list[str] = []  # 允许接入的群号；为空表示不进任何群（只私聊）
+    aliases: list[str] = ["白璎", "小璎"]  # 群里提到这些名字就算在叫她
+    unsolicited_probability: float = 0.3  # 没被叫到、但话题和她的记忆强相关时插话的概率
+    unsolicited_min_cosine: float = 0.7  # 话题与某条记忆的向量相似度至少这么高才考虑插话
+    unsolicited_min_interval_minutes: float = 15.0  # 同一个群里两次主动插话的最短间隔
+    max_replies_per_minute: int = 6  # 全局发言上限，防刷屏、降低风控风险
+
+    @field_validator("owner_accounts", "groups", "aliases", mode="before")
+    @classmethod
+    def _split_csv(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return value
+
+
+class SleepConfig(_Section):
+    """每日“睡眠”：反思、遗忘、合并重复事实。"""
+
+    hour: int = 4  # 本地时间几点开始
+    identity_every_days: int = 7  # 自我认知多久反思一次
 
 
 class Config(_Section):
@@ -127,6 +159,7 @@ class Config(_Section):
     models: ModelsConfig = ModelsConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     qq: QQConfig = QQConfig()
+    sleep: SleepConfig = SleepConfig()
 
     @property
     def data_dir(self) -> Path:
