@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
+import numpy as np
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from companion.memory import forgetting
@@ -74,6 +75,17 @@ CREATE TABLE facts (
 CREATE INDEX facts_current ON facts (subject, predicate) WHERE valid_to IS NULL;
 
 CREATE VIRTUAL TABLE memory_fts USING fts5 (tokens, kind UNINDEXED, memory_id UNINDEXED);
+
+CREATE TABLE vectors (
+    kind      TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    model     TEXT NOT NULL,                    -- 由哪个 embedding 模型算出；换模型即重算
+    dim       INTEGER NOT NULL,
+    vec       BLOB NOT NULL,                    -- float32，已归一化
+    PRIMARY KEY (kind, memory_id)
+);
+
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
@@ -178,7 +190,7 @@ class MemoryIndex:
     def reset(self) -> None:
         """清空派生层，准备从事件日志重建。"""
         with self._tx() as c:
-            for table in ("memory_fts", "episode_people", "facts", "episodes"):
+            for table in ("memory_fts", "vectors", "meta", "episode_people", "facts", "episodes"):
                 c.execute(f"DELETE FROM {table}")
 
     @contextmanager
@@ -376,6 +388,123 @@ class MemoryIndex:
             (expr, *kinds, limit),
         ).fetchall()
         return [TextHit(r[0], r[1], r[2]) for r in rows]
+
+    # ---- 向量 ----
+
+    def texts_needing_vectors(self, model: str) -> list[tuple[MemoryKind, str, str]]:
+        """还没有用 `model` 算过向量的记忆：(kind, id, 文本)。"""
+        rows = self._conn.execute(
+            "SELECT 'episode', e.id, e.summary FROM episodes e "
+            "LEFT JOIN vectors v ON v.kind = 'episode' AND v.memory_id = e.id "
+            "WHERE v.model IS NULL OR v.model != ? "
+            "UNION ALL "
+            "SELECT 'fact', f.id, f.statement FROM facts f "
+            "LEFT JOIN vectors v ON v.kind = 'fact' AND v.memory_id = f.id "
+            "WHERE v.model IS NULL OR v.model != ?",
+            (model, model),
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    def put_vectors(
+        self, model: str, items: list[tuple[MemoryKind, str]], matrix: np.ndarray
+    ) -> None:
+        if len(items) != len(matrix):
+            raise ValueError("向量数与记忆数不一致")
+        with self._tx() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO vectors VALUES (?, ?, ?, ?, ?)",
+                [
+                    (kind, mid, model, int(vec.shape[0]), np.asarray(vec, np.float32).tobytes())
+                    for (kind, mid), vec in zip(items, matrix, strict=True)
+                ],
+            )
+
+    def load_vectors(
+        self, model: str, allowed: set[tuple[MemoryKind, str]] | None = None
+    ) -> tuple[list[tuple[MemoryKind, str]], np.ndarray]:
+        """可检索记忆（有效事实、未沉睡情景）的向量。`allowed` 进一步限定范围。"""
+        rows = self._conn.execute(
+            "SELECT v.kind, v.memory_id, v.vec FROM vectors v "
+            "LEFT JOIN episodes e ON v.kind = 'episode' AND e.id = v.memory_id "
+            "LEFT JOIN facts f ON v.kind = 'fact' AND f.id = v.memory_id "
+            "WHERE v.model = ? AND ((v.kind = 'episode' AND e.state != 'dormant') "
+            "  OR (v.kind = 'fact' AND f.valid_to IS NULL))",
+            (model,),
+        ).fetchall()
+        keys: list[tuple[MemoryKind, str]] = []
+        vecs: list[np.ndarray] = []
+        for kind, mid, blob in rows:
+            if allowed is None or (kind, mid) in allowed:
+                keys.append((kind, mid))
+                vecs.append(np.frombuffer(blob, dtype=np.float32))
+        return keys, (np.vstack(vecs) if vecs else np.zeros((0, 0), np.float32))
+
+    def allowed_keys(
+        self,
+        *,
+        person_id: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> set[tuple[MemoryKind, str]]:
+        """按人物和时间过滤出的记忆。情景看参与者与开始时间，事实看主语与生效时间。"""
+        ep_sql = "SELECT DISTINCT e.id FROM episodes e"
+        ep_where: list[str] = []
+        fact_where: list[str] = []
+        ep_args: list[str] = []
+        fact_args: list[str] = []
+        if person_id is not None:
+            ep_sql += " JOIN episode_people p ON p.episode_id = e.id"
+            ep_where.append("p.person_id = ?")
+            ep_args.append(person_id)
+            fact_where.append("subject = ?")
+            fact_args.append(person_id)
+        if since is not None:
+            ep_where.append("e.started_at >= ?")
+            ep_args.append(_iso(since))
+            fact_where.append("valid_from >= ?")
+            fact_args.append(_iso(since))
+        if until is not None:
+            ep_where.append("e.started_at < ?")
+            ep_args.append(_iso(until))
+            fact_where.append("valid_from < ?")
+            fact_args.append(_iso(until))
+        if ep_where:
+            ep_sql += " WHERE " + " AND ".join(ep_where)
+        fact_sql = "SELECT id FROM facts" + (
+            " WHERE " + " AND ".join(fact_where) if fact_where else ""
+        )
+        keys: set[tuple[MemoryKind, str]] = {
+            ("episode", r[0]) for r in self._conn.execute(ep_sql, ep_args)
+        }
+        keys |= {("fact", r[0]) for r in self._conn.execute(fact_sql, fact_args)}
+        return keys
+
+    def importance(self, kind: MemoryKind, memory_id: str) -> float:
+        row = self._conn.execute(
+            f"SELECT importance FROM {_table(kind)} WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(memory_id)
+        return float(row[0])
+
+    def text_of(self, kind: MemoryKind, memory_id: str) -> str:
+        column = "summary" if kind == "episode" else "statement"
+        row = self._conn.execute(
+            f"SELECT {column} FROM {_table(kind)} WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(memory_id)
+        return str(row[0])
+
+    # ---- 元数据（如抽取进度）----
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._tx() as c:
+            c.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
 
     @staticmethod
     def _index_text(c: sqlite3.Connection, kind: MemoryKind, memory_id: str, text: str) -> None:

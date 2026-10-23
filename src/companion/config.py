@@ -54,6 +54,10 @@ class SubscriptionConfig(_Section):
 
     enabled: bool = True
     codex_command: str = "codex"
+    model: str | None = None  # None 表示用 Codex 的默认模型；可选值见 app-server 的 model/list
+    effort: str = "low"  # 聊天要快，推理强度调低
+    switch_at_used_percent: float = 99.0  # 任一额度窗口用到这个百分比就切到兜底 API
+    timeout_seconds: float = 120.0
 
 
 class FallbackConfig(_Section):
@@ -63,11 +67,37 @@ class FallbackConfig(_Section):
     api_key: SecretStr | None = None
     model: str | None = None
     monthly_budget_usd: float = 20.0
+    # 每百万 token 的美元价格，用于估算花费；默认取 deepseek-flash 的高峰价（偏保守）
+    price_input_per_m: float = 0.3
+    price_output_per_m: float = 1.2
+    timeout_seconds: float = 120.0
+
+
+class EmbeddingConfig(_Section):
+    """本地 embedding 模型（Ollama 的 OpenAI 兼容接口）。换模型后向量会自动重算。"""
+
+    base_url: str = "http://localhost:11434/v1"
+    model: str = "qwen3-embedding:4b"
+    query_instruction: str = ""  # 查询前缀；评测显示 qwen3-embedding:4b 不加前缀更好
+    min_cosine: float = (
+        0.55  # 低于它的纯向量结果视为不相关（随模型而定，见 scripts/eval_embeddings.py）
+    )
+    batch_size: int = 32
+    timeout_seconds: float = 60.0
+
+
+class RetrievalConfig(_Section):
+    text_weight: float = (
+        0.0  # 关键词一路的权重；评测显示向量单独排序最好，关键词只在向量不可用时兜底
+    )
+    limit: int = 8  # 每轮最多放进上下文的检索结果
+    min_relevance: float = 0.0
 
 
 class ModelsConfig(_Section):
     subscription: SubscriptionConfig = SubscriptionConfig()
     fallback: FallbackConfig = FallbackConfig()
+    embedding: EmbeddingConfig = EmbeddingConfig()
 
 
 class QQConfig(_Section):
@@ -79,6 +109,7 @@ class Config(_Section):
     paths: PathsConfig = PathsConfig()
     persona: PersonaConfig = PersonaConfig()
     models: ModelsConfig = ModelsConfig()
+    retrieval: RetrievalConfig = RetrievalConfig()
     qq: QQConfig = QQConfig()
 
     @property
