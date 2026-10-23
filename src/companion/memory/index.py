@@ -496,6 +496,16 @@ class MemoryIndex:
             raise KeyError(memory_id)
         return str(row[0])
 
+    def counts(self) -> dict[str, int]:
+        c = self._conn
+        return {
+            "episodes": c.execute("SELECT COUNT(*) FROM episodes").fetchone()[0],
+            "facts": c.execute("SELECT COUNT(*) FROM facts WHERE valid_to IS NULL").fetchone()[0],
+            "superseded_facts": c.execute(
+                "SELECT COUNT(*) FROM facts WHERE valid_to IS NOT NULL"
+            ).fetchone()[0],
+        }
+
     # ---- 元数据（如抽取进度）----
 
     def get_meta(self, key: str) -> str | None:

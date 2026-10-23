@@ -14,6 +14,7 @@ from companion.memory import (
     init_memory,
     load_manifest,
 )
+from companion.models.openai_compat import ModelError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,6 +39,21 @@ def main(argv: list[str] | None = None) -> int:
     bind.add_argument("account", help="QQ 号或 MC 玩家名")
     bind.add_argument("person_id")
 
+    chat = sub.add_parser("chat", help="在命令行里和伙伴聊天")
+    chat.add_argument("--as", dest="person_id", required=True, help="你的 person_id，如 xiang")
+    chat.add_argument("--name", help="第一次使用时的显示名")
+    chat.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "subscription", "fallback", "local"],
+        help="优先使用的模型后端（默认 auto：订阅 → 兜底 API → 本地）",
+    )
+
+    extract = sub.add_parser("extract", help="把已结束的会话整理成记忆")
+    extract.add_argument("--force", action="store_true", help="不等空闲，立刻整理所有未整理的对话")
+
+    sub.add_parser("status", help="模型后端状态、本月花费与记忆数量")
+
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -55,7 +71,30 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "people":
             load_manifest(layout)
             _people(PeopleRegistry(layout), args)
-    except (ConfigError, MemoryFormatError, PeopleError) as e:
+        elif args.command == "chat":
+            from companion.chat_cli import run_chat
+
+            return run_chat(config, args.person_id, args.name, args.backend)
+        elif args.command == "extract":
+            from companion.core.companion import Companion
+
+            with Companion(config) as c:
+                done = c.extract_pending(force=args.force)
+                facts = sum(len(x.facts) for x in done)
+                print(f"整理了 {len(done)} 段会话，{facts} 条新事实")
+        elif args.command == "status":
+            from companion.core.companion import Companion
+
+            with Companion(config) as c:
+                for s in c.gateway.status():
+                    print(f"{'●' if s.available else '○'} {s.name}：{s.detail}")
+                n = c.index.counts()
+                print(
+                    f"记忆：{n['episodes']} 段经历，{n['facts']} 条有效事实"
+                    f"（另有 {n['superseded_facts']} 条已更新的旧事实），"
+                    f"{len(c.people.list())} 个人"
+                )
+    except (ConfigError, MemoryFormatError, PeopleError, ModelError) as e:
         print(f"错误：{e}")
         return 1
     return 0
