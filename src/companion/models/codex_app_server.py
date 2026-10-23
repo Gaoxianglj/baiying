@@ -131,16 +131,13 @@ class CodexAppServerBackend:
         if exe is None:
             raise ModelError(f"找不到 {codex_command}：请先安装 Codex CLI 并登录 ChatGPT")
         workdir.mkdir(parents=True, exist_ok=True)
-        instructions = workdir / "instructions.md"
-        instructions.write_text(INSTRUCTIONS, encoding="utf-8")
+        # 指令通过 thread/start 的 baseInstructions 传入；这里只关掉用不到的工具
         overrides = {
-            "model_instructions_file": json.dumps(str(instructions)),
             "personality": '"none"',
             "features.shell_tool": "false",
             "web_search": '"disabled"',
-            "history.persistence": '"none"',
         }
-        command = [exe, "app-server"]
+        command = [str(_native_codex(Path(exe))), "app-server"]
         for key, value in overrides.items():
             command += ["-c", f"{key}={value}"]
         return cls(command=command, workdir=workdir, **kwargs)
@@ -200,7 +197,9 @@ class CodexAppServerBackend:
             thread_params: dict[str, Any] = {
                 "cwd": str(self._workdir),
                 "approvalPolicy": "never",
-                "sandbox": "readOnly",
+                "sandbox": "read-only",
+                "baseInstructions": INSTRUCTIONS,  # 替换内置的编程助手指令
+                "ephemeral": True,  # 不把聊天存进 Codex 的历史
             }
             if self.model:
                 thread_params["model"] = self.model
@@ -331,6 +330,17 @@ class CodexAppServerBackend:
                 except json.JSONDecodeError:
                     log.debug("忽略非 JSON 输出：%s", line[:200])
         inbox.put(None)
+
+
+def _native_codex(shim: Path) -> Path:
+    """npm 在 Windows 上装的是 codex.cmd / codex.ps1 包装脚本，经 cmd.exe 转发时引号参数会被改写；
+    尽量找到包里自带的 codex.exe 直接启动。找不到就用原路径。"""
+    if shim.suffix.lower() not in (".cmd", ".ps1", ".bat"):
+        return shim
+    package = shim.parent / "node_modules" / "@openai" / "codex"
+    for candidate in sorted(package.glob("**/vendor/*/bin/codex.exe")):
+        return candidate
+    return shim
 
 
 def _is_limit(text: str) -> bool:

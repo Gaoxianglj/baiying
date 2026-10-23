@@ -41,7 +41,8 @@ while True:
         window = {"usedPercent": used, "windowDurationMins": 300, "resetsAt": reset_at}
         send({"id": rid, "result": {"rateLimits": {"primary": window, "secondary": None}}})
     elif method == "thread/start":
-        assert params.get("approvalPolicy") == "never" and params.get("sandbox") == "readOnly"
+        assert params.get("approvalPolicy") == "never" and params.get("sandbox") == "read-only"
+        assert params.get("ephemeral") is True and "对话代理" in params.get("baseInstructions", "")
         threads += 1
         send({"id": rid, "result": {"thread": {"id": f"t{threads}"}}})
     elif method == "turn/start":
