@@ -94,6 +94,11 @@ class RetrievalConfig(_Section):
     )
     limit: int = 8  # 每轮最多放进上下文的检索结果
     min_relevance: float = 0.0
+    standing_facts: int = 12  # 每轮常驻的、关于对话者的事实条数
+    recent_episodes: int = 3  # 每轮常驻的、和对话者最近的共同经历
+    recent_messages: int = 20  # 带上同一频道最近多少条对话
+    recent_hours: float = 6.0  # 只带这么多小时以内的对话
+    session_idle_minutes: float = 30.0  # 空闲多久算一段会话结束，之后抽取成记忆
 
 
 class LocalChatConfig(_Section):

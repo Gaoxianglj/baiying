@@ -6,7 +6,31 @@ import zlib
 
 import numpy as np
 
-from companion.models.openai_compat import ModelError
+from companion.models.gateway import ModelGateway, PricedBackend
+from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
+
+
+class ScriptedChat:
+    """假的 OpenAI 兼容客户端：用 `handler(messages, json_mode)` 生成回复，并记下每次请求。"""
+
+    def __init__(self, handler) -> None:
+        self.model = "scripted"
+        self.handler = handler
+        self.requests: list[list[ChatMessage]] = []
+
+    def chat(self, messages, *, json_mode=False, temperature=None, max_tokens=None) -> ChatResult:
+        self.requests.append(messages)
+        return ChatResult(
+            text=self.handler(messages, json_mode), backend="fallback", model="scripted"
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def scripted_gateway(handler) -> tuple[ModelGateway, ScriptedChat]:
+    chat = ScriptedChat(handler)
+    return ModelGateway(fallback=PricedBackend(client=chat, price_in=0, price_out=0)), chat
 
 
 class FakeEmbedder:

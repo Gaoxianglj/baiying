@@ -100,6 +100,7 @@ def init_memory(layout: MemoryLayout, persona_name: str, *, git: bool = True) ->
     for name in _SELF_TEMPLATES:
         write_new(layout.self_dir / name, render_template(name, name=persona_name))
     write_new(layout.root / ".gitignore", _GITIGNORE)
+    write_new(layout.root / ".gitattributes", "* text=auto eol=lf\n")
     for d in (layout.events_dir, layout.journal_dir, layout.people_dir, layout.archive_dir):
         write_new(d / ".gitkeep", "")
 
@@ -135,6 +136,41 @@ def _new_manifest(persona_name: str) -> dict[str, Any]:
 
 def _dump_json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def commit_memory(layout: MemoryLayout, persona_name: str, message: str) -> bool:
+    """把记忆文件夹的改动记进它自己的 git；没有 git 仓库或没有改动时什么也不做。"""
+    if not (layout.root / ".git").exists() or shutil.which("git") is None:
+        return False
+    identity = ["-c", f"user.name={persona_name}", "-c", "user.email=companion@localhost"]
+
+    def run(*args: str) -> str:
+        return subprocess.run(
+            ["git", *identity, *args],
+            cwd=layout.root,
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        ).stdout
+
+    run("add", "-A")
+    if not run("status", "--porcelain").strip():
+        return False
+    run("commit", "-m", message)
+    return True
+
+
+def update_manifest(layout: MemoryLayout, **derived: str | None) -> None:
+    """记录派生层由哪些模型生成（如 embedding_model）。"""
+    manifest = load_manifest(layout)
+    changed = False
+    for key, value in derived.items():
+        if manifest["derived"].get(key) != value:
+            manifest["derived"][key] = value
+            changed = True
+    if changed:
+        layout.manifest_path.write_text(_dump_json(manifest), encoding="utf-8", newline="\n")
 
 
 def _git_init_and_commit(root: Path, persona_name: str) -> None:
