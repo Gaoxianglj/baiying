@@ -98,6 +98,7 @@ class Companion:
         self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl")
 
     def close(self) -> None:
+        self.skills.close()
         self.gateway.close()
         close = getattr(self.embedder, "close", None)
         if close:

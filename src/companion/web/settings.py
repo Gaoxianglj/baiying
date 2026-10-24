@@ -119,6 +119,12 @@ FIELDS: list[SettingField] = [
                  "比如先搜索、再打开某个网页，算两次", min=1, max=6, step=1, unit="次"),
     SettingField("skills.max_result_chars", "交回给她的结果最长", "number", "技能",
                  "太长会更慢、更耗额度", min=500, max=20000, step=500, unit="字"),
+    SettingField("skills.search.enabled", "联网搜索与读网页", "bool", "技能·联网搜索",
+                 "用 DeepSeek 的搜索服务（需要兜底 API key），每次约 0.0008 美元，计入 DeepSeek 月预算"),
+    SettingField("skills.search.in_groups", "群聊里也能用", "bool", "技能·联网搜索",
+                 "关闭后只在私聊里搜索"),
+    SettingField("skills.search.count", "每次搜索看几条结果", "number", "技能·联网搜索",
+                 "越多越全面，但更慢、更耗额度", min=1, max=20, step=1, unit="条"),
     # 睡眠
     SettingField("sleep.hour", "每天几点开始睡眠", "number", "睡眠",
                  "整理、遗忘、反思、写日记", min=0, max=23, step=1, unit="点"),

@@ -181,12 +181,23 @@ class SleepConfig(_Section):
     identity_every_days: int = 7  # 自我认知多久反思一次
 
 
+class SearchSkillConfig(_Section):
+    """联网搜索与读网页：DeepSeek Search / Fetch API（用兜底 API 的 key，计入它的月预算）。"""
+
+    enabled: bool = True
+    in_groups: bool = True  # 群聊里也能用
+    count: int = 5  # 每次搜索取几条结果
+    price_per_call_usd: float = 0.00075  # 搜索、抓取各 0.75 美元 / 千次（只有成功返回内容才计费）
+    timeout_seconds: float = 30.0
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
     enabled: bool = True  # 总开关
     max_rounds: int = 3  # 一轮回复里最多连续用几次技能
     max_result_chars: int = 6000  # 交回给她的结果最长多少字
+    search: SearchSkillConfig = SearchSkillConfig()
 
 
 class Config(_Section):

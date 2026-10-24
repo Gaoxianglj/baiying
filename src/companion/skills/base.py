@@ -80,6 +80,9 @@ class Skill:
         """控制台显示的当前状态（如额度）。"""
         return ""
 
+    def close(self) -> None:
+        pass
+
 
 class Skills:
     def __init__(
@@ -88,6 +91,10 @@ class Skills:
         self.all = skills
         self.cfg = cfg
         self.usage_path = usage_path
+
+    def close(self) -> None:
+        for s in self.all:
+            s.close()
 
     def available(self, ctx: SkillContext | None) -> list[Skill]:
         if ctx is None or not self.cfg.enabled:
