@@ -14,7 +14,7 @@ from itertools import count
 from typing import Any
 
 from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,17 @@ class OneBotClient:
             try:
                 await self.run_once()
                 backoff = 1.0
-            except (OSError, ConnectionClosed) as e:
+            except InvalidStatus as e:
+                status = e.response.status_code
+                hint = (
+                    "token 不对，或者这个端口上跑的不是 NapCat（可能被别的程序占用）"
+                    if status in (401, 403)
+                    else "这个地址上的服务不接受 WebSocket 连接"
+                )
+                log.error(
+                    "%s 拒绝了连接（HTTP %d）：%s；%.0f 秒后重试", self.url, status, hint, backoff
+                )
+            except (OSError, InvalidHandshake, ConnectionClosed, TimeoutError) as e:
                 log.warning("与 NapCat 的连接断开：%s；%.0f 秒后重连", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)

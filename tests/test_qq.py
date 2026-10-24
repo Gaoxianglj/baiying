@@ -188,6 +188,26 @@ def test_parse_segments():
     assert text_segments("好", "5")[0]["type"] == "reply"
 
 
+def test_onebot_client_keeps_retrying_when_rejected(caplog):
+    async def reject(connection, request):
+        return connection.respond(401, "Unauthorized")
+
+    async def main():
+        async def on_event(ev):
+            pass
+
+        async with serve(lambda ws: None, "127.0.0.1", 0, process_request=reject) as srv:
+            port = srv.sockets[0].getsockname()[1]
+            client = OneBotClient(f"ws://127.0.0.1:{port}", "wrong", on_event)
+            task = asyncio.create_task(client.run_forever(max_backoff=0.05))
+            await asyncio.sleep(0.5)
+            assert not task.done()  # 没有因为 401 崩溃
+            task.cancel()
+
+    asyncio.run(main())
+    assert "HTTP 401" in caplog.text and "可能被别的程序占用" in caplog.text
+
+
 def test_onebot_client_round_trip():
     received = []
 
