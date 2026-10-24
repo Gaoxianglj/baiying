@@ -181,6 +181,14 @@ class SleepConfig(_Section):
     identity_every_days: int = 7  # 自我认知多久反思一次
 
 
+class SkillsConfig(_Section):
+    """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
+
+    enabled: bool = True  # 总开关
+    max_rounds: int = 3  # 一轮回复里最多连续用几次技能
+    max_result_chars: int = 6000  # 交回给她的结果最长多少字
+
+
 class Config(_Section):
     root: Path = Path(".")
     paths: PathsConfig = PathsConfig()
@@ -190,6 +198,7 @@ class Config(_Section):
     qq: QQConfig = QQConfig()
     vision: VisionConfig = VisionConfig()
     stickers: StickerConfig = StickerConfig()
+    skills: SkillsConfig = SkillsConfig()
     sleep: SleepConfig = SleepConfig()
 
     @property

@@ -90,6 +90,8 @@ def render_prompt(messages: list[ChatMessage], json_schema: dict[str, Any] | Non
             parts.append(f"<设定>\n{m.content}\n</设定>")
         elif m.role == "assistant":
             parts.append(f"<你之前说>\n{m.content}\n</你之前说>")
+        elif m.role == "skill":
+            parts.append(f"<技能结果>\n{m.content}\n</技能结果>")
         else:
             parts.append(f"<对方说>\n{m.content}\n</对方说>")
     if json_schema is not None:

@@ -35,6 +35,7 @@ from companion.memory.events import Event
 from companion.memory.index import MemoryKind
 from companion.memory.people import PeopleError
 from companion.models.openai_compat import ModelError
+from companion.skills import SkillContext
 
 log = logging.getLogger(__name__)
 
@@ -272,9 +273,28 @@ class QQBot:
         if not self._can_send():
             log.warning("发言过于频繁，这一轮只记录不回复")
             return
+        loop = asyncio.get_running_loop()
+
+        def interim(text: str) -> None:
+            """她用技能前先说的话（如“我查一下”）：从工作线程里立刻发出去。"""
+            asyncio.run_coroutine_threadsafe(self._send(src, text), loop).result(timeout=30)
+
+        ctx = SkillContext(
+            body="qq",
+            channel=src.channel,
+            person_id=pending.events[-1].actor.person_id or "",
+            private=src.message_type == "private",
+            owner=src.user_id in self.cfg.owner_accounts,
+            now=src.received_at,
+        )
         try:
             reply = await self._call(
-                self.c.respond, pending.events[-1], mode=pending.mode, batch=pending.events
+                self.c.respond,
+                pending.events[-1],
+                mode=pending.mode,
+                batch=pending.events,
+                skill_ctx=ctx,
+                on_interim=interim,
             )
         except ModelError as e:
             log.error("生成回复失败：%s", e)
@@ -291,6 +311,8 @@ class QQBot:
             quote = pending.required_message_id
         if reply.text.strip():
             await self._send(src, reply.text, reply_to=quote)
+        for path in reply.images:
+            await self._send_image(src, path)
         if reply.sticker is not None:
             await self._send_sticker(src, reply.sticker.digest)
         partners = self._partners.setdefault(src.channel, {})
@@ -479,14 +501,16 @@ class QQBot:
             await self._call(self.c.index.set_meta, key, self.now().isoformat())
 
     async def _send_sticker(self, src: Source, digest: str) -> None:
-        path = self.c.stickers.image_path(digest)
+        await self._send_image(src, self.c.stickers.image_path(digest), sticker=True)
+
+    async def _send_image(self, src: Source, path: Path, *, sticker: bool = False) -> None:
         if not path.exists():
             return
         b64 = base64.b64encode(await asyncio.to_thread(path.read_bytes)).decode()
-        segment = {
-            "type": "image",
-            "data": {"file": f"base64://{b64}", "sub_type": 1, "summary": "[动画表情]"},
-        }
+        data: dict[str, object] = {"file": f"base64://{b64}"}
+        if sticker:
+            data |= {"sub_type": 1, "summary": "[动画表情]"}
+        segment = {"type": "image", "data": data}
         if src.message_type == "group":
             action, params = "send_group_msg", {"group_id": int(src.group_id), "message": [segment]}
         else:
@@ -494,7 +518,7 @@ class QQBot:
         try:
             await self.client.call(action, params)
         except OneBotError as e:
-            log.error("发送表情包失败：%s", e)
+            log.error("发送图片失败：%s", e)
             return
         self._last_spoke[src.channel] = self.now()
 

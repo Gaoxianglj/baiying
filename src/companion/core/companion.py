@@ -6,8 +6,10 @@ import json
 import logging
 import random
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from companion import media
 from companion.config import Config
@@ -20,7 +22,9 @@ from companion.memory.index import Fact, MemoryIndex, MemoryKind
 from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
-from companion.models.openai_compat import ChatResult, ModelError
+from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
+from companion.skills import Skill, SkillCall, SkillContext, Skills
+from companion.skills.builtin import build_skills
 from companion.stickers import Sticker, StickerBook, split_sticker
 
 log = logging.getLogger(__name__)
@@ -37,6 +41,8 @@ class Reply:
     event: Event
     sticker: Sticker | None = None  # 想配的表情包（已过概率与冷却）
     silent: bool = False  # 她判断这一轮不需要接话
+    skill_calls: list[SkillCall] = field(default_factory=list)
+    images: list[Path] = field(default_factory=list)  # 技能产出、要发给对方的图片
 
 
 class Companion:
@@ -46,6 +52,7 @@ class Companion:
         *,
         gateway: ModelGateway | None = None,
         embedder: Embedder | None = None,
+        skills: list[Skill] | None = None,
     ) -> None:
         self.config = config
         self.name = config.persona.name
@@ -86,6 +93,9 @@ class Companion:
         )
         self._last_sticker: dict[str, datetime] = {}
         self._rng = random.Random()
+        if skills is None:
+            skills = build_skills(config, self.gateway)
+        self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl")
 
     def close(self) -> None:
         self.gateway.close()
@@ -112,8 +122,9 @@ class Companion:
         display_name: str | None = None,
         platform: str | None = None,
         now: datetime | None = None,
+        on_interim: Callable[[str], None] | None = None,
     ) -> Reply:
-        """记录对方的话，组装上下文，生成并记录白璎的回复。"""
+        """记录对方的话，组装上下文，生成并记录白璎的回复（本地命令行：当作主人私聊）。"""
         incoming = self.ingest.record(
             body=body,
             channel=channel,
@@ -124,7 +135,10 @@ class Companion:
             display_name=display_name,
             ts=now,
         )
-        return self.respond(incoming, now=now)
+        assert incoming.actor.person_id is not None
+        ctx = SkillContext(body, channel, incoming.actor.person_id, private=True, owner=True,
+                           now=now)  # fmt: skip
+        return self.respond(incoming, now=now, skill_ctx=ctx, on_interim=on_interim)
 
     def respond(
         self,
@@ -133,12 +147,16 @@ class Companion:
         *,
         mode: str = "required",
         batch: list[Event] | None = None,
+        skill_ctx: SkillContext | None = None,
+        on_interim: Callable[[str], None] | None = None,
     ) -> Reply:
         """对一条（或接连几条合并成的一轮）已经记下的消息作出回复。
 
         mode：required = 被直接叫到，一般要回；optional = 可以不接；
               strict = 不是冲她来的，更倾向不接。
         她判断不需要接话时会输出【不回复】，此时返回 silent=True，不记录也不发送。
+        skill_ctx：这个场合能用哪些技能（None = 不用技能）。她用技能前先说的话
+        （如“我查一下”）会记下来并交给 on_interim 立刻发出去。
         """
         assert incoming.actor.person_id is not None
         body, channel = incoming.body, incoming.channel
@@ -157,23 +175,27 @@ class Companion:
             now=now,
             sticker_emotions=emotions,
             reply_mode=mode,
+            extra_sections=[p] if (p := self.skills.prompt(skill_ctx)) else None,
         )
-        result = self.gateway.chat(bundle.messages, purpose="chat")
-        text, wanted = split_sticker(result.text)
-        if SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted):
-            return Reply("", result, bundle, incoming, None, silent=True)
+        result, calls = self._chat_with_skills(bundle, skill_ctx, on_interim)
+        text, wanted = split_sticker(self.skills.strip_markers(result.text))
+        images = [p for c in calls for p in c.images]
+        if not images and (
+            SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted)
+        ):
+            return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls)
+        text = SILENT_MARK.sub("", text).strip()
         self.context.mark_recalled(bundle, now=now)
         sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
+        meta: dict[str, object] = {
+            "backend": result.backend,
+            "model": result.model,
+            "recalled": [f"{r.kind}:{r.memory_id}" for r in bundle.recalled],
+        }
+        if calls:
+            meta["skills"] = [{"skill": c.skill, "arg": c.arg[:200], "ok": c.ok} for c in calls]
         event = self.ingest.record_self(
-            body=body,
-            channel=channel,
-            content=text or "…",
-            ts=now,
-            meta={
-                "backend": result.backend,
-                "model": result.model,
-                "recalled": [f"{r.kind}:{r.memory_id}" for r in bundle.recalled],
-            },
+            body=body, channel=channel, content=text or "…", ts=now, meta=meta
         )
         if sticker is not None:
             self.ingest.record_self(
@@ -183,7 +205,39 @@ class Companion:
                 ts=now,
                 meta={"sticker": sticker.digest, "emotion": sticker.emotion},
             )
-        return Reply(text, result, bundle, event, sticker)
+        return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images)
+
+    def _chat_with_skills(
+        self,
+        bundle: ContextBundle,
+        ctx: SkillContext | None,
+        on_interim: Callable[[str], None] | None,
+    ) -> tuple[ChatResult, list[SkillCall]]:
+        """生成回复；她写了技能标记就执行，把结果交回给她，直到她给出最终回复。"""
+        messages = list(bundle.messages)
+        calls: list[SkillCall] = []
+        rounds = self.config.skills.max_rounds
+        while True:
+            result = self.gateway.chat(messages, purpose="chat")
+            found = self.skills.find(result.text, ctx) if len(calls) < rounds else None
+            if found is None:
+                return result, calls
+            before, skill, marker, arg = found
+            assert ctx is not None
+            interim = SILENT_MARK.sub("", split_sticker(before)[0]).strip()
+            if interim:
+                self.ingest.record_self(
+                    body=ctx.body, channel=ctx.channel, content=interim, ts=ctx.now
+                )
+                if on_interim is not None:
+                    on_interim(interim)
+            call, outcome = self.skills.run(skill, marker, arg, ctx)
+            calls.append(call)
+            said = f"{before}【{marker}：{arg}】" if before else f"【{marker}：{arg}】"
+            messages += [
+                ChatMessage("assistant", said),
+                ChatMessage("skill", self.skills.feedback(skill, marker, outcome)),
+            ]
 
     def _choose_sticker(self, channel: str, emotion: str, now: datetime | None) -> Sticker | None:
         cfg = self.config.stickers

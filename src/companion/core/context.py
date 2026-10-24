@@ -93,6 +93,7 @@ class ContextAssembler:
         now: datetime | None = None,
         sticker_emotions: list[str] | None = None,
         reply_mode: str = "required",
+        extra_sections: list[str] | None = None,
     ) -> ContextBundle:
         now = now or datetime.now(UTC)
         person_id = self.people.canonical(person_id)
@@ -118,6 +119,8 @@ class ContextAssembler:
                 "如果这句话很适合配一张，就在回复最后单独写【表情：情绪词】（从上面选），"
                 "不适合就不写。大多数时候不需要配，别每句都发。"
             )
+        for section in extra_sections or []:
+            prompt += "\n\n" + section
         messages = [ChatMessage("system", prompt), *dialogue]
         if not dialogue or dialogue[-1].role != "user":
             messages.append(ChatMessage("user", query))

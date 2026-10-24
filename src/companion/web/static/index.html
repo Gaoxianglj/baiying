@@ -332,6 +332,8 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17.5" cy="9" r="2.5"/><path d="M16 14.5a5 5 0 0 1 6 5"/></svg>人物与记忆</button>
       <button data-page="stickers">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 3H6a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h8l7-7V6a3 3 0 0 0-3-3h-4z"/><path d="M14 21v-4a3 3 0 0 1 3-3h4"/><circle cx="9" cy="10" r="1"/><circle cx="14" cy="10" r="1"/><path d="M8.5 14c1.5 1.3 3.5 1.3 5 0"/></svg>表情包</button>
+      <button data-page="skills">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l2.4 5.2 5.6.6-4.2 3.8 1.2 5.6L12 15.4 7 18.2l1.2-5.6L4 8.8l5.6-.6z"/></svg>技能</button>
       <button data-page="journal">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3h11a2 2 0 0 1 2 2v16l-3-2-3 2-3-2-3 2V5a2 2 0 0 1 2-2z"/><path d="M9 8h7M9 12h7"/></svg>日记</button>
     </nav>
@@ -444,7 +446,7 @@ $("#nav").addEventListener("click", e => {
   if (b) go(b.dataset.page);
 });
 async function go(page) {
-  if (Object.keys(state.dirty).length && page !== "settings") {
+  if (Object.keys(state.dirty).length && page !== state.page) {
     const leave = await confirmBox("有未保存的设置", "离开这个页面会丢掉还没保存的修改。", "仍然离开");
     if (!leave) return;
     state.dirty = {}; updateSavebar();
@@ -533,7 +535,7 @@ pages.settings = async () => {
 
 function renderSettings() {
   const sections = [];
-  for (const f of state.fields) {
+  for (const f of state.fields.filter(f => !isSkillSection(f.section))) {
     let s = sections.find(x => x.name === f.section);
     if (!s) sections.push(s = { name: f.section, fields: [] });
     s.fields.push(f);
@@ -544,6 +546,13 @@ function renderSettings() {
       <p>保存到本机设置（<code>config.local.toml</code>）；原本写在 <code>.env</code> 的项会改回 <code>.env</code>。密钥不会出现在这里。</p></div></div>
     ${sections.map(s => `<div class="card section-card"><h3>${icons[s.name] || "⚙️"} ${esc(s.name)}</h3>
       ${s.fields.map(fieldRow).join("")}</div>`).join("")}`;
+  bindFields();
+}
+
+const isSkillSection = name => name === "技能" || name.startsWith("技能·");
+const rerenderFields = () => state.page === "skills" ? renderSkills() : renderSettings();
+
+function bindFields() {
   main.querySelectorAll("[data-path]").forEach(el => {
     const ev = el.type === "range" || el.type === "text" || el.type === "number" ? "input" : "change";
     el.addEventListener(ev, () => onFieldChange(el));
@@ -608,12 +617,12 @@ function updateSavebar() {
   $("#savebar").classList.toggle("show", n > 0);
 }
 
-$("#undoBtn").onclick = () => { state.dirty = {}; updateSavebar(); renderSettings(); };
+$("#undoBtn").onclick = () => { state.dirty = {}; updateSavebar(); rerenderFields(); };
 $("#saveBtn").onclick = async () => {
   const btn = $("#saveBtn"); btn.disabled = true;
   try {
     const d = await api("settings", { changes: state.dirty });
-    state.fields = d.fields; state.dirty = {}; updateSavebar(); renderSettings();
+    state.fields = d.fields; state.dirty = {}; updateSavebar(); rerenderFields();
     const persona = state.fields.find(f => f.path === "persona.name");
     if (persona) setPersona(persona.value);
     toast(`已保存到 ${d.written.join("、") || "本机设置"}，重启 companion qq 后生效`);
@@ -624,7 +633,7 @@ $("#saveBtn").onclick = async () => {
 async function resetField(path) {
   try {
     const d = await api("settings-reset", { path });
-    state.fields = d.fields; delete state.dirty[path]; updateSavebar(); renderSettings();
+    state.fields = d.fields; delete state.dirty[path]; updateSavebar(); rerenderFields();
     toast("已恢复默认");
   } catch (err) { toast(err.message, true); }
 }
@@ -745,6 +754,38 @@ pages.stickers = async () => {
     catch (err) { toast(err.message, true); }
   });
 };
+
+// ---------- 技能 ----------
+pages.skills = async () => {
+  const [s, d] = await Promise.all([api("settings"), api("skills")]);
+  state.fields = s.fields; state.skills = d;
+  renderSkills();
+};
+
+function renderSkills() {
+  const d = state.skills;
+  const fieldsOf = section => state.fields.filter(f => f.section === section);
+  const general = fieldsOf("技能");
+  const master = general.find(f => f.path === "skills.enabled");
+  const on = master ? currentValue(master) : true;
+  const cards = d.skills.map(k => `
+    <div class="card section-card">
+      <h3>${esc(k.label)} ${k.status ? `<span class="chip grey">${esc(k.status)}</span>` : ""}</h3>
+      <div class="help" style="margin:-4px 0 10px">${k.usage.map(u => esc(u)).join("<br>")}</div>
+      ${fieldsOf("技能·" + k.label).map(fieldRow).join("")}
+    </div>`).join("");
+  const fmtRow = r => `<div class="memo"><div class="body">${esc(r.arg)}
+      <div class="when">${fmtTime(r.ts)} · ${esc((d.skills.find(k => k.name === r.skill) || {}).label || r.skill)} · ${r.seconds} 秒
+        ${r.ok ? "" : '<span class="chip amber">失败</span>'}</div></div></div>`;
+  main.innerHTML = `
+    <div class="page-head"><div><h2>技能</h2>
+      <p>${esc(state.persona)}聊天时可以用的能力：她在回复里写一个标记，程序执行后把结果交回给她，她再接着说。${on ? "" : "<b>现在总开关是关着的。</b>"}</p></div></div>
+    <div class="card section-card"><h3>🧩 通用</h3>${general.map(fieldRow).join("")}</div>
+    <div style="margin-top:18px" class="grid">${cards || '<div class="card empty">🧩 还没有装上任何技能。</div>'}</div>
+    <div class="card" style="margin-top:18px"><h3>🕘 最近用过 <span class="chip grey">${d.recent.length}</span></h3>
+      ${d.recent.length ? d.recent.map(fmtRow).join("") : '<p class="faint">还没用过技能</p>'}</div>`;
+  bindFields();
+}
 
 // ---------- 日记 ----------
 pages.journal = async () => {

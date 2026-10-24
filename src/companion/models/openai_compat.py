@@ -22,20 +22,21 @@ class ModelError(RuntimeError):
 
 @dataclass(frozen=True)
 class ChatMessage:
-    role: str  # system / user / assistant
+    role: str  # system / user / assistant / skill（技能返回的结果，发给 API 时按 user 处理）
     content: str
     images: tuple[Path, ...] = ()  # 本地图片（已转成 JPEG），只在 user 消息里使用
 
     def to_openai(self) -> dict[str, Any]:
+        role = "user" if self.role == "skill" else self.role
         if not self.images:
-            return {"role": self.role, "content": self.content}
+            return {"role": role, "content": self.content}
         parts: list[dict[str, Any]] = [{"type": "text", "text": self.content}]
         for path in self.images:
             b64 = base64.b64encode(path.read_bytes()).decode()
             parts.append(
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
             )
-        return {"role": self.role, "content": parts}
+        return {"role": role, "content": parts}
 
 
 @dataclass

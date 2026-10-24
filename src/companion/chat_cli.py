@@ -44,17 +44,25 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
             c.extract_pending(channel=channel)  # 之前那段会话若已空闲够久，先整理掉
             try:
                 last = c.reply(
-                    body="cli", channel=channel, account=person_id, text=text, display_name=display
+                    body="cli",
+                    channel=channel,
+                    account=person_id,
+                    text=text,
+                    display_name=display,
+                    on_interim=lambda said: print(f"{c.name}：{said}", flush=True),
                 )
             except ModelError as e:
                 print(f"（出错了：{e}）")
                 continue
-            sticker = (
-                f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
-                if last.sticker
-                else ""
-            )
-            print(f"{c.name}：{last.text}   [{last.result.backend}]{sticker}\n")
+            for call in last.skill_calls:
+                print(f"  （用了技能 {call.skill}：{call.arg[:60]}，{call.seconds:.0f} 秒）")
+            if last.silent:
+                print(f"（{c.name}没有回复）\n")
+                continue
+            extras = "".join(f"\n{c.name}：[图片] {p}" for p in last.images)
+            if last.sticker:
+                extras += f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
+            print(f"{c.name}：{last.text}   [{last.result.backend}]{extras}\n")
 
         print("正在整理这次的对话……")
         try:

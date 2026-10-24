@@ -112,6 +112,13 @@ FIELDS: list[SettingField] = [
                  min=1, max=50, step=1, unit="张"),
     SettingField("stickers.capacity", "表情库容量", "number", "表情包",
                  "满了会淘汰见得少、很久没见的", min=20, max=2000, step=10, unit="张"),
+    # 技能（显示在“技能”页；section 以“技能”开头）
+    SettingField("skills.enabled", "启用技能", "bool", "技能",
+                 "总开关：关闭后她不会用任何技能（各技能还有自己的开关）"),
+    SettingField("skills.max_rounds", "一次回复最多用几次技能", "number", "技能",
+                 "比如先搜索、再打开某个网页，算两次", min=1, max=6, step=1, unit="次"),
+    SettingField("skills.max_result_chars", "交回给她的结果最长", "number", "技能",
+                 "太长会更慢、更耗额度", min=500, max=20000, step=500, unit="字"),
     # 睡眠
     SettingField("sleep.hour", "每天几点开始睡眠", "number", "睡眠",
                  "整理、遗忘、反思、写日记", min=0, max=23, step=1, unit="点"),

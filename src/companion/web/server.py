@@ -26,6 +26,7 @@ from companion.memory.layout import commit_memory
 from companion.memory.people import SELF_ID
 from companion.models.openai_compat import ModelError
 from companion.runtime import AlreadyRunning, InstanceLock, run_dir, setup_logging, stop_flag
+from companion.skills.base import recent_usage
 from companion.web import settings
 
 log = logging.getLogger(__name__)
@@ -135,6 +136,8 @@ class ConsoleApp:
         if route == ("POST", "sticker-delete"):
             removed = self.companion.stickers.remove(str(data["digest"]))
             return {"removed": removed, **self.sticker_list()}
+        if route == ("GET", "skills"):
+            return self.skill_list()
         if route == ("GET", "journal") and len(parts) == 1:
             return self.journal_list()
         if route == ("GET", "journal") and len(parts) == 2:
@@ -302,6 +305,21 @@ class ConsoleApp:
             "stickers": items,
             "emotions": c.stickers.emotions(),
             "capacity": c.config.stickers.capacity,
+        }
+
+    def skill_list(self) -> dict[str, Any]:
+        c = self.companion
+        return {
+            "skills": [
+                {
+                    "name": s.name,
+                    "label": s.label,
+                    "usage": list(s.markers.values()),
+                    "status": s.status(),
+                }
+                for s in c.skills.all
+            ],
+            "recent": recent_usage(c.config.data_dir / "skills.jsonl"),
         }
 
     def journal_list(self) -> dict[str, Any]:
