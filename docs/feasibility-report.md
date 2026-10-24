@@ -286,6 +286,47 @@ flowchart TB
 - [x] 本地显卡：RTX 4070 Ti SUPER 16GB，暂无已部署的本地模型；先用于 embedding 和轻量判断
 - [x] 群聊记忆：记住所有人（预计只接入约 4–5 人的小群）
 
+## 补充调研（2026-10-24）：聊天改进与技能扩展
+
+阶段 1 上线后，你提出了两类新需求：让聊天更聪明，以及给她加几样“技能”。下面逐项给出可行性结论。总的判断：**除“听歌”外都可行**；最关键的发现是 Codex 的权限配置能精确实现你要的 Agent 权限，且 Codex 可以改用 DeepSeek 作为模型，所以订阅额度用尽时 Agent 也能继续工作。
+
+### 聊天的智能度
+
+| 问题 | 原因 | 做法 | 结论 |
+| --- | --- | --- | --- |
+| 你连发“文字 + 表情包”，她回了两条（第二条回应表情，多余） | 每条消息都单独触发一次回复 | **消息合并**：收到要回的消息后先等一小会儿（私聊约 3 秒、可调），把同一个人接连发来的几条合成一轮再回 | 可行 |
+| 有些消息根本不需要接话（比如只回了个表情） | 模型被要求“总要说点什么” | **允许沉默**：提示词告诉她不需要接话时只输出【不回复】，程序就不发 | 可行（qq-bridge 的 `[SILENT]` 也是这个思路） |
+| 群里 @她 聊上之后，对方不再 @、直接接着说，她就不理了 | 现在只认 @、叫名字、引用她 | **对话延续状态机**（借鉴 qq-bridge 的“观望 → 活跃 → 试探 → 退出”）：她说话后进入“活跃”，刚和她聊的人在一定时间内接着说的话，交给模型判断要不要接（可沉默）；别人插进来的话判断更严格；一段时间没人理她就退出 | 可行；代价是活跃期内每条消息都要问一次模型，消耗额度 |
+| 别人引用某条消息时，她不知道引用的是什么 | 现在只取被引用的图片 | **引用解析**：取出被引用消息的发送人和原文，写成“（引用了 X 的话：……）” | 可行 |
+
+### 技能（身体）
+
+| 技能 | 结论 | 做法与依据 | 需要注意 |
+| --- | --- | --- | --- |
+| 联网搜索与浏览网页 | 可行 | DeepSeek 提供独立的 [Search / Fetch API](https://api-docs.deepseek.com/guides/search)，用现有 API key 直接调用：搜索与抓取各 0.75 美元 / 千次，搜索 100 次/秒、抓取 25 次/秒。她在回复里写【搜索：关键词】，程序搜完把结果交回给她再作答；网页用 Fetch 转成 Markdown 阅读。Codex 也自带联网搜索（`web_search = "live"`），但慢且耗额度 | 计入 DeepSeek 月预算；搜索内容只用于回答，不进长期记忆（除非她自己觉得值得记） |
+| Agent（调用 Codex 干活） | 可行 | Codex 的[权限配置](https://developers.openai.com/codex/config-reference)支持按路径设 `read` / `write` / `deny`：以只读为基础，专属文件夹设为可写，黑名单设为 `deny`（连读都不行），正好对应“文件夹内完全权限、外部只读、黑名单无权限”。订阅可用时用 ChatGPT 账号；额度用尽时，按 DeepSeek 官方的 [Codex 接入说明](https://api-docs.deepseek.com/quick_start/agent_integrations/codex) 改用 DeepSeek 模型（`wire_api = "responses"`）继续工作，不需要 DeepSeek Harness | 仅限主号私聊或本地命令行；Agent 用独立的 Codex 进程，与聊天进程分开；长任务要给进度；DeepSeek 驱动 Codex 需实测 |
+| DeepSeek Harness（DSH） | 可行但不推荐 | qq-bridge 证明能通过 DSH 的本地 Web API 接入，但官方文档很少；上面“Codex + DeepSeek 模型”已能覆盖需求 | 暂不实装 |
+| 生图 | 可行（仅订阅） | Codex 内置生图（gpt-image-2），结果以 `imageGeneration` 返回保存路径；按网上资料，生图消耗额度约是普通对话的 3–5 倍。DeepSeek 不能生图，订阅额度用尽时生图暂停 | 私聊不限；群聊按“20 分钟最多 N 张”限制 |
+| 听歌与分享歌 | 部分可行 | **分享**：OneBot 有音乐卡片消息（QQ 音乐 / 网易云 / 自定义），但 NapCat 发音乐卡片需要配置签名服务地址（`musicSignUrl`），通常依赖第三方。**听**：她没有“听音频”的能力，只能读歌名、歌手、歌词、简介来“了解”一首歌；获取歌词多依赖非官方接口 | 列为可选，待你决定 |
+| 我的世界 | 按原计划 | 阶段 2 内容不变，优先级排在上面这些之后 | — |
+| 控制台开关 | 可行 | 每项技能在控制台有总开关和各自参数 | — |
+
+### 一键启停与后台运行
+
+可行。用 PowerShell 脚本（另配双击用的 `.bat`）管理四个部分：NapCat（`E:\07\NapCat.Shell.Windows.OneKey\…`）、Ollama（目前由它自己的托盘程序运行）、主程序 `companion qq`、控制台 `companion web`。
+
+- 全部以隐藏窗口在后台运行；关掉命令行窗口也不会停。
+- 日志写进 `data/logs/`，进程号写进 `data/run/`；停止脚本按进程号结束。
+- 主程序崩溃后自动重启（守护进程，qq-bridge 的 `start.bat` 也这样做），并防止重复启动。
+- 控制台改用固定令牌，地址可以收藏。
+
+### 新增来源（2026-10-24 查阅）
+
+- [qq-bridge](https://github.com/Derpyu520/qq-bridge)
+- DeepSeek：[Search / Fetch API](https://api-docs.deepseek.com/guides/search)、[Codex 接入](https://api-docs.deepseek.com/quick_start/agent_integrations/codex)、[价格](https://api-docs.deepseek.com/quick_start/pricing)
+- Codex：[配置参考](https://developers.openai.com/codex/config-reference)；生图额度说明见第三方整理 [Image Generation in Codex CLI](https://codex.danielvaughan.com/2026/04/27/codex-cli-image-generation-gpt-image-2-visual-development-workflows/)
+- [NapCat 文档](https://napneko.github.io/guide/boot/Shell)
+
 ## 来源
 
 仓库与文档均于 2026-10-22 查阅。
