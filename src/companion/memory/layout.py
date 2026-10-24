@@ -32,6 +32,7 @@ FORMAT_VERSION = 1
 _GITIGNORE = (
     "# 派生层可随时重建，不做版本记录\nindex.sqlite\nindex.sqlite-*\ncache/\n"
     "# 原始事件只追加、不需要版本记录；不进 git 也保证“忘掉这件事”能真正删除\nevents/*.jsonl\n"
+    "# 图片体积大、也要能被真正删除\nmedia/\n"
 )
 _SELF_TEMPLATES = ("seed.md", "identity.md", "style.md")
 
@@ -67,6 +68,10 @@ class MemoryLayout:
     @property
     def archive_dir(self) -> Path:
         return self.root / "archive"
+
+    @property
+    def media_dir(self) -> Path:
+        return self.root / "media"
 
     @property
     def index_path(self) -> Path:

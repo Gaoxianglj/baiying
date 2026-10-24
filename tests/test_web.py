@@ -105,7 +105,7 @@ def test_empty_text_resets_to_default(root):
 def test_dump_toml_round_trip():
     data = {
         "a": 1,
-        "persona": {"name": "白璎\"引号"},
+        "persona": {"name": '白璎"引号'},
         "qq": {"aliases": ["白璎", "小璎"]},
         "models": {"subscription": {"enabled": False, "switch_at_used_percent": 99.5}},
     }

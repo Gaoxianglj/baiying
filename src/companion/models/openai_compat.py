@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -22,6 +24,18 @@ class ModelError(RuntimeError):
 class ChatMessage:
     role: str  # system / user / assistant
     content: str
+    images: tuple[Path, ...] = ()  # 本地图片（已转成 JPEG），只在 user 消息里使用
+
+    def to_openai(self) -> dict[str, Any]:
+        if not self.images:
+            return {"role": self.role, "content": self.content}
+        parts: list[dict[str, Any]] = [{"type": "text", "text": self.content}]
+        for path in self.images:
+            b64 = base64.b64encode(path.read_bytes()).decode()
+            parts.append(
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            )
+        return {"role": self.role, "content": parts}
 
 
 @dataclass
@@ -71,7 +85,7 @@ class OpenAICompatClient:
         body: dict[str, Any] = {
             **self.extra_body,
             "model": self.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [m.to_openai() for m in messages],
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}

@@ -21,12 +21,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any, TypeVar
 
-from companion.bodies.qq.message import Incoming, parse_segments, text_segments
+from companion import media
+from companion.bodies.qq.message import ImageRef, Incoming, parse_segments, text_segments
 from companion.bodies.qq.onebot import OneBotClient, OneBotError
 from companion.config import QQConfig
 from companion.core.companion import Companion
+from companion.media import MediaError
 from companion.memory.events import Event
 from companion.memory.index import MemoryKind
 from companion.memory.people import PeopleError
@@ -39,6 +42,7 @@ T = TypeVar("T")
 NOTICE = """大家好，我是{name}，一个 AI。
 我会记住群里的聊天，这样以后还能记得和大家一起经历过的事。
 记忆保存在主人的电脑上；聊天时，相关的内容会发给 AI 模型服务（OpenAI 或 DeepSeek）用来生成回复。
+图片：只有发给我的、或我刚在群里说完话那一分钟里的图片，我才会看（也会发给模型服务），并保存在主人电脑上；其他时候的图片我不看也不存。
 想让我记住什么：发「/记住 内容」
 想让我忘掉什么：发「/忘掉 关键词」，我会列出相关的记忆让你挑"""
 
@@ -62,6 +66,7 @@ class Source:
     name: str
     message_id: str | None
     incoming: Incoming
+    received_at: datetime | None = None  # 消息发出时间（OneBot 的 time 字段）
 
     @property
     def channel(self) -> str:
@@ -93,6 +98,7 @@ class QQBot:
         self._sent_times: deque[datetime] = deque()
         self._sent_ids: deque[str] = deque(maxlen=500)
         self._last_unsolicited: dict[str, datetime] = {}
+        self._last_spoke: dict[str, datetime] = {}
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
 
     # ---- 运行 ----
@@ -149,6 +155,12 @@ class QQBot:
             or (src.incoming.reply_to is not None and src.incoming.reply_to in self._sent_ids)
             or any(alias in text for alias in self.cfg.aliases)
         )
+        text, digests = await self._see_images(src, addressed)
+        meta: dict[str, object] = {}
+        if src.message_id:
+            meta["message_id"] = src.message_id
+        if digests:
+            meta["images"] = digests
         event = await self._call(
             self.c.observe,
             body="qq",
@@ -156,7 +168,8 @@ class QQBot:
             account=src.user_id,
             text=text,
             display_name=src.name,
-            meta={"message_id": src.message_id} if src.message_id else None,
+            now=src.received_at,
+            meta=meta,
         )
         if not addressed and not await self._should_chime_in(src.channel, text):
             return
@@ -192,7 +205,83 @@ class QQBot:
                 return None
             incoming.text = "（@了你一下）"
         message_id = str(ev["message_id"]) if ev.get("message_id") is not None else None
-        return Source(message_type, user_id, group_id, name, message_id, incoming)
+        received = datetime.fromtimestamp(ev["time"], UTC) if ev.get("time") else None
+        return Source(message_type, user_id, group_id, name, message_id, incoming, received)
+
+    # ---- 看图 ----
+
+    def _active(self, channel: str) -> bool:
+        """她刚在这个频道说过话（active_seconds 秒内）。"""
+        last = self._last_spoke.get(channel)
+        window = timedelta(seconds=self.c.config.vision.active_seconds)
+        return last is not None and self.now() - last <= window
+
+    async def _see_images(self, src: Source, addressed: bool) -> tuple[str, list[str]]:
+        """按规则看图，把占位符换成描述；返回（正文，看过的图片哈希）。
+
+        私聊、@她、引用并 @她：看；群里没冲她来的：只在她活跃时看，否则记作“[图片]”且不下载。
+        """
+        inc = src.incoming
+        vision = self.c.config.vision
+        read = vision.enabled and (addressed or self._active(src.channel))
+        descriptions: list[str] = []
+        digests: list[str] = []
+        for ref in inc.images:
+            label = "表情包" if ref.sticker else "图片"
+            if not read:
+                descriptions.append(f"[{label}]")
+                continue
+            desc, digest = await self._look(ref)
+            descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看清）]")
+            if digest:
+                digests.append(digest)
+        text = inc.fill_images(descriptions)
+
+        # 引用了一条带图的消息并 @她：把被引用的图也看一下
+        if vision.enabled and addressed and inc.reply_to and inc.reply_to not in self._sent_ids:
+            quoted = await self._quoted_images(inc.reply_to)
+            seen = []
+            for ref in quoted:
+                desc, digest = await self._look(ref)
+                if desc:
+                    seen.append(desc)
+                if digest:
+                    digests.append(digest)
+            if seen:
+                text += "（引用的图片：" + "；".join(seen) + "）"
+        return text, digests
+
+    async def _look(self, ref: ImageRef) -> tuple[str | None, str | None]:
+        try:
+            data = await self._download(ref)
+            return await self._call(self.c.look, data)
+        except (MediaError, ModelError, OneBotError, OSError) as e:
+            log.warning("看图失败：%s", e)
+            return None, None
+
+    async def _download(self, ref: ImageRef) -> bytes:
+        max_bytes = self.c.config.vision.max_bytes
+        url = ref.url
+        if not url and ref.file:
+            # 没有直链时向 NapCat 换：可能给本地路径，也可能给链接
+            data = await self.client.call("get_image", {"file": ref.file})
+            local = (data or {}).get("file")
+            if local and Path(local).is_file():
+                return await asyncio.to_thread(Path(local).read_bytes)
+            url = (data or {}).get("url")
+        if not url:
+            raise MediaError("拿不到图片地址")
+        return await asyncio.to_thread(media.fetch, url, max_bytes=max_bytes)
+
+    async def _quoted_images(self, message_id: str) -> list[ImageRef]:
+        try:
+            msg = await self.client.call("get_msg", {"message_id": int(message_id)})
+        except (OneBotError, ValueError) as e:
+            log.warning("取被引用的消息失败：%s", e)
+            return []
+        if not isinstance(msg, dict):
+            return []
+        return parse_segments(msg.get("message"), self.self_id).images
 
     # ---- 发言策略 ----
 
@@ -235,6 +324,7 @@ class QQBot:
         except OneBotError as e:
             log.error("发送失败：%s", e)
             return
+        self._last_spoke[src.channel] = self.now()
         if isinstance(data, dict) and data.get("message_id") is not None:
             self._sent_ids.append(str(data["message_id"]))
 

@@ -505,7 +505,7 @@ function renderSettings() {
     if (!s) sections.push(s = { name: f.section, fields: [] });
     s.fields.push(f);
   }
-  const icons = { "人格": "💜", "模型": "🤖", "记忆": "🧠", "QQ": "💬", "睡眠": "🌙" };
+  const icons = { "人格": "💜", "模型": "🤖", "记忆": "🧠", "QQ": "💬", "看图": "🖼️", "睡眠": "🌙" };
   main.innerHTML = `
     <div class="page-head"><div><h2>设置</h2>
       <p>保存到本机设置（<code>config.local.toml</code>）；原本写在 <code>.env</code> 的项会改回 <code>.env</code>。密钥不会出现在这里。</p></div></div>

@@ -184,7 +184,8 @@ def test_parse_segments():
         {"3000": "小明"},
     )
     assert inc.mentioned_self and inc.reply_to == "77" and inc.at == ["3000"]
-    assert inc.text == "看 @小明 [图片]"
+    assert inc.text == "看 @小明 ⟦图0⟧" and len(inc.images) == 1
+    assert inc.fill_images(["[图片：猫]"]) == "看 @小明 [图片：猫]"
     assert text_segments("好", "5")[0]["type"] == "reply"
 
 

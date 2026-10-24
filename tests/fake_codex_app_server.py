@@ -59,6 +59,10 @@ while True:
                 "error": {"message": "You've hit your usage limit."}}}})  # fmt: skip
             continue
         out = '{"ok": true}' if "outputSchema" in params else reply
+        images = [i for i in params["input"] if i.get("type") == "localImage"]
+        if images:
+            assert all(os.path.isfile(i["path"]) for i in images)
+            out = f"我看到了 {len(images)} 张图"
         if "<设定>" not in text:
             out = "没有收到设定"
         half = len(out) // 2

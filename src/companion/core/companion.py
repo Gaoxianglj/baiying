@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from companion import media
 from companion.config import Config
 from companion.core.context import ContextAssembler, ContextBundle
 from companion.core.extract import Extraction, SessionExtractor, ended, split_sessions
@@ -68,6 +69,11 @@ class Companion:
         )
         self.extractor = SessionExtractor(
             persona_name=self.name, gateway=self.gateway, index=self.index, people=self.people
+        )
+        self.media = media.MediaStore(
+            self.layout.media_dir,
+            max_side=config.vision.max_side,
+            max_bytes=config.vision.max_bytes,
         )
 
     def close(self) -> None:
@@ -206,8 +212,27 @@ class Companion:
                 to_delete.add((kind, mid))
                 event_ids |= set(self.index.delete(kind, mid))
         removed = self.log.redact(event_ids)
+        self._drop_orphan_images(removed)
         commit_memory(self.layout, self.name, f"按要求忘掉了 {len(to_delete)} 条记忆")
-        return len(to_delete), removed
+        return len(to_delete), len(removed)
+
+    # ---- 图片 ----
+
+    def look(self, data: bytes) -> tuple[str, str]:
+        """保存并让主模型看一张图，返回（描述，图片哈希）。"""
+        stored = self.media.save(data)
+        description, backend = media.describe(self.gateway, stored.path)
+        log.info("看图（%s）：%s", backend, description)
+        return description, stored.digest
+
+    def _drop_orphan_images(self, removed: list[Event]) -> None:
+        """被删除的消息里的图片，如果没有别的消息还在用，就一起删掉。"""
+        digests = {d for e in removed for d in e.meta.get("images", [])}
+        if not digests:
+            return
+        still_used = {d for e in self.log.iter_events() for d in e.meta.get("images", [])}
+        for digest in digests - still_used:
+            self.media.delete(digest)
 
     def _display(self, person_id: str) -> str:
         person = self.people.get(person_id)
@@ -229,6 +254,7 @@ class Companion:
 
         results: list[Extraction] = []
         for ch, events in by_channel.items():
+            events.sort(key=lambda e: e.ts)  # 看图会让写入顺序略晚于发生顺序
             pending = self._after_cursor(ch, events)
             for session in split_sessions(pending, idle):
                 if not force and not ended(session, idle, now):

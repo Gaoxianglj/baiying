@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 _PLACEHOLDERS = {
-    "image": "[图片]",
     "face": "[表情]",
     "mface": "[表情]",
     "record": "[语音]",
@@ -21,12 +20,31 @@ _PLACEHOLDERS = {
 }
 
 
+@dataclass(frozen=True)
+class ImageRef:
+    url: str | None
+    file: str | None  # NapCat 的文件标识，没有 url 时可用 get_image 换取
+    sticker: bool  # 收藏表情 / 动画表情（不是普通照片）
+
+
+def image_marker(i: int) -> str:
+    """正文里第 i 张图的占位符，看完图后替换成描述。"""
+    return f"⟦图{i}⟧"
+
+
 @dataclass
 class Incoming:
-    text: str  # 给模型看的文字
+    text: str  # 给模型看的文字（图片处是占位符）
     mentioned_self: bool = False
     reply_to: str | None = None  # 引用的消息 id
     at: list[str] = field(default_factory=list)  # 被 @ 的 QQ 号
+    images: list[ImageRef] = field(default_factory=list)
+
+    def fill_images(self, descriptions: list[str]) -> str:
+        text = self.text
+        for i, desc in enumerate(descriptions):
+            text = text.replace(image_marker(i), desc)
+        return text
 
 
 def parse_segments(message: Any, self_id: str, names: dict[str, str] | None = None) -> Incoming:
@@ -53,6 +71,16 @@ def parse_segments(message: Any, self_id: str, names: dict[str, str] | None = No
             parts.append(f"@{names.get(qq) or data.get('name') or qq} ")
         elif kind == "reply":
             out.reply_to = str(data.get("id", "")) or None
+        elif kind == "image":
+            summary = str(data.get("summary") or "")
+            out.images.append(
+                ImageRef(
+                    url=data.get("url") or None,
+                    file=data.get("file") or None,
+                    sticker=str(data.get("sub_type", "0")) == "1" or "表情" in summary,
+                )
+            )
+            parts.append(image_marker(len(out.images) - 1))
         else:
             parts.append(_PLACEHOLDERS.get(str(kind), ""))
     out.text = "".join(parts).strip()

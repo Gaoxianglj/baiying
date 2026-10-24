@@ -130,11 +130,14 @@ class ContextAssembler:
 
     def _recent_dialogue(self, channel: str, now: datetime) -> list[ChatMessage]:
         since = now - timedelta(hours=self.cfg.recent_hours)
-        events = [
-            e
-            for e in self.log.iter_events(since=since)
-            if e.channel == channel and e.kind == "message" and e.ts <= now
-        ][-self.cfg.recent_messages :]
+        events = sorted(
+            (
+                e
+                for e in self.log.iter_events(since=since)
+                if e.channel == channel and e.kind == "message" and e.ts <= now
+            ),
+            key=lambda e: e.ts,
+        )[-self.cfg.recent_messages :]
         return [self._as_message(e) for e in events]
 
     def _as_message(self, e: Event) -> ChatMessage:

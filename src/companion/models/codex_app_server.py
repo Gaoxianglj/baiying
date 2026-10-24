@@ -210,7 +210,12 @@ class CodexAppServerBackend:
 
             turn_params: dict[str, Any] = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": render_prompt(messages, json_schema)}],
+                "input": [{"type": "text", "text": render_prompt(messages, json_schema)}]
+                + [
+                    {"type": "localImage", "path": str(path.resolve())}
+                    for m in messages
+                    for path in m.images
+                ],
             }
             if self.effort:
                 turn_params["effort"] = self.effort

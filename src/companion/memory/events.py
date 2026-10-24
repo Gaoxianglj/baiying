@@ -62,23 +62,23 @@ class EventLog:
                 f.flush()
         return path
 
-    def redact(self, event_ids: set[str]) -> int:
-        """从日志里彻底删除这些事件（用于“忘掉这件事”），返回删除条数。
+    def redact(self, event_ids: set[str]) -> list[Event]:
+        """从日志里彻底删除这些事件（用于“忘掉这件事”），返回被删除的事件。
 
         这是唯一会改写日志的操作：逐个月份文件重写，先写临时文件再原子替换。
         """
-        removed = 0
+        removed: list[Event] = []
         with self._lock:
             for path in sorted(self._dir.glob("*.jsonl")):
                 lines = path.read_text("utf-8").splitlines(keepends=True)
                 kept = []
                 for line in lines:
                     try:
-                        hit = Event.model_validate_json(line).id in event_ids
+                        event = Event.model_validate_json(line)
                     except ValidationError:
-                        hit = False
-                    if hit:
-                        removed += 1
+                        event = None
+                    if event is not None and event.id in event_ids:
+                        removed.append(event)
                     else:
                         kept.append(line)
                 if len(kept) != len(lines):

@@ -89,6 +89,10 @@ FIELDS: list[SettingField] = [
                  min=1, max=240, step=1, unit="分钟"),
     SettingField("qq.max_replies_per_minute", "每分钟最多发言", "number", "QQ",
                  "防刷屏、降低风控风险", min=1, max=30, step=1, unit="条"),
+    # 看图
+    SettingField("vision.enabled", "看图", "bool", "看图", "关闭后所有图片都只记作“[图片]”"),
+    SettingField("vision.active_seconds", "说完话后多久内看群里的图", "number", "看图",
+                 "群里没冲她来的图片，只在她刚说完话的这段时间里看", min=0, max=600, step=10, unit="秒"),
     # 睡眠
     SettingField("sleep.hour", "每天几点开始睡眠", "number", "睡眠",
                  "整理、遗忘、反思、写日记", min=0, max=23, step=1, unit="点"),

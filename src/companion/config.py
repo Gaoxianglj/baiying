@@ -145,6 +145,19 @@ class QQConfig(_Section):
         return value
 
 
+class VisionConfig(_Section):
+    """看图（交给主模型：GPT 订阅 → DeepSeek）。
+
+    私聊、群里 @她 或引用并 @她 的图片都看；群里没冲她来的图片，只在她“活跃”时
+    （在这个群说完话后的 active_seconds 秒内）才看，其余时候只记作“[图片]”，也不下载。
+    """
+
+    enabled: bool = True
+    active_seconds: float = 60.0
+    max_side: int = 1024  # 长边缩到这个像素，省时间和 token
+    max_bytes: int = 10_000_000
+
+
 class SleepConfig(_Section):
     """每日“睡眠”：反思、遗忘、合并重复事实。"""
 
@@ -159,6 +172,7 @@ class Config(_Section):
     models: ModelsConfig = ModelsConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     qq: QQConfig = QQConfig()
+    vision: VisionConfig = VisionConfig()
     sleep: SleepConfig = SleepConfig()
 
     @property
