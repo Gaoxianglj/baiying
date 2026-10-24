@@ -12,6 +12,7 @@ Companion 不是线程安全地被多处同时使用的，所以所有对它的�
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import random
 import re
@@ -184,7 +185,10 @@ class QQBot:
                 await self._send(src, "（我这会儿有点恍神，等一下再聊好吗）")
             return
         quote = src.message_id if src.message_type == "group" and addressed else None
-        await self._send(src, reply.text, reply_to=quote)
+        if reply.text.strip():
+            await self._send(src, reply.text, reply_to=quote)
+        if reply.sticker is not None:
+            await self._send_sticker(src, reply.sticker.digest)
 
     def _source(self, ev: dict[str, Any]) -> Source | None:
         user_id = str(ev.get("user_id", ""))
@@ -231,7 +235,7 @@ class QQBot:
             if not read:
                 descriptions.append(f"[{label}]")
                 continue
-            desc, digest = await self._look(ref)
+            desc, digest = await self._look(ref, src)
             descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看清）]")
             if digest:
                 digests.append(digest)
@@ -242,7 +246,7 @@ class QQBot:
             quoted = await self._quoted_images(inc.reply_to)
             seen = []
             for ref in quoted:
-                desc, digest = await self._look(ref)
+                desc, digest = await self._look(ref, None)
                 if desc:
                     seen.append(desc)
                 if digest:
@@ -251,10 +255,14 @@ class QQBot:
                 text += "（引用的图片：" + "；".join(seen) + "）"
         return text, digests
 
-    async def _look(self, ref: ImageRef) -> tuple[str | None, str | None]:
+    async def _look(self, ref: ImageRef, src: Source | None) -> tuple[str | None, str | None]:
+        """看一张图；表情包顺便判断能否收藏，并记下是谁发的。"""
         try:
             data = await self._download(ref)
-            return await self._call(self.c.look, data)
+            pid = None
+            if ref.sticker and src is not None:
+                pid = await self._call(self.c.people.ensure, "qq", src.user_id, src.name)
+            return await self._call(self.c.look, data, sticker=ref.sticker, person_id=pid)
         except (MediaError, ModelError, OneBotError, OSError) as e:
             log.warning("看图失败：%s", e)
             return None, None
@@ -348,6 +356,26 @@ class QQBot:
             if isinstance(data, dict) and data.get("message_id") is not None:
                 self._sent_ids.append(str(data["message_id"]))
             await self._call(self.c.index.set_meta, key, self.now().isoformat())
+
+    async def _send_sticker(self, src: Source, digest: str) -> None:
+        path = self.c.stickers.image_path(digest)
+        if not path.exists():
+            return
+        b64 = base64.b64encode(await asyncio.to_thread(path.read_bytes)).decode()
+        segment = {
+            "type": "image",
+            "data": {"file": f"base64://{b64}", "sub_type": 1, "summary": "[动画表情]"},
+        }
+        if src.message_type == "group":
+            action, params = "send_group_msg", {"group_id": int(src.group_id), "message": [segment]}
+        else:
+            action, params = "send_private_msg", {"user_id": int(src.user_id), "message": [segment]}
+        try:
+            await self.client.call(action, params)
+        except OneBotError as e:
+            log.error("发送表情包失败：%s", e)
+            return
+        self._last_spoke[src.channel] = self.now()
 
     async def _notify_owners(self, text: str) -> None:
         for owner in self.cfg.owner_accounts:

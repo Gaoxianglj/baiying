@@ -158,6 +158,16 @@ class VisionConfig(_Section):
     max_bytes: int = 10_000_000
 
 
+class StickerConfig(_Section):
+    """表情包：群聊和私聊共用一个库。"""
+
+    enabled: bool = True
+    capacity: int = 300  # 库里最多存多少张，满了淘汰见得少、很久没见的
+    min_library: int = 3  # 库里至少有这么多张，才告诉她可以发表情包
+    send_probability: float = 0.6  # 她想发时，真的发出去的概率
+    min_interval_seconds: float = 120.0  # 同一个聊天里两次发表情的最短间隔
+
+
 class SleepConfig(_Section):
     """每日“睡眠”：反思、遗忘、合并重复事实。"""
 
@@ -173,6 +183,7 @@ class Config(_Section):
     retrieval: RetrievalConfig = RetrievalConfig()
     qq: QQConfig = QQConfig()
     vision: VisionConfig = VisionConfig()
+    stickers: StickerConfig = StickerConfig()
     sleep: SleepConfig = SleepConfig()
 
     @property

@@ -85,6 +85,15 @@ class ConsoleApp:
             return _json(
                 {"error": "未授权，请用启动时打印的链接打开控制台"}, HTTPStatus.UNAUTHORIZED
             )
+        if method == "GET" and url.path.startswith("/api/sticker-image/"):
+            digest = url.path.rsplit("/", 1)[-1]
+            if not digest.isalnum():
+                return _json({"error": "不合法"}, HTTPStatus.BAD_REQUEST)
+            with self._lock:
+                path = self.companion.stickers.image_path(digest)
+            if not path.exists():
+                return _json({"error": "没有这张表情"}, HTTPStatus.NOT_FOUND)
+            return HTTPStatus.OK, {"Content-Type": "image/jpeg"}, path.read_bytes()
         if method == "POST" and headers.get("content-type", "").split(";")[0] != "application/json":
             return _json({"error": "只接受 JSON"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
 
@@ -120,6 +129,11 @@ class ConsoleApp:
             return self.person(parts[1])
         if route == ("POST", "forget"):
             return self.forget(str(data["kind"]), str(data["id"]))
+        if route == ("GET", "stickers"):
+            return self.sticker_list()
+        if route == ("POST", "sticker-delete"):
+            removed = self.companion.stickers.remove(str(data["digest"]))
+            return {"removed": removed, **self.sticker_list()}
         if route == ("GET", "journal") and len(parts) == 1:
             return self.journal_list()
         if route == ("GET", "journal") and len(parts) == 2:
@@ -266,6 +280,28 @@ class ConsoleApp:
             raise ValueError("kind 只能是 fact 或 episode")
         n_mem, n_msg = self.companion.forget([(kind, memory_id)])  # type: ignore[list-item]
         return {"memories": n_mem, "messages": n_msg}
+
+    def sticker_list(self) -> dict[str, Any]:
+        c = self.companion
+        names = {p.person_id: (p.names[0] if p.names else p.person_id) for p in c.people.list()}
+        items = []
+        for s in c.stickers.all():
+            items.append(
+                {
+                    "digest": s.digest,
+                    "description": s.description,
+                    "emotion": s.emotion,
+                    "seen": s.seen,
+                    "used": s.used,
+                    "first_seen": s.first_seen,
+                    "from": [names.get(p, p) for p in s.from_people],
+                }
+            )
+        return {
+            "stickers": items,
+            "emotions": c.stickers.emotions(),
+            "capacity": c.config.stickers.capacity,
+        }
 
     def journal_list(self) -> dict[str, Any]:
         d = self.companion.layout.journal_dir

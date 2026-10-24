@@ -115,6 +115,11 @@ class FakeClient:
 
 def brain(messages, json_mode):
     if messages[-1].images:
+        if json_mode:  # 表情包：描述 + 情绪 + 能否收藏
+            return json.dumps(
+                {"description": "一只橘猫趴在键盘上", "emotion": "困", "usable": True},
+                ensure_ascii=False,
+            )
         return "一只橘猫趴在键盘上"
     return "好可爱！"
 

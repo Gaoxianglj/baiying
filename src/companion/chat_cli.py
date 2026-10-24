@@ -49,7 +49,12 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
             except ModelError as e:
                 print(f"（出错了：{e}）")
                 continue
-            print(f"{c.name}：{last.text}   [{last.result.backend}]\n")
+            sticker = (
+                f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
+                if last.sticker
+                else ""
+            )
+            print(f"{c.name}：{last.text}   [{last.result.backend}]{sticker}\n")
 
         print("正在整理这次的对话……")
         try:

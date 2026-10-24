@@ -93,6 +93,16 @@ FIELDS: list[SettingField] = [
     SettingField("vision.enabled", "看图", "bool", "看图", "关闭后所有图片都只记作“[图片]”"),
     SettingField("vision.active_seconds", "说完话后多久内看群里的图", "number", "看图",
                  "群里没冲她来的图片，只在她刚说完话的这段时间里看", min=0, max=600, step=10, unit="秒"),
+    # 表情包
+    SettingField("stickers.enabled", "收藏和使用表情包", "bool", "表情包", "群聊和私聊共用一个表情库"),
+    SettingField("stickers.send_probability", "想发时真的发出去的概率", "slider", "表情包",
+                 "她觉得适合配表情时，按这个概率真的发", min=0, max=1, step=0.05),
+    SettingField("stickers.min_interval_seconds", "同一个聊天里发表情的间隔", "number", "表情包",
+                 min=0, max=1800, step=10, unit="秒"),
+    SettingField("stickers.min_library", "库里至少几张才开始用", "number", "表情包",
+                 min=1, max=50, step=1, unit="张"),
+    SettingField("stickers.capacity", "表情库容量", "number", "表情包",
+                 "满了会淘汰见得少、很久没见的", min=20, max=2000, step=10, unit="张"),
     # 睡眠
     SettingField("sleep.hour", "每天几点开始睡眠", "number", "睡眠",
                  "整理、遗忘、反思、写日记", min=0, max=23, step=1, unit="点"),

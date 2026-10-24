@@ -80,6 +80,33 @@ def describe(gateway: ModelGateway, image: Path) -> tuple[str, str]:
     return clean(result.text), result.backend
 
 
+STICKER_PROMPT = """这是聊天里有人发的表情包。请输出 json：
+- description：一两句中文描述画面；有文字就原样写出来。
+- emotion：它表达的情绪或态度，用 2~6 个字的中文词，如 开心、无奈、震惊、委屈、得意、疑惑、嫌弃、晚安、点赞。
+- usable：适不适合在朋友群的日常聊天里当表情包发。真人的私人照片、聊天截图、含个人信息、不雅或让人不适的内容填 false。"""
+
+STICKER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {"type": "string"},
+        "emotion": {"type": "string"},
+        "usable": {"type": "boolean"},
+    },
+    "required": ["description", "emotion", "usable"],
+    "additionalProperties": False,
+}
+
+
+def describe_sticker(gateway: ModelGateway, image: Path) -> tuple[str, str, bool]:
+    """看表情包：返回（描述，情绪词，是否适合收藏使用）。"""
+    data, _ = gateway.chat_json(
+        [ChatMessage("user", STICKER_PROMPT, images=(image,))], STICKER_SCHEMA, purpose="vision"
+    )
+    description = clean(str(data.get("description", "")))
+    emotion = clean(str(data.get("emotion", "")), 12) or "其他"
+    return description, emotion, bool(data.get("usable"))
+
+
 def fetch(url: str, *, max_bytes: int, timeout: float = 30.0) -> bytes:
     """下载图片（QQ 的图片链接有时效，收到就下）。"""
     try:

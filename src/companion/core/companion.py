@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -19,6 +20,7 @@ from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ChatResult, ModelError
+from companion.stickers import Sticker, StickerBook, split_sticker
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ class Reply:
     result: ChatResult
     bundle: ContextBundle
     event: Event
+    sticker: Sticker | None = None  # 想配的表情包（已过概率与冷却）
 
 
 class Companion:
@@ -75,6 +78,11 @@ class Companion:
             max_side=config.vision.max_side,
             max_bytes=config.vision.max_bytes,
         )
+        self.stickers = StickerBook(
+            self.layout.root / "stickers", capacity=config.stickers.capacity
+        )
+        self._last_sticker: dict[str, datetime] = {}
+        self._rng = random.Random()
 
     def close(self) -> None:
         self.gateway.close()
@@ -119,19 +127,28 @@ class Companion:
         """对一条已经记下的消息作出回复。"""
         assert incoming.actor.person_id is not None
         body, channel = incoming.body, incoming.channel
+        sticker_cfg = self.config.stickers
+        emotions = (
+            self.stickers.emotions()
+            if sticker_cfg.enabled and len(self.stickers) >= sticker_cfg.min_library
+            else []
+        )
         bundle = self.context.build(
             person_id=incoming.actor.person_id,
             body=body,
             channel=channel,
             query=incoming.content,
             now=now,
+            sticker_emotions=emotions,
         )
         result = self.gateway.chat(bundle.messages, purpose="chat")
         self.context.mark_recalled(bundle, now=now)
+        text, wanted = split_sticker(result.text)
+        sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
         event = self.ingest.record_self(
             body=body,
             channel=channel,
-            content=result.text,
+            content=text or "…",
             ts=now,
             meta={
                 "backend": result.backend,
@@ -139,7 +156,35 @@ class Companion:
                 "recalled": [f"{r.kind}:{r.memory_id}" for r in bundle.recalled],
             },
         )
-        return Reply(result.text, result, bundle, event)
+        if sticker is not None:
+            self.ingest.record_self(
+                body=body,
+                channel=channel,
+                content=f"[表情包：{sticker.description}]",
+                ts=now,
+                meta={"sticker": sticker.digest, "emotion": sticker.emotion},
+            )
+        return Reply(text, result, bundle, event, sticker)
+
+    def _choose_sticker(self, channel: str, emotion: str, now: datetime | None) -> Sticker | None:
+        cfg = self.config.stickers
+        now = now or datetime.now(UTC)
+        last = self._last_sticker.get(channel)
+        if last is not None and (now - last).total_seconds() < cfg.min_interval_seconds:
+            return None
+        if self._rng.random() >= cfg.send_probability:
+            return None
+        sticker = self.stickers.pick(emotion, embed=self._embed_quietly, rng=self._rng)
+        if sticker is not None:
+            self._last_sticker[channel] = now
+            self.stickers.mark_used(sticker.digest, now)
+        return sticker
+
+    def _embed_quietly(self, texts: list[str]):
+        try:
+            return self.embedder.embed(texts)
+        except ModelError:
+            return None
 
     def observe(
         self,
@@ -218,9 +263,26 @@ class Companion:
 
     # ---- 图片 ----
 
-    def look(self, data: bytes) -> tuple[str, str]:
-        """保存并让主模型看一张图，返回（描述，图片哈希）。"""
+    def look(
+        self, data: bytes, *, sticker: bool = False, person_id: str | None = None
+    ) -> tuple[str, str]:
+        """保存并让主模型看一张图，返回（描述，图片哈希）。
+
+        表情包会同时判断情绪和是否适合收藏；适合的收进表情包库（群聊私聊共用）。
+        """
         stored = self.media.save(data)
+        if sticker and self.config.stickers.enabled:
+            known = self.stickers.get(stored.digest)
+            if known is not None:  # 收藏过的表情不用再看一遍
+                self.stickers.add(
+                    stored.path, stored.digest, known.description, known.emotion, person_id
+                )
+                return known.description, stored.digest
+            description, emotion, usable = media.describe_sticker(self.gateway, stored.path)
+            log.info("看表情包（%s，%s）：%s", emotion, "收藏" if usable else "不收藏", description)
+            if usable:
+                self.stickers.add(stored.path, stored.digest, description, emotion, person_id)
+            return description, stored.digest
         description, backend = media.describe(self.gateway, stored.path)
         log.info("看图（%s）：%s", backend, description)
         return description, stored.digest

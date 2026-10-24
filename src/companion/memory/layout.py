@@ -33,6 +33,7 @@ _GITIGNORE = (
     "# 派生层可随时重建，不做版本记录\nindex.sqlite\nindex.sqlite-*\ncache/\n"
     "# 原始事件只追加、不需要版本记录；不进 git 也保证“忘掉这件事”能真正删除\nevents/*.jsonl\n"
     "# 图片体积大、也要能被真正删除\nmedia/\n"
+    "# 表情包只记文字信息（index.json），图片本身不进 git\nstickers/*.jpg\n"
 )
 _SELF_TEMPLATES = ("seed.md", "identity.md", "style.md")
 

@@ -73,6 +73,7 @@ class ContextAssembler:
         channel: str,
         query: str,
         now: datetime | None = None,
+        sticker_emotions: list[str] | None = None,
     ) -> ContextBundle:
         now = now or datetime.now(UTC)
         person_id = self.people.canonical(person_id)
@@ -89,6 +90,14 @@ class ContextAssembler:
         dialogue = self._recent_dialogue(channel, now)
 
         prompt = self._render(person, person_id, body, channel, facts, shared, recalled, now)
+        if sticker_emotions:
+            prompt += (
+                "\n\n【表情包】\n你收藏了一些表情包，能表达："
+                + "、".join(sticker_emotions)
+                + "。\n"
+                "如果这句话很适合配一张，就在回复最后单独写【表情：情绪词】（从上面选），"
+                "不适合就不写。大多数时候不需要配，别每句都发。"
+            )
         messages = [ChatMessage("system", prompt), *dialogue]
         if not dialogue or dialogue[-1].role != "user":
             messages.append(ChatMessage("user", query))

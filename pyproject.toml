@@ -38,6 +38,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.ruff.lint.per-file-ignores]
 # 提示词是成段的中文，硬折行反而难读
 "src/companion/core/sleep.py" = ["E501"]
+"src/companion/media.py" = ["E501"]
 "src/companion/web/settings.py" = ["E501"]
 "src/companion/web/server.py" = ["E501"]
 
