@@ -21,6 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="companion", description="长期记忆 AI 伙伴")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--root", type=Path, default=None, help="项目根目录（默认当前目录）")
+    parser.add_argument("--log-file", type=Path, default=None, help="同时把日志写进这个文件")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("config", help="显示生效的配置（密钥打码）")
@@ -57,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     web = sub.add_parser("web", help="打开本机控制台网页：查看状态、调整设置、管理记忆")
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    web.add_argument("--new-token", action="store_true", help="换一个新的访问令牌（旧链接失效）")
     sub.add_parser("sleep", help="立刻做一次“睡眠”：整理、遗忘、合并、反思、写日记")
 
     args = parser.parse_args(argv)
@@ -90,11 +92,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "web":
             from companion.web.server import run_web
 
-            return run_web(config.root, args.port, not args.no_browser)
+            return run_web(
+                config.root,
+                args.port,
+                not args.no_browser,
+                log_file=args.log_file,
+                rotate_token=args.new_token,
+            )
         elif args.command == "qq":
             from companion.bodies.qq.runner import run_qq
 
-            return run_qq(config)
+            return run_qq(config, log_file=args.log_file)
         elif args.command == "sleep":
             from companion.core.companion import Companion
             from companion.core.sleep import Sleeper

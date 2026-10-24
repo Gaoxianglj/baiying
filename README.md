@@ -38,6 +38,15 @@ uv run pytest
 uv run ruff check .
 ```
 
+## 一键启停（后台运行）
+
+- `start.bat`：依次启动 Ollama → NapCat（用 `.env` 的 `QQ_BOT_ACCOUNT` 快速登录；需要扫码时自动弹出二维码图片，扫完继续）→ 主程序 → 控制台，全部在后台运行，关掉窗口也不会停；最后打开控制台（地址固定，可收藏）
+- `stop.bat`：主程序先整理完这次的对话再退出；然后停控制台、NapCat（只停 NapCat 目录里的 QQ，不动你平时用的 QQ）、Ollama。保留某项：`stop.bat -KeepOllama` / `-KeepNapCat`
+- `status.bat`：查看各服务是否在运行
+- 主程序和控制台崩溃后 5 秒自动重启，且同一时间只允许运行一个实例
+- 日志在 `data/logs/`（`qq-日期.log`、`web-日期.log`），运行状态在 `data/run/`
+- `.env` 里可设 `NAPCAT_DIR`（NapCat 目录）和 `CONSOLE_PORT`（控制台端口，默认 8765）
+
 ## 配置
 
 优先级从低到高：`config.toml`（进仓库）< `config.local.toml`（本机）< `.env`（本机）< 环境变量。API key 只能放 `.env` 或环境变量；复制 `.env.example` 为 `.env` 后填写。

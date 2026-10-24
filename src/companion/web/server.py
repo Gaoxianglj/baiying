@@ -25,6 +25,7 @@ from companion.core.companion import Companion
 from companion.memory.layout import commit_memory
 from companion.memory.people import SELF_ID
 from companion.models.openai_compat import ModelError
+from companion.runtime import AlreadyRunning, InstanceLock, run_dir, setup_logging, stop_flag
 from companion.web import settings
 
 log = logging.getLogger(__name__)
@@ -363,13 +364,50 @@ def make_handler(app: ConsoleApp) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def run_web(root: Path, port: int, open_browser: bool) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def console_token(data_dir: Path, *, rotate: bool = False) -> str:
+    """固定令牌：存在 data/run/console_token，地址可以收藏；`rotate` 时换一个新的。"""
+    path = run_dir(data_dir) / "console_token"
+    if not rotate and path.exists():
+        token = path.read_text("utf-8").strip()
+        if len(token) >= 24:
+            return token
+    path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(24)
+    path.write_text(token, encoding="utf-8")
+    return token
+
+
+def run_web(
+    root: Path,
+    port: int,
+    open_browser: bool,
+    *,
+    log_file: Path | None = None,
+    rotate_token: bool = False,
+) -> int:
+    setup_logging(log_file)
+    data_dir = load_config(root).data_dir
+    try:
+        lock = InstanceLock(run_dir(data_dir) / "web.lock").acquire()
+    except AlreadyRunning as e:
+        log.error("%s，不再重复启动", e)
+        return 3
+    flag = stop_flag(data_dir, "web")  # 由启停脚本创建和清理
+    token = console_token(data_dir, rotate=rotate_token)
     app = ConsoleApp(root, token)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app))
     url = f"http://127.0.0.1:{server.server_port}/?token={token}"
+    (run_dir(data_dir) / "console_url.txt").write_text(url, encoding="utf-8")
     print(f"控制台已启动：{url}\n（只有本机能访问；按 Ctrl+C 退出）", flush=True)
+    log.info("控制台已启动：http://127.0.0.1:%d/", server.server_port)
+
+    def watch_stop() -> None:
+        while not flag.exists():
+            threading.Event().wait(1)
+        log.info("收到停止信号，控制台退出")
+        server.shutdown()
+
+    threading.Thread(target=watch_stop, daemon=True).start()
     if open_browser:
         webbrowser.open(url)
     try:
@@ -379,4 +417,5 @@ def run_web(root: Path, port: int, open_browser: bool) -> int:
     finally:
         server.server_close()
         app.close()
+        lock.release()
     return 0
