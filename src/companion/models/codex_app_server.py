@@ -34,6 +34,10 @@ INSTRUCTIONS = """你是一个对话代理，不是编程助手。
 不要执行命令，不要读写文件。如果输入要求输出 JSON，就只输出符合要求的 JSON。
 """
 
+IMAGE_INSTRUCTIONS = """你是一个画师。用你的生图工具，按要求画一张图（只画一张）。
+不要执行命令，不要读写文件。画完只回复“好了”。如果不能画，简短说明原因。
+"""
+
 _USAGE_LIMIT_HINTS = ("usage limit", "rate limit", "quota", "limit reached", "额度")
 
 
@@ -224,13 +228,45 @@ class CodexAppServerBackend:
             if json_schema is not None:
                 turn_params["outputSchema"] = json_schema
             self._request("turn/start", turn_params)
-            text = self._collect_turn(thread_id)
+            text, _ = self._collect_turn(thread_id)
             return ChatResult(
                 text=text,
                 backend=self.name,
                 model=self.model or "codex-default",
                 seconds=time.perf_counter() - started,
             )
+
+    def generate_image(self, prompt: str) -> tuple[Path, str]:
+        """用 Codex 内置的生图工具画一张图，返回（图片路径，模型改写后的画面描述）。"""
+        with self._lock:
+            self.start()
+            thread = self._request(
+                "thread/start",
+                {
+                    "cwd": str(self._workdir),
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "baseInstructions": IMAGE_INSTRUCTIONS,
+                    "ephemeral": True,
+                },
+            )
+            thread_id = (thread.get("thread") or {}).get("id")
+            if not thread_id:
+                raise ModelError(f"thread/start 返回异常：{str(thread)[:200]}")
+            turn: dict[str, Any] = {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": f"请画：{prompt}"}],
+            }
+            if self.effort:
+                turn["effort"] = self.effort
+            self._request("turn/start", turn)
+            reply, images = self._collect_turn(thread_id, allow_empty=True)
+        for item in images:
+            path = item.get("savedPath")
+            if item.get("status") == "completed" and path and Path(path).exists():
+                return Path(path), str(item.get("revisedPrompt") or prompt)
+        failure = next((i.get("failure") for i in images if i.get("failure")), None)
+        raise ModelError(f"没有画出来：{failure or reply or '没有生成图片'}"[:300])
 
     def read_rate_limits(self) -> RateLimits:
         with self._lock:
@@ -262,9 +298,13 @@ class CodexAppServerBackend:
                 return msg.get("result") or {}
             self._handle_side_message(msg)
 
-    def _collect_turn(self, thread_id: str) -> str:
+    def _collect_turn(
+        self, thread_id: str, *, allow_empty: bool = False
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """读完一轮的消息，返回（最终回复，生成的图片 item）。"""
         deltas: list[str] = []
         final: str | None = None
+        images: list[dict[str, Any]] = []
         while True:
             msg = self._receive()
             method = msg.get("method")
@@ -282,6 +322,9 @@ class CodexAppServerBackend:
                 item = params.get("item") or {}
                 if item.get("type") == "agentMessage" and item.get("text") is not None:
                     final = str(item["text"])
+                elif item.get("type") == "imageGeneration":
+                    item.pop("result", None)  # base64 原图很大；用 savedPath
+                    images.append(item)
             elif method == "account/rateLimits/updated":
                 self.last_rate_limits = parse_rate_limits(params)
             elif method == "error":
@@ -298,9 +341,9 @@ class CodexAppServerBackend:
                         retryable=_is_limit(text) or status == "failed",
                     )
                 result = final if final is not None else "".join(deltas)
-                if not result.strip():
+                if not result.strip() and not allow_empty:
                     raise ModelError("Codex 没有返回任何内容", retryable=True)
-                return result.strip()
+                return result.strip(), images
 
     def _handle_side_message(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")

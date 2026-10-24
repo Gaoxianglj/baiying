@@ -58,11 +58,19 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
                 print(f"  （用了技能 {call.skill}：{call.arg[:60]}，{call.seconds:.0f} 秒）")
             if last.silent:
                 print(f"（{c.name}没有回复）\n")
-                continue
-            extras = "".join(f"\n{c.name}：[图片] {p}" for p in last.images)
-            if last.sticker:
-                extras += f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
-            print(f"{c.name}：{last.text}   [{last.result.backend}]{extras}\n")
+            else:
+                extras = "".join(f"\n{c.name}：[图片] {p}" for p in last.images)
+                if last.sticker:
+                    extras += (
+                        f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
+                    )
+                print(f"{c.name}：{last.text}   [{last.result.backend}]{extras}\n")
+            for job in last.later:  # 命令行里直接等它做完
+                done = job()
+                for path in c.deliver("cli", channel, done):
+                    print(f"{c.name}：[图片] {path}\n")
+                if not done.ok:
+                    print(f"（{done.text}）\n")
 
         print("正在整理这次的对话……")
         try:

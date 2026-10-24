@@ -35,7 +35,7 @@ from companion.memory.events import Event
 from companion.memory.index import MemoryKind
 from companion.memory.people import PeopleError
 from companion.models.openai_compat import ModelError
-from companion.skills import SkillContext
+from companion.skills import SkillContext, SkillResult
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +132,7 @@ class QQBot:
         self._last_spoke: dict[str, datetime] = {}
         self._partners: dict[str, dict[str, datetime]] = {}  # 频道 → {刚和她聊过的人: 时间}
         self._pending: dict[str, _Pending] = {}
+        self._jobs: set[asyncio.Task[None]] = set()
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
 
     # ---- 运行 ----
@@ -262,8 +263,9 @@ class QQBot:
 
     async def drain(self) -> None:
         """等所有待回的消息处理完（测试与退出时用）。"""
-        while self._pending:
+        while self._pending or self._jobs:
             tasks = [p.task for p in self._pending.values() if p.task is not None]
+            tasks += list(self._jobs)
             if not tasks:
                 break
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -301,6 +303,10 @@ class QQBot:
             if src.message_type == "private":
                 await self._send(src, "（我这会儿有点恍神，等一下再聊好吗）")
             return
+        for job in reply.later:  # 画图等耗时的活：后台做，做完直接发
+            task = asyncio.create_task(self._run_later(src, job))
+            self._jobs.add(task)
+            task.add_done_callback(self._jobs.discard)
         if reply.silent:
             log.info("%s：这一轮选择不回复", src.channel)
             return
@@ -318,6 +324,16 @@ class QQBot:
         partners = self._partners.setdefault(src.channel, {})
         for s in pending.sources:
             partners[s.user_id] = self.now()
+
+    async def _run_later(self, src: Source, job: Callable[[], SkillResult]) -> None:
+        result = await asyncio.to_thread(job)  # 不占用记忆核心的工作线程，聊天照常
+        if not result.ok:
+            log.warning("%s：后台技能没成功：%s", src.channel, result.text)
+            await self._send(src, "（" + result.text[:80] + "）")
+            return
+        paths = await self._call(self.c.deliver, "qq", src.channel, result, self.now())
+        for path in paths:
+            await self._send_image(src, path)
 
     def _source(self, ev: dict[str, Any]) -> Source | None:
         user_id = str(ev.get("user_id", ""))

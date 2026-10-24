@@ -123,6 +123,12 @@ FIELDS: list[SettingField] = [
                  "用 DeepSeek 的搜索服务（需要兜底 API key），每次约 0.0008 美元，计入 DeepSeek 月预算"),
     SettingField("skills.search.in_groups", "群聊里也能用", "bool", "技能·联网搜索",
                  "关闭后只在私聊里搜索"),
+    SettingField("skills.image.enabled", "画画", "bool", "技能·画画",
+                 "用 GPT 订阅自带的生图（DeepSeek 不能画）；每张约占 5 小时额度的 1%，额度快用完时自动暂停"),
+    SettingField("skills.image.group_limit", "群聊限额：最多几张", "number", "技能·画画",
+                 "所有群加起来共享；私聊不限", min=0, max=50, step=1, unit="张"),
+    SettingField("skills.image.group_window_minutes", "群聊限额：时间窗口", "number", "技能·画画",
+                 min=1, max=1440, step=1, unit="分钟"),
     SettingField("skills.search.count", "每次搜索看几条结果", "number", "技能·联网搜索",
                  "越多越全面，但更慢、更耗额度", min=1, max=20, step=1, unit="条"),
     # 睡眠

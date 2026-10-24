@@ -23,7 +23,7 @@ from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
-from companion.skills import Skill, SkillCall, SkillContext, Skills
+from companion.skills import Skill, SkillCall, SkillContext, SkillResult, Skills
 from companion.skills.builtin import build_skills
 from companion.stickers import Sticker, StickerBook, split_sticker
 
@@ -43,6 +43,11 @@ class Reply:
     silent: bool = False  # 她判断这一轮不需要接话
     skill_calls: list[SkillCall] = field(default_factory=list)
     images: list[Path] = field(default_factory=list)  # 技能产出、要发给对方的图片
+
+    @property
+    def later(self) -> list[Callable[[], SkillResult]]:
+        """要放到后台做的活（如画图）；做完用 Companion.deliver 记下，再把图片发出去。"""
+        return [c.later for c in self.skill_calls if c.later is not None]
 
 
 class Companion:
@@ -239,6 +244,31 @@ class Companion:
                 ChatMessage("assistant", said),
                 ChatMessage("skill", self.skills.feedback(skill, marker, outcome)),
             ]
+
+    def deliver(
+        self, body: str, channel: str, result: SkillResult, now: datetime | None = None
+    ) -> list[Path]:
+        """后台技能做完了：把图片存进图片库、记成她发的消息，返回要发出去的图片路径。"""
+        if not result.ok:
+            return []
+        paths, digests = [], []
+        for image in result.images:
+            try:
+                stored = self.media.save(image.read_bytes())
+            except (OSError, media.MediaError) as e:
+                log.warning("保存技能图片失败：%s", e)
+                continue
+            paths.append(stored.path)
+            digests.append(stored.digest)
+        if digests:
+            self.ingest.record_self(
+                body=body,
+                channel=channel,
+                content=f"[我画的图：{media.clean(result.text)}]",
+                ts=now,
+                meta={"images": digests},
+            )
+        return paths
 
     def _choose_sticker(self, channel: str, emotion: str, now: datetime | None) -> Sticker | None:
         cfg = self.config.stickers

@@ -47,6 +47,8 @@ class SkillResult:
     text: str  # 交回给她的结果
     images: list[Path] = field(default_factory=list)  # 需要发给对方的图片
     ok: bool = True
+    # 耗时的活（如画图）：先交回 text 让她回一句，真正的活放到后台做，做完把图片直接发出去
+    later: Callable[[], SkillResult] | None = None
 
 
 @dataclass
@@ -57,6 +59,7 @@ class SkillCall:
     ok: bool
     seconds: float
     images: list[Path] = field(default_factory=list)
+    later: Callable[[], SkillResult] | None = None  # 放到后台做的活
 
 
 class Skill:
@@ -146,7 +149,9 @@ class Skills:
         seconds = time.monotonic() - started
         status = "完成" if result.ok else "失败"
         log.info("技能 %s（%s）%s，%.1f 秒", skill.label, arg[:60], status, seconds)
-        call = SkillCall(skill.name, marker, arg, result.ok, seconds, list(result.images))
+        call = SkillCall(
+            skill.name, marker, arg, result.ok, seconds, list(result.images), result.later
+        )
         self._record(call, ctx)
         return call, result
 

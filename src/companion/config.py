@@ -191,6 +191,15 @@ class SearchSkillConfig(_Section):
     timeout_seconds: float = 30.0
 
 
+class ImageSkillConfig(_Section):
+    """生图：Codex 内置生图（只用 GPT 订阅；额度用尽时暂停）。私聊不限，群聊共享限额。"""
+
+    enabled: bool = True
+    group_limit: int = 5  # 所有群加起来，每个窗口最多画几张
+    group_window_minutes: float = 20.0
+    timeout_seconds: float = 300.0
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
@@ -198,6 +207,7 @@ class SkillsConfig(_Section):
     max_rounds: int = 3  # 一轮回复里最多连续用几次技能
     max_result_chars: int = 6000  # 交回给她的结果最长多少字
     search: SearchSkillConfig = SearchSkillConfig()
+    image: ImageSkillConfig = ImageSkillConfig()
 
 
 class Config(_Section):

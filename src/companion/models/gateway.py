@@ -176,6 +176,10 @@ class ModelGateway:
             return default
         return [self.prefer] + [n for n in default if n != self.prefer]
 
+    def subscription_available(self, now: datetime | None = None) -> bool:
+        """订阅现在能用（已配置、额度没到切换阈值）。"""
+        return self._subscription_ready(now)
+
     def _subscription_ready(self, now: datetime | None) -> bool:
         if self.subscription is None:
             return False
