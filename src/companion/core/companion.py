@@ -43,11 +43,13 @@ class Reply:
     silent: bool = False  # 她判断这一轮不需要接话
     skill_calls: list[SkillCall] = field(default_factory=list)
     images: list[Path] = field(default_factory=list)  # 技能产出、要发给对方的图片
+    skill_ctx: SkillContext | None = None
 
     @property
-    def later(self) -> list[Callable[[], SkillResult]]:
-        """要放到后台做的活（如画图）；做完用 Companion.deliver 记下，再把图片发出去。"""
-        return [c.later for c in self.skill_calls if c.later is not None]
+    def later(self) -> list[SkillCall]:
+        """要放到后台做的活（如画图、Agent 任务）。做完后：结果带 report 的用 Companion.report
+        让她转述；否则用 Companion.deliver 记下并把图片发出去。"""
+        return [c for c in self.skill_calls if c.later is not None]
 
 
 class Companion:
@@ -129,8 +131,11 @@ class Companion:
         platform: str | None = None,
         now: datetime | None = None,
         on_interim: Callable[[str], None] | None = None,
+        ask: Callable[[str], bool] | None = None,
     ) -> Reply:
-        """记录对方的话，组装上下文，生成并记录白璎的回复（本地命令行：当作主人私聊）。"""
+        """记录对方的话，组装上下文，生成并记录白璎的回复（本地命令行：当作主人私聊）。
+
+        on_interim：她先说的话、后台任务进度；ask：后台任务请求批准时问主人。"""
         incoming = self.ingest.record(
             body=body,
             channel=channel,
@@ -143,7 +148,7 @@ class Companion:
         )
         assert incoming.actor.person_id is not None
         ctx = SkillContext(body, channel, incoming.actor.person_id, private=True, owner=True,
-                           now=now)  # fmt: skip
+                           now=now, notify=on_interim, ask=ask)  # fmt: skip
         return self.respond(incoming, now=now, skill_ctx=ctx, on_interim=on_interim)
 
     def respond(
@@ -189,7 +194,8 @@ class Companion:
         if not images and (
             SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted)
         ):
-            return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls)
+            return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls,
+                         skill_ctx=skill_ctx)  # fmt: skip
         text = SILENT_MARK.sub("", text).strip()
         self.context.mark_recalled(bundle, now=now)
         sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
@@ -211,7 +217,8 @@ class Companion:
                 ts=now,
                 meta={"sticker": sticker.digest, "emotion": sticker.emotion},
             )
-        return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images)
+        return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images,
+                     skill_ctx=skill_ctx)  # fmt: skip
 
     def _chat_with_skills(
         self,
@@ -269,6 +276,31 @@ class Companion:
                 meta={"images": digests},
             )
         return paths
+
+    def report(self, ctx: SkillContext, skill_name: str, result: SkillResult) -> str:
+        """后台任务做完了：让她用自己的话把结果告诉对方，记下并返回这句话。"""
+        label = next((s.label for s in self.skills.all if s.name == skill_name), skill_name)
+        bundle = self.context.build(
+            person_id=ctx.person_id, body=ctx.body, channel=ctx.channel, query=result.text[:300]
+        )
+        done = "完成了" if result.ok else "没有完成"
+        note = (
+            f"【{label}{done}】\n{result.text[: self.config.skills.max_result_chars]}\n\n"
+            "这是你之前交给后台的任务的结果，不是对方说的话。请用你自己的话简洁地告诉对方："
+            "说重点和产出文件在哪；没做成就说明原因。不要编造结果里没有的内容。"
+        )
+        try:
+            answer = self.gateway.chat([*bundle.messages, ChatMessage("skill", note)])
+            text = split_sticker(self.skills.strip_markers(answer.text))[0]
+            text = SILENT_MARK.sub("", text).strip()
+        except ModelError as e:
+            log.warning("转述任务结果失败：%s", e)
+            text = ""
+        text = text or f"{label}{done}：{result.text[:400]}"
+        self.ingest.record_self(
+            body=ctx.body, channel=ctx.channel, content=text, meta={"report": skill_name}
+        )
+        return text
 
     def _choose_sticker(self, channel: str, emotion: str, now: datetime | None) -> Sticker | None:
         cfg = self.config.stickers

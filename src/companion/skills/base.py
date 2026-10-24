@@ -39,7 +39,10 @@ class SkillContext:
     private: bool  # 私聊或本地命令行
     owner: bool  # 主人本人
     now: datetime | None = None
-    notify: Callable[[str], None] | None = None  # 技能执行中给对方发提示（如审批请求）
+    notify: Callable[[str], None] | None = None  # 技能执行中给对方发提示（如进度）
+    ask: Callable[[str], bool] | None = (
+        None  # 向主人请求批准（会阻塞到主人回复或超时）；None = 一律拒绝
+    )
 
 
 @dataclass
@@ -49,6 +52,7 @@ class SkillResult:
     ok: bool = True
     # 耗时的活（如画图）：先交回 text 让她回一句，真正的活放到后台做，做完把图片直接发出去
     later: Callable[[], SkillResult] | None = None
+    report: bool = False  # 后台做完后让她用自己的话把结果告诉对方（而不是直接发图）
 
 
 @dataclass

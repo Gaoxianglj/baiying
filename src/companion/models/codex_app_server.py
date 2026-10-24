@@ -3,6 +3,8 @@
 做法：
 - 启动时用 `-c` 覆盖配置：用中性的对话代理指令替换内置的编程助手指令，关掉执行命令与联网搜索，
   不保存会话历史；每轮回复都开一个新线程、沙箱只读、从不请求审批。
+- 一律关掉用户 Codex 配置里的 MCP 服务器、插件、电脑操控与浏览器工具：她在群聊里收到的话可能
+  带有诱导，不能让模型借这些工具碰到本机。
 - 角色设定、记忆、对话记录全部放进本轮输入，所以和兜底 API 用的是同一份提示词。
 - `account/rateLimits/read` 读额度窗口，供网关判断要不要提前切到兜底 API。
 
@@ -13,11 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import shutil
 import subprocess
 import threading
 import time
+import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,8 +121,10 @@ class CodexAppServerBackend:
         effort: str | None = "low",
         timeout: float = 120.0,
         name: str = "subscription",
+        env: dict[str, str] | None = None,
     ) -> None:
         self.name = name
+        self._env = env
         self.model = model
         self.effort = effort
         self.timeout = timeout
@@ -132,19 +138,28 @@ class CodexAppServerBackend:
         self.last_rate_limits: RateLimits | None = None
 
     @classmethod
-    def from_codex(cls, codex_command: str, workdir: Path, **kwargs: Any) -> CodexAppServerBackend:
+    def from_codex(
+        cls,
+        codex_command: str,
+        workdir: Path,
+        *,
+        overrides: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> CodexAppServerBackend:
+        """overrides：额外的 `-c` 配置（值是 TOML）；默认是聊天用的“无工具”配置。"""
         exe = shutil.which(codex_command)
         if exe is None:
             raise ModelError(f"找不到 {codex_command}：请先安装 Codex CLI 并登录 ChatGPT")
         workdir.mkdir(parents=True, exist_ok=True)
-        # 指令通过 thread/start 的 baseInstructions 传入；这里只关掉用不到的工具
-        overrides = {
-            "personality": '"none"',
-            "features.shell_tool": "false",
-            "web_search": '"disabled"',
-        }
+        # 指令通过 thread/start 的 baseInstructions 传入；这里关掉用不到的工具
+        settings = {"personality": '"none"', **lockdown_overrides()}
+        settings |= (
+            overrides
+            if overrides is not None
+            else {"features.shell_tool": "false", "web_search": '"disabled"'}
+        )
         command = [str(_native_codex(Path(exe))), "app-server"]
-        for key, value in overrides.items():
+        for key, value in settings.items():
             command += ["-c", f"{key}={value}"]
         return cls(command=command, workdir=workdir, **kwargs)
 
@@ -163,6 +178,7 @@ class CodexAppServerBackend:
                 text=True,
                 encoding="utf-8",
                 bufsize=1,
+                env=self._env,
             )
         except OSError as e:
             raise ModelError(f"无法启动 codex app-server：{e}", retryable=True) from e
@@ -380,6 +396,32 @@ class CodexAppServerBackend:
                 except json.JSONDecodeError:
                     log.debug("忽略非 JSON 输出：%s", line[:200])
         inbox.put(None)
+
+
+# 关掉的功能：电脑操控、浏览器、插件（含其 MCP 服务器）、应用连接器、多代理
+_LOCKED_FEATURES = (
+    "computer_use",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "plugins",
+    "apps",
+    "multi_agent",
+)
+
+
+def lockdown_overrides() -> dict[str, str]:
+    """关掉用户 Codex 配置里的 MCP 服务器和各种能碰到本机的工具（只读配置里的名字）。"""
+    out = {f"features.{name}": "false" for name in _LOCKED_FEATURES}
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        servers = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return out
+    for name in servers.get("mcp_servers") or {}:
+        if name.replace("_", "").replace("-", "").isalnum():
+            out[f"mcp_servers.{name}.enabled"] = "false"
+    return out
 
 
 def _native_codex(shim: Path) -> Path:

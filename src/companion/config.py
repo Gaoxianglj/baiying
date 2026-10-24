@@ -200,6 +200,32 @@ class ImageSkillConfig(_Section):
     timeout_seconds: float = 300.0
 
 
+class AgentSkillConfig(_Section):
+    """Agent：独立的 Codex 进程替主人干活。只限主人私聊或本地命令行。
+
+    权限：工作文件夹内可读写，其余位置只读，黑名单（密钥、记忆、浏览器与密码管理器数据等）连读都不行；
+    越权操作会转给主人审批。订阅额度用尽时可改用 DeepSeek 驱动 Codex。
+    """
+
+    enabled: bool = True
+    workspace: Path = Path("data/workspace")  # 相对于项目根目录
+    extra_deny: list[str] = []  # 额外的黑名单路径（绝对路径，或相对于项目根目录）
+    effort: str = "medium"
+    web_search: bool = True  # 允许 Codex 自带的联网搜索
+    task_timeout_minutes: float = 30.0
+    approval_timeout_minutes: float = 10.0  # 主人多久没回审批就当拒绝
+    progress_every_seconds: float = 120.0  # 多久汇报一次进度
+    deepseek_fallback: bool = True  # 订阅额度用尽时改用 DeepSeek 驱动
+    deepseek_model: str = "deepseek-flash"
+
+    @field_validator("extra_deny", mode="before")
+    @classmethod
+    def _split(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return value
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
@@ -208,6 +234,7 @@ class SkillsConfig(_Section):
     max_result_chars: int = 6000  # 交回给她的结果最长多少字
     search: SearchSkillConfig = SearchSkillConfig()
     image: ImageSkillConfig = ImageSkillConfig()
+    agent: AgentSkillConfig = AgentSkillConfig()
 
 
 class Config(_Section):

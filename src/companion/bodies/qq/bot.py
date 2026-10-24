@@ -16,6 +16,7 @@ import base64
 import logging
 import random
 import re
+import threading
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +36,7 @@ from companion.memory.events import Event
 from companion.memory.index import MemoryKind
 from companion.memory.people import PeopleError
 from companion.models.openai_compat import ModelError
-from companion.skills import SkillContext, SkillResult
+from companion.skills import SkillCall, SkillContext
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,7 @@ class QQBot:
         self._partners: dict[str, dict[str, datetime]] = {}  # 频道 → {刚和她聊过的人: 时间}
         self._pending: dict[str, _Pending] = {}
         self._jobs: set[asyncio.Task[None]] = set()
+        self._approvals: dict[str, list[Any]] = {}  # 审批码 → [threading.Event, 是否批准]
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
 
     # ---- 运行 ----
@@ -258,8 +260,16 @@ class QQBot:
         except asyncio.CancelledError:
             return
         pending = self._pending.pop(channel, None)
-        if pending is not None:
+        if pending is None:
+            return
+        me = asyncio.current_task()
+        if me is not None:  # 回复中的也算进 drain 要等的
+            self._jobs.add(me)  # type: ignore[arg-type]
+        try:
             await self._reply_batch(pending)
+        finally:
+            if me is not None:
+                self._jobs.discard(me)  # type: ignore[arg-type]
 
     async def drain(self) -> None:
         """等所有待回的消息处理完（测试与退出时用）。"""
@@ -278,7 +288,7 @@ class QQBot:
         loop = asyncio.get_running_loop()
 
         def interim(text: str) -> None:
-            """她用技能前先说的话（如“我查一下”）：从工作线程里立刻发出去。"""
+            """她用技能前先说的话（如“我查一下”）、后台任务的进度：从别的线程里立刻发出去。"""
             asyncio.run_coroutine_threadsafe(self._send(src, text), loop).result(timeout=30)
 
         ctx = SkillContext(
@@ -288,6 +298,8 @@ class QQBot:
             private=src.message_type == "private",
             owner=src.user_id in self.cfg.owner_accounts,
             now=src.received_at,
+            notify=interim,
+            ask=lambda question: self._ask_owner(src, question, loop),
         )
         try:
             reply = await self._call(
@@ -303,8 +315,8 @@ class QQBot:
             if src.message_type == "private":
                 await self._send(src, "（我这会儿有点恍神，等一下再聊好吗）")
             return
-        for job in reply.later:  # 画图等耗时的活：后台做，做完直接发
-            task = asyncio.create_task(self._run_later(src, job))
+        for call in reply.later:  # 画图、Agent 等耗时的活：后台做，做完再发
+            task = asyncio.create_task(self._run_later(src, ctx, call))
             self._jobs.add(task)
             task.add_done_callback(self._jobs.discard)
         if reply.silent:
@@ -325,8 +337,13 @@ class QQBot:
         for s in pending.sources:
             partners[s.user_id] = self.now()
 
-    async def _run_later(self, src: Source, job: Callable[[], SkillResult]) -> None:
-        result = await asyncio.to_thread(job)  # 不占用记忆核心的工作线程，聊天照常
+    async def _run_later(self, src: Source, ctx: SkillContext, call: SkillCall) -> None:
+        assert call.later is not None
+        result = await asyncio.to_thread(call.later)  # 不占用记忆核心的工作线程，聊天照常
+        if result.report:  # 让她用自己的话转述结果
+            text = await self._call(self.c.report, ctx, call.skill, result)
+            await self._send(src, text)
+            return
         if not result.ok:
             log.warning("%s：后台技能没成功：%s", src.channel, result.text)
             await self._send(src, "（" + result.text[:80] + "）")
@@ -538,6 +555,20 @@ class QQBot:
             return
         self._last_spoke[src.channel] = self.now()
 
+    def _ask_owner(self, src: Source, question: str, loop: asyncio.AbstractEventLoop) -> bool:
+        """（在后台线程里）把审批请求发给主人，等 /批准 或 /拒绝；超时算拒绝。"""
+        code = f"{self.rng.randrange(1000, 10000)}"
+        waiter = threading.Event()
+        self._approvals[code] = [waiter, False]
+        minutes = self.c.config.skills.agent.approval_timeout_minutes
+        text = f"{question}\n回复 /批准 {code} 或 /拒绝 {code}（{minutes:g} 分钟内不回就算拒绝）"
+        try:
+            asyncio.run_coroutine_threadsafe(self._send(src, text), loop).result(timeout=30)
+            waiter.wait(timeout=minutes * 60)
+            return bool(self._approvals[code][1])
+        finally:
+            self._approvals.pop(code, None)
+
     async def _notify_owners(self, text: str) -> None:
         for owner in self.cfg.owner_accounts:
             try:
@@ -600,6 +631,18 @@ class QQBot:
                 src,
                 "\n".join(f"{'●' if s.available else '○'} {s.name}：{s.detail}" for s in statuses),
             )
+        elif cmd in ("批准", "拒绝") and is_owner and src.message_type == "private":
+            entry = self._approvals.get(arg)
+            if entry is None:
+                await self._send(src, "没有这个审批（可能已经超时了）。")
+                return
+            entry[1] = cmd == "批准"
+            entry[0].set()
+            await self._send(src, "好，批准了。" if cmd == "批准" else "好，拒绝了。")
+        elif cmd == "停止任务" and is_owner:
+            agent = next((s for s in self.c.skills.all if s.name == "agent"), None)
+            stopped = agent is not None and agent.cancel()  # type: ignore[attr-defined]
+            await self._send(src, "好，让助手停下了。" if stopped else "现在没有在做的任务。")
         elif cmd in ("帮助", "help"):
             await self._send(src, HELP)
         # 其他以 / 开头的消息不理会，避免和别的机器人抢指令

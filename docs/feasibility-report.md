@@ -320,6 +320,15 @@ flowchart TB
 - 主程序崩溃后自动重启（守护进程，qq-bridge 的 `start.bat` 也这样做），并防止重复启动。
 - 控制台改用固定令牌，地址可以收藏。
 
+### 实测补充（2026-10-24，实装技能时）
+
+- **联网搜索**：DeepSeek Search 约 2 秒、Fetch 约 1–5 秒；一轮“搜索后作答”用 DeepSeek 约 5 秒，用 Codex 订阅约 17 秒。
+- **生图**：Codex app-server 返回 `imageGeneration` item（含 `savedPath`，图片存在 `~/.codex/generated_images/`）；一张图约 30–70 秒，约占 5 小时额度的 1%。用单独的 Codex 进程在后台画，不耽误聊天。
+- **Agent 权限**：Windows 上用 `codex sandbox` 实测——黑名单读取被拒、工作文件夹外写入被拒、其余位置可读、工作文件夹可写，权限配置确实生效。盘符根目录（如 `C:/`）不能写进 filesystem 表，要用 `extends = ":read-only"` 打底。必须设 `approvals_reviewer = "user"`，否则 Codex 自己审批、不会转给我们。
+- **Agent 的限制**：沙箱里的命令做不了 HTTPS（受限令牌拿不到 TLS 凭据，schannel 报 `SEC_E_NO_CREDENTIALS`），也启动不了本机装的 Python，所以联网改用 Codex 自带的搜索；审批通过后的提权命令在本机启动失败（`setup refresh had errors`），工作文件夹外的写入实际做不了，这反而更安全。
+- **DeepSeek 驱动 Codex**：`model_provider` 指向 `https://api.deepseek.com/`、`wire_api = "responses"`，key 用 `env_key` 通过环境变量传入（不出现在命令行），实测能完成文件任务（约 60 秒一个小任务）。
+- **安全加固**：用户的 Codex 配置会把 MCP 服务器和插件（含电脑操控 `cua_repl`、`node_repl` 等）带进 app-server。现在所有 Codex 进程都关掉这些（`features.computer_use / browser_use / plugins / apps … = false`，并逐个关闭配置里的 `mcp_servers`），避免群聊里的诱导借工具碰到本机。
+
 ### 新增来源（2026-10-24 查阅）
 
 - [qq-bridge](https://github.com/Derpyu520/qq-bridge)

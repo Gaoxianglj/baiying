@@ -50,6 +50,7 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
                     text=text,
                     display_name=display,
                     on_interim=lambda said: print(f"{c.name}：{said}", flush=True),
+                    ask=_ask,
                 )
             except ModelError as e:
                 print(f"（出错了：{e}）")
@@ -65,8 +66,13 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
                         f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
                     )
                 print(f"{c.name}：{last.text}   [{last.result.backend}]{extras}\n")
-            for job in last.later:  # 命令行里直接等它做完
-                done = job()
+            for call in last.later:  # 命令行里直接等它做完
+                assert call.later is not None and last.skill_ctx is not None
+                print("（后台进行中，请稍候……）", flush=True)
+                done = call.later()
+                if done.report:
+                    print(f"{c.name}：{c.report(last.skill_ctx, call.skill, done)}\n")
+                    continue
                 for path in c.deliver("cli", channel, done):
                     print(f"{c.name}：[图片] {path}\n")
                 if not done.ok:
@@ -80,6 +86,11 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
         except ModelError as e:
             print(f"整理失败（下次启动会重试）：{e}")
     return 0
+
+
+def _ask(question: str) -> bool:
+    answer = input(f"\n{question}\n批准吗？(y/n) ").strip().lower()
+    return answer in ("y", "yes", "是", "批准")
 
 
 def _ensure_person(c: Companion, person_id: str, name: str | None) -> str:
