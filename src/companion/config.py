@@ -136,6 +136,12 @@ class QQConfig(_Section):
     unsolicited_min_cosine: float = 0.7  # 话题与某条记忆的向量相似度至少这么高才考虑插话
     unsolicited_min_interval_minutes: float = 15.0  # 同一个群里两次主动插话的最短间隔
     max_replies_per_minute: int = 6  # 全局发言上限，防刷屏、降低风控风险
+    # 消息合并：要回的消息先等这么久，把同一个聊天里接连发来的几条合成一轮再回
+    debounce_private_seconds: float = 3.0
+    debounce_group_seconds: float = 4.0
+    # 对话延续：她在群里说完话后这么久内算“还在聊”，每回复一次就刷新
+    conversation_seconds: float = 90.0
+    others_join_conversation: bool = True  # 活跃期内别人插话也交给模型判断（更严格）
 
     @field_validator("owner_accounts", "groups", "aliases", mode="before")
     @classmethod

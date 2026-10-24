@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -25,6 +26,7 @@ from companion.stickers import Sticker, StickerBook, split_sticker
 log = logging.getLogger(__name__)
 
 _CURSOR = "extract_cursor:"
+SILENT_MARK = re.compile(r"[【\[]\s*(不回复|SILENT)\s*[】\]]", re.IGNORECASE)
 
 
 @dataclass
@@ -34,6 +36,7 @@ class Reply:
     bundle: ContextBundle
     event: Event
     sticker: Sticker | None = None  # 想配的表情包（已过概率与冷却）
+    silent: bool = False  # 她判断这一轮不需要接话
 
 
 class Companion:
@@ -123,10 +126,23 @@ class Companion:
         )
         return self.respond(incoming, now=now)
 
-    def respond(self, incoming: Event, now: datetime | None = None) -> Reply:
-        """对一条已经记下的消息作出回复。"""
+    def respond(
+        self,
+        incoming: Event,
+        now: datetime | None = None,
+        *,
+        mode: str = "required",
+        batch: list[Event] | None = None,
+    ) -> Reply:
+        """对一条（或接连几条合并成的一轮）已经记下的消息作出回复。
+
+        mode：required = 被直接叫到，一般要回；optional = 可以不接；
+              strict = 不是冲她来的，更倾向不接。
+        她判断不需要接话时会输出【不回复】，此时返回 silent=True，不记录也不发送。
+        """
         assert incoming.actor.person_id is not None
         body, channel = incoming.body, incoming.channel
+        query = "\n".join(e.content for e in batch) if batch else incoming.content
         sticker_cfg = self.config.stickers
         emotions = (
             self.stickers.emotions()
@@ -137,13 +153,16 @@ class Companion:
             person_id=incoming.actor.person_id,
             body=body,
             channel=channel,
-            query=incoming.content,
+            query=query,
             now=now,
             sticker_emotions=emotions,
+            reply_mode=mode,
         )
         result = self.gateway.chat(bundle.messages, purpose="chat")
-        self.context.mark_recalled(bundle, now=now)
         text, wanted = split_sticker(result.text)
+        if SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted):
+            return Reply("", result, bundle, incoming, None, silent=True)
+        self.context.mark_recalled(bundle, now=now)
         sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
         event = self.ingest.record_self(
             body=body,

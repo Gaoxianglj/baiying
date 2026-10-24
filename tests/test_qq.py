@@ -41,7 +41,13 @@ def bot(tmp_path):
     init_memory(MemoryLayout(config.memory_dir), "白璎", git=False)
     gateway, chat = scripted_gateway(lambda messages, json_mode: "嗯嗯，我在呢。")
     companion = Companion(config, gateway=gateway, embedder=FakeEmbedder())
-    cfg = QQConfig(bot_account=BOT, owner_accounts=[OWNER], groups=[GROUP])
+    cfg = QQConfig(
+        bot_account=BOT,
+        owner_accounts=[OWNER],
+        groups=[GROUP],
+        debounce_private_seconds=0,
+        debounce_group_seconds=0,
+    )
     clock = {"now": T0}
     b = QQBot(companion, cfg, client=FakeClient(), rng=random.Random(1),
               clock=lambda: clock["now"])  # fmt: skip
@@ -73,6 +79,7 @@ def run(bot, *events):
     async def go():
         for ev in events:
             await bot.handle_event(ev)
+            await bot.drain()
 
     asyncio.run(go())
 
@@ -100,7 +107,8 @@ def test_group_mention_alias_and_reply_to_her(bot):
     run(bot, msg("白璎你看这个", group=GROUP, mid=12))
     her_id = str(9000 + len(bot.client.sent))
     run(bot, msg("哈哈", group=GROUP, reply=her_id, mid=13))
-    assert len(bot.client.sent) == 3
+    sends = [a for a, _ in bot.client.sent if a.startswith("send_")]
+    assert len(sends) == 3
 
 
 def test_other_groups_and_self_ignored(bot):
@@ -126,7 +134,8 @@ def test_chime_in_only_when_topic_matches_memory(bot):
     bot.clock["now"] = T0 + timedelta(hours=1)
     run(bot, msg("我在做红石自动门呢", group=GROUP))
     assert len(bot.client.sent) == sent_before + 1
-    # 插话之后有冷却
+    # 对话窗口（90 秒）过后、插话冷却（15 分钟）之内：不再插话
+    bot.clock["now"] = T0 + timedelta(hours=1, minutes=3)
     run(bot, msg("我在做红石自动门呢", group=GROUP))
     assert len(bot.client.sent) == sent_before + 1
 

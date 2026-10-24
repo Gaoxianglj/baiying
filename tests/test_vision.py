@@ -139,7 +139,13 @@ def bot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(media, "fetch", fake_fetch)
     clock = {"now": T0}
-    cfg = QQConfig(bot_account=BOT, groups=[GROUP], unsolicited_probability=0)
+    cfg = QQConfig(
+        bot_account=BOT,
+        groups=[GROUP],
+        unsolicited_probability=0,
+        debounce_private_seconds=0,
+        debounce_group_seconds=0,
+    )
     b = QQBot(companion, cfg, client=FakeClient(), rng=random.Random(1),
               clock=lambda: clock["now"])  # fmt: skip
     b.fetched, b.clock = fetched, clock
@@ -171,6 +177,7 @@ def run(bot, *events):
     async def go():
         for ev in events:
             await bot.handle_event(ev)
+            await bot.drain()
 
     asyncio.run(go())
 
@@ -199,14 +206,18 @@ def test_group_image_seen_while_active(bot):
     assert "[表情包：一只橘猫趴在键盘上]" in contents(bot)
     bot.clock["now"] = T0 + timedelta(seconds=61)
     run(bot, image_msg(group=GROUP, mid=5))
-    assert contents(bot)[-1] == "[图片]"
+    theirs = [e.content for e in bot.c.log.iter_events() if e.actor.person_id != "self"]
+    assert theirs[-1] == "[图片]"  # 过了看图的 60 秒，不看也不下载
 
 
 def test_mentioned_with_image_and_quoted_image(bot):
-    bot.client.messages[77] = {"message": [{"type": "image", "data": {"url": "https://img/77"}}]}
+    bot.client.messages[77] = {
+        "sender": {"user_id": 5555, "nickname": "小红"},
+        "message": [{"type": "image", "data": {"url": "https://img/77"}}],
+    }
     run(bot, image_msg(group=GROUP, at_bot=True, text="这是什么", reply="77", mid=6))
     first = contents(bot)[0]
-    assert first == "这是什么（引用的图片：一只橘猫趴在键盘上）"
+    assert first == "这是什么（引用了小红的话：[图片：一只橘猫趴在键盘上]）"
     assert ("get_msg", {"message_id": 77}) in bot.client.sent
 
 

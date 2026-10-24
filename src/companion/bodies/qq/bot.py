@@ -19,7 +19,7 @@ import re
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -55,6 +55,35 @@ HELP = """可用指令：
 
 FORGET_TTL = timedelta(minutes=10)
 BIND_PREFIX = "bind_request:"
+
+
+_MODE_RANK = {"other": 0, "chime": 1, "partner": 2, "required": 3}
+
+
+@dataclass
+class _Pending:
+    """等待合并回复的一组消息（同一个聊天）。"""
+
+    sources: list[Source] = field(default_factory=list)
+    events: list[Event] = field(default_factory=list)
+    kind: str = "other"
+    required_message_id: str | None = None  # 最后一条直接叫她的消息，群里回复时引用它
+    task: asyncio.Task[None] | None = None
+
+    def add(self, src: Source, event: Event, kind: str) -> None:
+        self.sources.append(src)
+        self.events.append(event)
+        if _MODE_RANK[kind] > _MODE_RANK[self.kind]:
+            self.kind = kind
+        if kind == "required":
+            self.required_message_id = src.message_id
+
+    @property
+    def mode(self) -> str:
+        """交给 Companion 的回复模式：required 一般要回；optional 可沉默；strict 更倾向沉默。"""
+        return {"required": "required", "partner": "optional", "chime": "optional"}.get(
+            self.kind, "strict"
+        )
 
 
 @dataclass
@@ -100,6 +129,8 @@ class QQBot:
         self._sent_ids: deque[str] = deque(maxlen=500)
         self._last_unsolicited: dict[str, datetime] = {}
         self._last_spoke: dict[str, datetime] = {}
+        self._partners: dict[str, dict[str, datetime]] = {}  # 频道 → {刚和她聊过的人: 时间}
+        self._pending: dict[str, _Pending] = {}
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
 
     # ---- 运行 ----
@@ -156,7 +187,7 @@ class QQBot:
             or (src.incoming.reply_to is not None and src.incoming.reply_to in self._sent_ids)
             or any(alias in text for alias in self.cfg.aliases)
         )
-        text, digests = await self._see_images(src, addressed)
+        text, digests = await self._enrich(src, addressed)
         meta: dict[str, object] = {}
         if src.message_id:
             meta["message_id"] = src.message_id
@@ -172,23 +203,99 @@ class QQBot:
             now=src.received_at,
             meta=meta,
         )
-        if not addressed and not await self._should_chime_in(src.channel, text):
+
+        # 决定这条消息算哪一类：必须回 / 对话延续中 / 主动插话 / 只记录
+        if addressed:
+            kind = "required"
+        else:
+            kind = self._conversation_kind(src)
+            if kind is None and await self._should_chime_in(src.channel, text):
+                kind = "chime"
+        if kind is None:
             return
-        if not self._take_rate_slot():
-            log.warning("发言过于频繁，本条只记录不回复")
+        self._enqueue(src, event, kind)
+
+    # ---- 消息合并与对话延续 ----
+
+    def _conversation_kind(self, src: Source) -> str | None:
+        """群里没 @她 的消息：她在“活跃”中（刚说完话的 conversation_seconds 秒内）才考虑接话。
+
+        刚和她聊的人接着说 → partner（交给模型判断要不要接）；别人插话 → other（判断更严格）。
+        """
+        if src.message_type != "group":
+            return None
+        last = self._last_spoke.get(src.channel)
+        window = timedelta(seconds=self.cfg.conversation_seconds)
+        if last is None or self.now() - last > window:
+            return None
+        partners = self._partners.get(src.channel, {})
+        seen = partners.get(src.user_id)
+        if seen is not None and self.now() - seen <= window:
+            return "partner"
+        return "other" if self.cfg.others_join_conversation else None
+
+    def _enqueue(self, src: Source, event: Event, kind: str) -> None:
+        """先不急着回：等一小会儿，把接连发来的几条（文字、图片、表情）合成一轮再回。"""
+        pending = self._pending.get(src.channel)
+        if pending is None:
+            pending = _Pending()
+            self._pending[src.channel] = pending
+        pending.add(src, event, kind)
+        if pending.task is not None:
+            pending.task.cancel()
+        delay = (
+            self.cfg.debounce_private_seconds
+            if src.message_type == "private"
+            else self.cfg.debounce_group_seconds
+        )
+        pending.task = asyncio.create_task(self._flush_later(src.channel, delay))
+
+    async def _flush_later(self, channel: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        pending = self._pending.pop(channel, None)
+        if pending is not None:
+            await self._reply_batch(pending)
+
+    async def drain(self) -> None:
+        """等所有待回的消息处理完（测试与退出时用）。"""
+        while self._pending:
+            tasks = [p.task for p in self._pending.values() if p.task is not None]
+            if not tasks:
+                break
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _reply_batch(self, pending: _Pending) -> None:
+        src = pending.sources[-1]
+        if not self._can_send():
+            log.warning("发言过于频繁，这一轮只记录不回复")
             return
         try:
-            reply = await self._call(self.c.respond, event)
+            reply = await self._call(
+                self.c.respond, pending.events[-1], mode=pending.mode, batch=pending.events
+            )
         except ModelError as e:
             log.error("生成回复失败：%s", e)
             if src.message_type == "private":
                 await self._send(src, "（我这会儿有点恍神，等一下再聊好吗）")
             return
-        quote = src.message_id if src.message_type == "group" and addressed else None
+        if reply.silent:
+            log.info("%s：这一轮选择不回复", src.channel)
+            return
+        self._sent_times.append(self.now())
+        # 群里被直接叫到时引用那条消息，让大家知道她在回谁
+        quote = None
+        if src.message_type == "group" and pending.mode == "required":
+            quote = pending.required_message_id
         if reply.text.strip():
             await self._send(src, reply.text, reply_to=quote)
         if reply.sticker is not None:
             await self._send_sticker(src, reply.sticker.digest)
+        partners = self._partners.setdefault(src.channel, {})
+        for s in pending.sources:
+            partners[s.user_id] = self.now()
 
     def _source(self, ev: dict[str, Any]) -> Source | None:
         user_id = str(ev.get("user_id", ""))
@@ -220,10 +327,10 @@ class QQBot:
         window = timedelta(seconds=self.c.config.vision.active_seconds)
         return last is not None and self.now() - last <= window
 
-    async def _see_images(self, src: Source, addressed: bool) -> tuple[str, list[str]]:
-        """按规则看图，把占位符换成描述；返回（正文，看过的图片哈希）。
+    async def _enrich(self, src: Source, addressed: bool) -> tuple[str, list[str]]:
+        """补全一条消息：按规则看图、写明引用了谁的什么话；返回（正文，看过的图片哈希）。
 
-        私聊、@她、引用并 @她：看；群里没冲她来的：只在她活跃时看，否则记作“[图片]”且不下载。
+        看图：私聊、@她、引用并 @她 时看；群里没冲她来的，只在她活跃时看，否则记作“[图片]”且不下载。
         """
         inc = src.incoming
         vision = self.c.config.vision
@@ -241,19 +348,37 @@ class QQBot:
                 digests.append(digest)
         text = inc.fill_images(descriptions)
 
-        # 引用了一条带图的消息并 @她：把被引用的图也看一下
-        if vision.enabled and addressed and inc.reply_to and inc.reply_to not in self._sent_ids:
-            quoted = await self._quoted_images(inc.reply_to)
-            seen = []
-            for ref in quoted:
+        if inc.reply_to:
+            text += await self._describe_quote(inc.reply_to, read and addressed, digests)
+        return text, digests
+
+    async def _describe_quote(self, message_id: str, look: bool, digests: list[str]) -> str:
+        """引用了一条消息：写明引用的是谁的什么话；@她 时顺便看被引用的图。"""
+        msg = await self._get_message(message_id)
+        if msg is None:
+            return "（引用了一条消息）"
+        sender = msg.get("sender") or {}
+        uid = str(sender.get("user_id", ""))
+        who = (
+            "你"
+            if uid == self.self_id
+            else str(sender.get("card") or sender.get("nickname") or uid or "某人")
+        )
+        quoted = parse_segments(msg.get("message"), self.self_id)
+        descriptions = []
+        for ref in quoted.images:
+            label = "表情包" if ref.sticker else "图片"
+            desc = None
+            if look:
                 desc, digest = await self._look(ref, None)
-                if desc:
-                    seen.append(desc)
                 if digest:
                     digests.append(digest)
-            if seen:
-                text += "（引用的图片：" + "；".join(seen) + "）"
-        return text, digests
+            descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}]")
+        body = quoted.fill_images(descriptions).strip()
+        if len(body) > 120:
+            body = body[:119] + "…"
+        said = "你说的" if who == "你" else f"{who}的话"
+        return f"（引用了{said}：{body or '……'}）"
 
     async def _look(self, ref: ImageRef, src: Source | None) -> tuple[str | None, str | None]:
         """看一张图；表情包顺便判断能否收藏，并记下是谁发的。"""
@@ -281,15 +406,13 @@ class QQBot:
             raise MediaError("拿不到图片地址")
         return await asyncio.to_thread(media.fetch, url, max_bytes=max_bytes)
 
-    async def _quoted_images(self, message_id: str) -> list[ImageRef]:
+    async def _get_message(self, message_id: str) -> dict[str, Any] | None:
         try:
             msg = await self.client.call("get_msg", {"message_id": int(message_id)})
         except (OneBotError, ValueError) as e:
             log.warning("取被引用的消息失败：%s", e)
-            return []
-        if not isinstance(msg, dict):
-            return []
-        return parse_segments(msg.get("message"), self.self_id).images
+            return None
+        return msg if isinstance(msg, dict) else None
 
     # ---- 发言策略 ----
 
@@ -309,14 +432,12 @@ class QQBot:
         self._last_unsolicited[channel] = now
         return True
 
-    def _take_rate_slot(self) -> bool:
+    def _can_send(self) -> bool:
+        """每分钟发言上限（按“回复了几轮”计；选择沉默的不算）。"""
         now = self.now()
         while self._sent_times and now - self._sent_times[0] > timedelta(minutes=1):
             self._sent_times.popleft()
-        if len(self._sent_times) >= self.cfg.max_replies_per_minute:
-            return False
-        self._sent_times.append(now)
-        return True
+        return len(self._sent_times) < self.cfg.max_replies_per_minute
 
     async def _send(self, src: Source, text: str, reply_to: str | None = None) -> None:
         message = text_segments(text, reply_to)

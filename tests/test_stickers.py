@@ -178,15 +178,21 @@ class FakeClient:
 
 def test_qq_collects_and_sends_sticker(companion, monkeypatch):
     monkeypatch.setattr(media, "fetch", lambda url, *, max_bytes, timeout=30.0: png_bytes("purple"))
-    bot = QQBot(companion, QQConfig(bot_account=BOT, groups=[GROUP], unsolicited_probability=0),
-                client=FakeClient(), rng=random.Random(1), clock=lambda: T0)  # fmt: skip
+    cfg = QQConfig(
+        bot_account=BOT,
+        groups=[GROUP],
+        unsolicited_probability=0,
+        debounce_private_seconds=0,
+        debounce_group_seconds=0,
+    )
+    bot = QQBot(companion, cfg, client=FakeClient(), rng=random.Random(1), clock=lambda: T0)
     ev = {
         "post_type": "message", "self_id": int(BOT), "user_id": int(FRIEND), "message_id": 1,
         "message_type": "private", "sender": {"nickname": "小明"}, "time": int(T0.timestamp()),
         "message": [{"type": "image", "data": {"url": "https://img/1", "sub_type": 1}}],
     }  # fmt: skip
     try:
-        asyncio.run(bot.handle_event(ev))
+        asyncio.run(_handle_and_drain(bot, ev))
     finally:
         bot.close()
     assert len(companion.stickers) == 1
@@ -196,3 +202,8 @@ def test_qq_collects_and_sends_sticker(companion, monkeypatch):
     assert sticker_seg["type"] == "image" and sticker_seg["data"]["file"].startswith("base64://")
     first = next(iter(companion.log.iter_events()))
     assert first.content == "[表情包：一只摊手的猫]"
+
+
+async def _handle_and_drain(bot, ev):
+    await bot.handle_event(ev)
+    await bot.drain()

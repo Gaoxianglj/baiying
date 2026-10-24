@@ -20,6 +20,24 @@ from companion.memory.layout import MemoryLayout
 from companion.memory.people import SELF_ID, PeopleRegistry, Person
 from companion.models.openai_compat import ChatMessage
 
+_SILENT_HOW = "不需要接话时，只输出【不回复】这四个字（加括号），不要输出别的。"
+
+_REPLY_RULES = {
+    "required": (
+        "对方在直接和你说话，一般要回应。对方接连发了几条（比如一句话加一个表情）时，"
+        "把它们当成一轮，只回一次，不要逐条回应。"
+        "如果最后只是一个表情、一句“嗯/好/哈哈”之类的收尾，可以只回一个表情或不回。" + _SILENT_HOW
+    ),
+    "optional": (
+        "这条消息没有直接叫你，但你们刚刚还在聊。如果对方明显是在接着跟你说话，就自然地回；"
+        "如果是在跟别人说、话题已经结束、或只是附和和表情，就不要接。" + _SILENT_HOW
+    ),
+    "strict": (
+        "这条消息不是冲你来的，是群里别人在说话。只有当话题明显和你有关、或你有很想说的一句话时才插嘴，"
+        "大多数时候都不要接。" + _SILENT_HOW
+    ),
+}
+
 _SCENES = {
     "qq": "在 QQ 上",
     "minecraft": "在《我的世界》里",
@@ -74,6 +92,7 @@ class ContextAssembler:
         query: str,
         now: datetime | None = None,
         sticker_emotions: list[str] | None = None,
+        reply_mode: str = "required",
     ) -> ContextBundle:
         now = now or datetime.now(UTC)
         person_id = self.people.canonical(person_id)
@@ -90,6 +109,7 @@ class ContextAssembler:
         dialogue = self._recent_dialogue(channel, now)
 
         prompt = self._render(person, person_id, body, channel, facts, shared, recalled, now)
+        prompt += "\n\n【要不要接话】\n" + _REPLY_RULES.get(reply_mode, _REPLY_RULES["required"])
         if sticker_emotions:
             prompt += (
                 "\n\n【表情包】\n你收藏了一些表情包，能表达："
