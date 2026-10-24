@@ -30,6 +30,10 @@ data/        运行时记忆数据（不进仓库）
 uv sync
 uv run companion config    # 查看生效配置（密钥打码）
 uv run companion init      # 创建记忆文件夹 data/memory/
+uv run companion chat --as <你的id>   # 命令行聊天
+uv run companion qq        # 连接 NapCat，在 QQ 上运行
+uv run companion web       # 本机控制台：状态、设置、种子、人物与记忆、日记
+uv run companion sleep     # 手动做一次“睡眠”
 uv run pytest
 uv run ruff check .
 ```

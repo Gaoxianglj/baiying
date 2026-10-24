@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="模型后端状态、本月花费与记忆数量")
     sub.add_parser("qq", help="连接 NapCat，在 QQ 上运行")
+    web = sub.add_parser("web", help="打开本机控制台网页：查看状态、调整设置、管理记忆")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     sub.add_parser("sleep", help="立刻做一次“睡眠”：整理、遗忘、合并、反思、写日记")
 
     args = parser.parse_args(argv)
@@ -84,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
                 done = c.extract_pending(force=args.force)
                 facts = sum(len(x.facts) for x in done)
                 print(f"整理了 {len(done)} 段会话，{facts} 条新事实")
+        elif args.command == "web":
+            from companion.web.server import run_web
+
+            return run_web(config.root, args.port, not args.no_browser)
         elif args.command == "qq":
             from companion.bodies.qq.runner import run_qq
 

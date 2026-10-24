@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>白璎控制台</title>
+<style>
+  :root {
+    --bg: #faf9ff;
+    --panel: #ffffff;
+    --ink: #241f36;
+    --muted: #6f6a86;
+    --faint: #9a95b0;
+    --line: #ece8f8;
+    --violet-50: #f6f2ff;
+    --violet-100: #ede5ff;
+    --violet-200: #dccdfe;
+    --violet-300: #c4abfc;
+    --violet-400: #a47ff7;
+    --violet-500: #8b5cf6;
+    --violet-600: #7442e6;
+    --violet-700: #6030c9;
+    --green: #12a37a;
+    --amber: #d98a06;
+    --rose: #e0446a;
+    --shadow: 0 1px 2px rgba(60, 30, 120, .04), 0 8px 24px rgba(90, 50, 180, .07);
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: "Inter", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+
+  /* ---------- 布局 ---------- */
+  .app { display: grid; grid-template-columns: 248px 1fr; min-height: 100vh; }
+  aside {
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    padding: 28px 18px;
+    position: sticky; top: 0; height: 100vh;
+    display: flex; flex-direction: column; gap: 28px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px; }
+  .avatar {
+    width: 46px; height: 46px; border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 20px; font-weight: 600; color: #fff;
+    background: radial-gradient(circle at 30% 25%, #e9ddff 0, #b897fb 35%, #7442e6 100%);
+    box-shadow: 0 6px 16px rgba(116, 66, 230, .35), inset 0 0 0 2px rgba(255,255,255,.5);
+    flex: none;
+  }
+  .brand h1 { font-size: 17px; margin: 0; letter-spacing: .02em; }
+  .brand p { margin: 0; font-size: 12px; color: var(--faint); }
+  nav { display: flex; flex-direction: column; gap: 4px; }
+  nav button {
+    display: flex; align-items: center; gap: 12px;
+    border: 0; background: none; cursor: pointer;
+    padding: 10px 14px; border-radius: 12px;
+    color: var(--muted); text-align: left; font-size: 14px;
+    transition: background .15s, color .15s;
+  }
+  nav button:hover { background: var(--violet-50); color: var(--violet-700); }
+  nav button.active { background: var(--violet-100); color: var(--violet-700); font-weight: 600; }
+  nav svg { width: 18px; height: 18px; flex: none; }
+  .aside-foot { margin-top: auto; font-size: 12px; color: var(--faint); padding: 0 10px; }
+
+  main { padding: 36px 44px 120px; max-width: 1180px; width: 100%; }
+  .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+  .page-head h2 { font-size: 24px; margin: 0; letter-spacing: .01em; }
+  .page-head p { margin: 4px 0 0; color: var(--muted); }
+
+  /* ---------- 通用组件 ---------- */
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 20px 22px;
+  }
+  .card h3 { margin: 0 0 12px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .grid { display: grid; gap: 18px; }
+  .grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--faint); }
+  .dot.on { background: var(--green); box-shadow: 0 0 0 4px rgba(18,163,122,.12); }
+  .dot.off { background: var(--rose); box-shadow: 0 0 0 4px rgba(224,68,106,.1); }
+  .btn {
+    border: 1px solid var(--violet-200); background: #fff; color: var(--violet-700);
+    padding: 8px 16px; border-radius: 10px; cursor: pointer; font-weight: 500;
+    transition: all .15s;
+  }
+  .btn:hover { background: var(--violet-50); border-color: var(--violet-300); }
+  .btn.primary {
+    background: linear-gradient(135deg, var(--violet-500), var(--violet-600));
+    border-color: transparent; color: #fff; box-shadow: 0 4px 14px rgba(116,66,230,.28);
+  }
+  .btn.primary:hover { filter: brightness(1.05); }
+  .btn.danger { color: var(--rose); border-color: #f5c8d4; }
+  .btn.danger:hover { background: #fff3f6; }
+  .btn.small { padding: 4px 10px; font-size: 12px; border-radius: 8px; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 12px; padding: 1px 9px; border-radius: 999px;
+    background: var(--violet-50); color: var(--violet-700); border: 1px solid var(--violet-100);
+    white-space: nowrap;
+  }
+  .chip.green { background: #ebf9f4; color: var(--green); border-color: #cdeee2; }
+  .chip.amber { background: #fff6e6; color: var(--amber); border-color: #f8e2b5; }
+  .chip.grey { background: #f4f3f8; color: var(--muted); border-color: #e8e6ef; }
+  .bar { height: 8px; background: var(--violet-50); border-radius: 999px; overflow: hidden; }
+  .bar > i {
+    display: block; height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, var(--violet-300), var(--violet-600));
+    transition: width .6s ease;
+  }
+  .bar.warn > i { background: linear-gradient(90deg, #f7c46c, var(--amber)); }
+  .bar.full > i { background: linear-gradient(90deg, #f39ab0, var(--rose)); }
+  .empty { text-align: center; color: var(--faint); padding: 36px 0; }
+
+  /* ---------- 概览 ---------- */
+  .hero {
+    position: relative; overflow: hidden;
+    border-radius: 20px; padding: 28px 30px; margin-bottom: 20px;
+    background: linear-gradient(120deg, #7442e6 0%, #9a6cf8 55%, #c9b2ff 100%);
+    color: #fff; box-shadow: 0 14px 34px rgba(116,66,230,.28);
+  }
+  .hero::after {
+    content: ""; position: absolute; right: -60px; top: -80px; width: 280px; height: 280px;
+    border-radius: 50%; background: radial-gradient(circle, rgba(255,255,255,.35), rgba(255,255,255,0) 70%);
+  }
+  .hero h2 { margin: 0; font-size: 26px; }
+  .hero p { margin: 6px 0 0; opacity: .9; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 6px; }
+  .stat b { display: block; font-size: 24px; font-weight: 650; color: var(--violet-700); line-height: 1.3; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; text-align: right; }
+  .quota { margin-bottom: 12px; }
+  .quota .row { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 13px; }
+
+  /* ---------- 设置 ---------- */
+  .section-card { margin-bottom: 18px; padding: 6px 22px; }
+  .section-card > h3 { padding: 14px 0 6px; margin: 0; }
+  .field {
+    display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 24px; align-items: center;
+    padding: 14px 0; border-top: 1px solid var(--line);
+  }
+  .section-card > h3 + .field { border-top: 0; }
+  .field .label { font-weight: 550; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .field .help { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .field .control { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+  .field.dirty { background: linear-gradient(90deg, var(--violet-50), transparent 70%); margin: 0 -22px; padding: 14px 22px; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; border: 1px solid var(--line); background: #fdfcff;
+    border-radius: 10px; padding: 8px 12px; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--violet-400); box-shadow: 0 0 0 4px var(--violet-100); }
+  input:disabled, select:disabled { background: #f6f5fa; color: var(--faint); }
+  .unit { color: var(--muted); white-space: nowrap; font-size: 13px; }
+  .num-wrap { display: flex; align-items: center; gap: 8px; width: 100%; }
+  .num-wrap input { max-width: 140px; margin-left: auto; }
+  .switch { position: relative; width: 44px; height: 24px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span {
+    position: absolute; inset: 0; border-radius: 999px; background: #dcd8e8; cursor: pointer; transition: .2s;
+  }
+  .switch span::before {
+    content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.2); transition: .2s;
+  }
+  .switch input:checked + span { background: var(--violet-500); }
+  .switch input:checked + span::before { transform: translateX(20px); }
+  .switch input:disabled + span { opacity: .5; cursor: default; }
+  .slider-wrap { display: flex; align-items: center; gap: 12px; width: 100%; }
+  input[type=range] { flex: 1; accent-color: var(--violet-500); height: 4px; }
+  .slider-val {
+    min-width: 54px; text-align: center; font-variant-numeric: tabular-nums;
+    background: var(--violet-50); color: var(--violet-700); border-radius: 8px; padding: 2px 8px; font-weight: 600;
+  }
+  .link { color: var(--violet-600); cursor: pointer; font-size: 12px; background: none; border: 0; padding: 0; }
+  .link:hover { text-decoration: underline; }
+  .savebar {
+    position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, calc(100% + 40px));
+    visibility: hidden;
+    background: #2a2340; color: #fff; border-radius: 14px; padding: 10px 12px 10px 20px;
+    display: flex; align-items: center; gap: 14px; box-shadow: 0 12px 34px rgba(30,20,60,.35);
+    transition: transform .3s cubic-bezier(.2,.9,.3,1.2); z-index: 20;
+  }
+  .savebar.show { transform: translate(-50%, 0); visibility: visible; }
+  .savebar .btn { border-color: rgba(255,255,255,.25); background: transparent; color: #fff; }
+  .savebar .btn.primary { background: linear-gradient(135deg, var(--violet-400), var(--violet-600)); }
+
+  /* ---------- 白璎 ---------- */
+  textarea.seed {
+    min-height: 460px; resize: vertical; line-height: 1.75; padding: 14px 16px;
+    font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Microsoft YaHei", monospace; font-size: 13px;
+  }
+  .md h1 { font-size: 18px; margin: 0 0 8px; }
+  .md h2 { font-size: 14px; margin: 16px 0 6px; color: var(--violet-700); }
+  .md ul { margin: 0; padding-left: 20px; }
+  .md li { margin: 3px 0; }
+  .md blockquote { margin: 0 0 10px; padding: 6px 12px; border-left: 3px solid var(--violet-200); color: var(--muted); background: var(--violet-50); border-radius: 0 8px 8px 0; }
+  .md p { margin: 6px 0; }
+  .md .src { color: var(--faint); font-size: 11px; }
+
+  /* ---------- 人物 ---------- */
+  .people { display: grid; grid-template-columns: 280px 1fr; gap: 18px; align-items: start; }
+  .plist { display: flex; flex-direction: column; gap: 8px; position: sticky; top: 24px; }
+  .pitem {
+    display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 14px;
+    border: 1px solid var(--line); background: #fff; cursor: pointer; transition: .15s; text-align: left;
+  }
+  .pitem:hover { border-color: var(--violet-200); }
+  .pitem.active { border-color: var(--violet-400); background: var(--violet-50); box-shadow: 0 0 0 3px var(--violet-100); }
+  .pav {
+    width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none;
+    background: var(--violet-100); color: var(--violet-700); font-weight: 600;
+  }
+  .pitem .meta { font-size: 12px; color: var(--faint); }
+  .memo { display: flex; gap: 12px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--line); }
+  .memo:first-of-type { border-top: 0; }
+  .memo .body { flex: 1; }
+  .memo .when { font-size: 12px; color: var(--faint); margin-top: 2px; display: flex; gap: 8px; align-items: center; }
+
+  /* ---------- 日记 ---------- */
+  .journal { display: grid; grid-template-columns: 240px 1fr; gap: 18px; align-items: start; }
+  .jitem { padding: 10px 14px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; }
+  .jitem:hover { background: var(--violet-50); }
+  .jitem.active { background: var(--violet-100); border-color: var(--violet-200); }
+  .jitem b { display: block; font-size: 13px; }
+  .jitem span { font-size: 12px; color: var(--faint); display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+  .paper {
+    background: #fff; border-radius: 18px; padding: 34px 40px; border: 1px solid var(--line); box-shadow: var(--shadow);
+    font-family: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", serif; font-size: 16px; line-height: 2;
+    border-left: 4px solid var(--violet-200);
+  }
+  .persona-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); align-items: start; }
+  .paper h3 { font-family: inherit; color: var(--violet-700); margin: 0 0 10px; }
+
+  /* ---------- 弹窗与提示 ---------- */
+  .toast {
+    position: fixed; top: 22px; left: 50%; transform: translate(-50%, -12px);
+    background: #fff; border: 1px solid var(--violet-200); color: var(--ink);
+    border-radius: 12px; padding: 10px 18px; box-shadow: var(--shadow); z-index: 40;
+    display: flex; gap: 8px; align-items: center;
+    opacity: 0; visibility: hidden; transition: opacity .25s, transform .25s, visibility .25s;
+  }
+  .toast.show { transform: translate(-50%, 0); opacity: 1; visibility: visible; }
+  .toast.err { border-color: #f5c8d4; }
+  .modal-back { position: fixed; inset: 0; background: rgba(36,31,54,.35); display: none; place-items: center; z-index: 30; backdrop-filter: blur(2px); }
+  .modal-back.show { display: grid; }
+  .modal { background: #fff; border-radius: 18px; padding: 24px; width: min(440px, 92vw); box-shadow: 0 24px 60px rgba(40,20,90,.3); }
+  .modal h3 { margin: 0 0 8px; }
+  .modal .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+
+  @media (max-width: 920px) {
+    .app { grid-template-columns: 1fr; }
+    aside {
+      position: sticky; top: 0; z-index: 10; height: auto; flex-direction: row; flex-wrap: wrap;
+      align-items: center; padding: 10px 14px; gap: 10px 18px;
+    }
+    .avatar { width: 36px; height: 36px; font-size: 16px; }
+    .brand p { display: none; }
+    nav { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 2px; }
+    nav button { padding: 7px 10px; }
+    .aside-foot { display: none; }
+    main { padding: 20px 16px 120px; }
+    .grid.cols-2, .grid.cols-3, .people, .journal, .persona-grid { grid-template-columns: 1fr; }
+    .field { grid-template-columns: 1fr; gap: 8px; }
+    .field .control { justify-content: flex-start; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .plist { position: static; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">
+      <div class="avatar" id="brandAvatar">璎</div>
+      <div><h1 id="brandName">白璎</h1><p>长期记忆 AI 伙伴</p></div>
+    </div>
+    <nav id="nav">
+      <button data-page="overview" class="active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>概览</button>
+      <button data-page="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>设置</button>
+      <button data-page="persona">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 21s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 5.6-7 10-7 10z"/></svg><span id="navPersona">白璎</span></button>
+      <button data-page="people">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17.5" cy="9" r="2.5"/><path d="M16 14.5a5 5 0 0 1 6 5"/></svg>人物与记忆</button>
+      <button data-page="journal">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3h11a2 2 0 0 1 2 2v16l-3-2-3 2-3-2-3 2V5a2 2 0 0 1 2-2z"/><path d="M9 8h7M9 12h7"/></svg>日记</button>
+    </nav>
+    <div class="aside-foot">设置保存后，需重启<br><code>companion qq</code> 才会生效</div>
+  </aside>
+  <main id="main"></main>
+</div>
+
+<div class="savebar" id="savebar">
+  <span id="saveText">有 0 项未保存</span>
+  <button class="btn small" id="undoBtn">撤销</button>
+  <button class="btn small primary" id="saveBtn">保存</button>
+</div>
+<div class="toast" id="toast"></div>
+<div class="modal-back" id="modalBack">
+  <div class="modal">
+    <h3 id="modalTitle"></h3>
+    <div id="modalBody" class="muted"></div>
+    <div class="actions">
+      <button class="btn" id="modalCancel">取消</button>
+      <button class="btn primary" id="modalOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (sel, root = document) => root.querySelector(sel);
+const main = $("#main");
+const state = { page: "overview", fields: [], dirty: {}, person: null, journal: null, persona: "白璎" };
+
+// ---------- 工具 ----------
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtTime = iso => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+};
+const fmtDate = iso => iso ? new Date(iso).toLocaleDateString("zh-CN", { year: "numeric", month: "numeric", day: "numeric" }) : "—";
+const greeting = () => {
+  const h = new Date().getHours();
+  return h < 5 ? "夜深了" : h < 11 ? "早上好" : h < 14 ? "中午好" : h < 18 ? "下午好" : "晚上好";
+};
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const res = await fetch("/api/" + path, opt);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("请求失败：" + res.status));
+  return data;
+}
+
+let toastTimer;
+function toast(msg, err = false) {
+  const t = $("#toast");
+  t.innerHTML = (err ? "⚠️ " : "✨ ") + esc(msg);
+  t.className = "toast show" + (err ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = "toast" + (err ? " err" : ""), 3200);
+}
+
+function confirmBox(title, body, okText = "确定") {
+  return new Promise(resolve => {
+    $("#modalTitle").textContent = title;
+    $("#modalBody").innerHTML = body;
+    $("#modalOk").textContent = okText;
+    $("#modalBack").classList.add("show");
+    const done = v => { $("#modalBack").classList.remove("show"); $("#modalOk").onclick = $("#modalCancel").onclick = null; resolve(v); };
+    $("#modalOk").onclick = () => done(true);
+    $("#modalCancel").onclick = () => done(false);
+  });
+}
+
+// 极简 Markdown：标题、列表、引用、段落；〔出处〕显示为浅色
+function md(text) {
+  text = String(text || "").replace(/^---\n[\s\S]*?\n---\n/, "");
+  const out = []; let list = false;
+  const inline = s => esc(s).replace(/〔([^〕]*)〕/g, '<span class="src">〔$1〕</span>');
+  for (const raw of text.split("\n")) {
+    const line = raw.trimEnd();
+    const li = line.match(/^\s*[-*] (.*)$/);
+    if (!li && list) { out.push("</ul>"); list = false; }
+    if (li) { if (!list) { out.push("<ul>"); list = true; } out.push(`<li>${inline(li[1])}</li>`); }
+    else if (line.startsWith("## ")) out.push(`<h2>${inline(line.slice(3))}</h2>`);
+    else if (line.startsWith("# ")) out.push(`<h1>${inline(line.slice(2))}</h1>`);
+    else if (line.startsWith(">")) out.push(`<blockquote>${inline(line.replace(/^>\s?/, ""))}</blockquote>`);
+    else if (line.trim()) out.push(`<p>${inline(line)}</p>`);
+  }
+  if (list) out.push("</ul>");
+  // 下面没有内容的小标题，补一句“还没有”
+  const filled = [];
+  out.forEach((html, i) => {
+    filled.push(html);
+    if (html.startsWith("<h2>") && (i === out.length - 1 || out[i + 1].startsWith("<h2>")))
+      filled.push('<p class="faint">还没有内容，会在之后的反思里慢慢写上。</p>');
+  });
+  return filled.join("") || '<p class="faint">（还是空的）</p>';
+}
+
+function setPersona(name) {
+  state.persona = name || "白璎";
+  $("#brandName").textContent = state.persona;
+  $("#navPersona").textContent = state.persona;
+  $("#brandAvatar").textContent = state.persona.slice(-1);
+  document.title = state.persona + "控制台";
+}
+
+// ---------- 导航 ----------
+$("#nav").addEventListener("click", e => {
+  const b = e.target.closest("button[data-page]");
+  if (b) go(b.dataset.page);
+});
+async function go(page) {
+  if (Object.keys(state.dirty).length && page !== "settings") {
+    const leave = await confirmBox("有未保存的设置", "离开这个页面会丢掉还没保存的修改。", "仍然离开");
+    if (!leave) return;
+    state.dirty = {}; updateSavebar();
+  }
+  state.page = page;
+  document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("active", b.dataset.page === page));
+  main.innerHTML = '<div class="empty">加载中…</div>';
+  try { await pages[page](); } catch (err) { main.innerHTML = `<div class="card empty">😢 ${esc(err.message)}</div>`; }
+}
+
+const pages = {};
+
+// ---------- 概览 ----------
+pages.overview = async (refresh = false) => {
+  const d = await api("overview" + (refresh ? "?refresh=1" : ""));
+  setPersona(d.persona);
+  const m = d.memory, fb = d.fallback;
+  const backend = name => d.backends.find(b => b.name === name) || {};
+  const sub = backend("subscription"), fbs = backend("fallback");
+  const pct = fb.budget ? Math.min(100, fb.spent / fb.budget * 100) : 0;
+  const barCls = p => p >= 100 ? "bar full" : p >= 80 ? "bar warn" : "bar";
+  const windowName = mins => mins === 300 ? "5 小时窗口" : mins === 10080 ? "7 天窗口" : mins ? `${mins} 分钟窗口` : "额度窗口";
+  const quotas = d.quota_windows.length ? d.quota_windows.map(w => `
+      <div class="quota">
+        <div class="row"><span>${windowName(w.minutes)}</span><span class="muted">已用 <b>${w.used}%</b> · ${w.resets_at ? fmtTime(w.resets_at) + " 重置" : ""}</span></div>
+        <div class="${barCls(w.used)}"><i style="width:${w.used}%"></i></div>
+      </div>`).join("") : '<p class="faint">暂时读不到额度信息</p>';
+  main.innerHTML = `
+    <div class="hero">
+      <h2>${greeting()}，这里是${esc(d.persona)}的控制台</h2>
+      <p>她现在记得 ${m.people} 个人、${m.facts} 条事实、${m.episodes} 段经历${m.last_sleep ? "，上次睡眠在 " + fmtTime(m.last_sleep) : "，还没有睡过觉"}。</p>
+    </div>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3><span class="dot ${sub.available ? "on" : "off"}"></span>GPT 订阅
+          <span style="margin-left:auto"><button class="btn small" id="refreshQuota">刷新额度</button></span></h3>
+        <p class="faint" style="margin:-6px 0 12px">${esc(sub.detail || "")}</p>
+        ${quotas}
+      </div>
+      <div class="card">
+        <h3><span class="dot ${fbs.available ? "on" : "off"}"></span>DeepSeek 兜底</h3>
+        <div class="quota">
+          <div class="row"><span>本月花费</span><span class="muted"><b>$${fb.spent.toFixed(4)}</b> / $${fb.budget}</span></div>
+          <div class="${barCls(pct)}"><i style="width:${Math.max(pct, fb.spent > 0 ? 1.5 : 0)}%"></i></div>
+        </div>
+        <dl class="kv">
+          <dt>模型</dt><dd>${esc(fb.model || "未设置")}</dd>
+          <dt>API key</dt><dd>${fb.key_set ? '<span class="chip green">已设置</span>' : '<span class="chip amber">未设置</span>'}</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h3>🧠 记忆</h3>
+        <div class="stats">
+          <div class="stat"><b>${m.people}</b><span>认识的人</span></div>
+          <div class="stat"><b>${m.facts}</b><span>有效事实</span></div>
+          <div class="stat"><b>${m.episodes}</b><span>共同经历</span></div>
+          <div class="stat"><b>${m.superseded_facts}</b><span>已更新的旧事实</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>💬 QQ</h3>
+        <dl class="kv">
+          <dt>账号</dt><dd>${esc(d.qq.account || "未设置")}</dd>
+          <dt>NapCat token</dt><dd>${d.qq.token_set ? '<span class="chip green">已设置</span>' : '<span class="chip amber">未设置</span>'}</dd>
+          <dt>允许的群</dt><dd>${d.qq.groups} 个</dd>
+          <dt>主人账号</dt><dd>${d.qq.owners} 个</dd>
+        </dl>
+      </div>
+    </div>
+    <div class="card" style="margin-top:18px;cursor:${d.latest_journal ? "pointer" : "default"}" id="latestJournal">
+      <h3>📔 最近的日记</h3>
+      ${d.latest_journal ? `<p style="margin:0"><span class="chip">${esc(d.latest_journal.date)}</span>
+        <span class="muted" style="margin-left:8px">${esc(d.latest_journal.preview)}…</span></p>` : '<p class="faint">她还没有写过日记。每天睡眠后会写一篇。</p>'}
+    </div>`;
+  $("#refreshQuota").onclick = async () => { await pages.overview(true); toast("额度已刷新"); };
+  if (d.latest_journal) $("#latestJournal").onclick = () => { state.journal = d.latest_journal.date; go("journal"); };
+};
+
+// ---------- 设置 ----------
+const SOURCE_CHIP = { "默认": "grey", "config.toml": "grey", "本机设置": "", ".env": "amber", "环境变量": "amber" };
+pages.settings = async () => {
+  const d = await api("settings");
+  state.fields = d.fields;
+  renderSettings();
+};
+
+function renderSettings() {
+  const sections = [];
+  for (const f of state.fields) {
+    let s = sections.find(x => x.name === f.section);
+    if (!s) sections.push(s = { name: f.section, fields: [] });
+    s.fields.push(f);
+  }
+  const icons = { "人格": "💜", "模型": "🤖", "记忆": "🧠", "QQ": "💬", "睡眠": "🌙" };
+  main.innerHTML = `
+    <div class="page-head"><div><h2>设置</h2>
+      <p>保存到本机设置（<code>config.local.toml</code>）；原本写在 <code>.env</code> 的项会改回 <code>.env</code>。密钥不会出现在这里。</p></div></div>
+    ${sections.map(s => `<div class="card section-card"><h3>${icons[s.name] || "⚙️"} ${esc(s.name)}</h3>
+      ${s.fields.map(fieldRow).join("")}</div>`).join("")}`;
+  main.querySelectorAll("[data-path]").forEach(el => {
+    const ev = el.type === "range" || el.type === "text" || el.type === "number" ? "input" : "change";
+    el.addEventListener(ev, () => onFieldChange(el));
+  });
+  main.querySelectorAll("[data-reset]").forEach(b => b.onclick = () => resetField(b.dataset.reset));
+}
+
+function currentValue(f) { return f.path in state.dirty ? state.dirty[f.path] : f.value; }
+
+function fieldRow(f) {
+  const v = currentValue(f);
+  const locked = f.source === "环境变量";
+  const dis = locked ? "disabled" : "";
+  let control;
+  if (f.kind === "bool") {
+    control = `<label class="switch"><input type="checkbox" data-path="${f.path}" ${v ? "checked" : ""} ${dis}><span></span></label>`;
+  } else if (f.kind === "select") {
+    control = `<select data-path="${f.path}" ${dis}>${f.options.map(o => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+  } else if (f.kind === "slider") {
+    control = `<div class="slider-wrap"><input type="range" data-path="${f.path}" min="${f.min}" max="${f.max}" step="${f.step}" value="${v ?? f.min}" ${dis}>
+      <span class="slider-val" id="sv-${f.path.replaceAll(".", "-")}">${fmtSlider(f, v)}</span></div>`;
+  } else if (f.kind === "number") {
+    control = `<div class="num-wrap"><input type="number" data-path="${f.path}" min="${f.min ?? ""}" max="${f.max ?? ""}" step="${f.step ?? "any"}" value="${v ?? ""}" ${dis}>
+      ${f.unit ? `<span class="unit">${esc(f.unit)}</span>` : ""}</div>`;
+  } else if (f.kind === "list") {
+    control = `<input type="text" data-path="${f.path}" value="${esc((v || []).join(", "))}" placeholder="用逗号分隔" ${dis}>`;
+  } else {
+    control = `<input type="text" data-path="${f.path}" value="${esc(v ?? "")}" placeholder="${esc(f.default ?? "（留空 = 默认）")}" ${dis}>`;
+  }
+  const chip = `<span class="chip ${SOURCE_CHIP[f.source] ?? ""}" title="${f.env_var ? "环境变量名：" + esc(f.env_var) : ""}">${esc(f.source)}</span>`;
+  const reset = f.source === "本机设置" ? `<button class="link" data-reset="${f.path}">恢复默认</button>` : "";
+  return `<div class="field ${f.path in state.dirty ? "dirty" : ""}" id="row-${f.path.replaceAll(".", "-")}">
+      <div><div class="label">${esc(f.label)} ${chip} ${reset}</div>
+        <div class="help">${esc(f.help)}${locked ? "（由系统环境变量设定，这里不能改）" : ""}</div></div>
+      <div class="control">${control}</div></div>`;
+}
+
+function fmtSlider(f, v) {
+  if (v === null || v === undefined) return "—";
+  if (f.unit === "%") return Math.round(v) + "%";
+  if (f.max <= 1) return Math.round(v * 100) + "%";
+  return Number(v).toFixed(2);
+}
+
+function onFieldChange(el) {
+  const f = state.fields.find(x => x.path === el.dataset.path);
+  let v;
+  if (f.kind === "bool") v = el.checked;
+  else if (f.kind === "number" || f.kind === "slider") v = el.value === "" ? null : Number(el.value);
+  else if (f.kind === "list") v = el.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+  else v = el.value;
+  if (f.kind === "slider") $("#sv-" + f.path.replaceAll(".", "-")).textContent = fmtSlider(f, v);
+  const same = JSON.stringify(v) === JSON.stringify(f.value) || (f.kind === "text" && (v || null) === (f.value || null));
+  if (same) delete state.dirty[f.path]; else state.dirty[f.path] = v;
+  $("#row-" + f.path.replaceAll(".", "-")).classList.toggle("dirty", f.path in state.dirty);
+  updateSavebar();
+}
+
+function updateSavebar() {
+  const n = Object.keys(state.dirty).length;
+  $("#saveText").textContent = `有 ${n} 项未保存`;
+  $("#savebar").classList.toggle("show", n > 0);
+}
+
+$("#undoBtn").onclick = () => { state.dirty = {}; updateSavebar(); renderSettings(); };
+$("#saveBtn").onclick = async () => {
+  const btn = $("#saveBtn"); btn.disabled = true;
+  try {
+    const d = await api("settings", { changes: state.dirty });
+    state.fields = d.fields; state.dirty = {}; updateSavebar(); renderSettings();
+    const persona = state.fields.find(f => f.path === "persona.name");
+    if (persona) setPersona(persona.value);
+    toast(`已保存到 ${d.written.join("、") || "本机设置"}，重启 companion qq 后生效`);
+  } catch (err) { toast(err.message, true); }
+  finally { btn.disabled = false; }
+};
+
+async function resetField(path) {
+  try {
+    const d = await api("settings-reset", { path });
+    state.fields = d.fields; delete state.dirty[path]; updateSavebar(); renderSettings();
+    toast("已恢复默认");
+  } catch (err) { toast(err.message, true); }
+}
+
+// ---------- 白璎 ----------
+pages.persona = async () => {
+  const d = await api("self");
+  main.innerHTML = `
+    <div class="page-head"><div><h2>${esc(state.persona)}</h2>
+      <p>种子是她的核心性格与底线，只由你修改；自我认知和表达习惯由她每天的反思自动更新。</p></div></div>
+    <div class="grid persona-grid">
+      <div class="card">
+        <h3>🌱 种子 <span class="chip">只由你修改</span></h3>
+        <textarea class="seed" id="seedText" spellcheck="false">${esc(d.seed)}</textarea>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+          <span class="faint">保存后会记进她的记忆仓库</span>
+          <button class="btn primary" id="saveSeed">保存种子</button>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card md"><h3>🪞 自我认知 <span class="chip grey">每周反思</span></h3>${md(d.identity)}</div>
+        <div class="card md"><h3>🎐 表达习惯 <span class="chip grey">表达学习</span></h3>${md(d.style)}</div>
+      </div>
+    </div>`;
+  $("#saveSeed").onclick = async () => {
+    try { await api("seed", { text: $("#seedText").value }); toast("种子已保存，下一句话起就会生效"); }
+    catch (err) { toast(err.message, true); }
+  };
+};
+
+// ---------- 人物与记忆 ----------
+pages.people = async () => {
+  const d = await api("people");
+  const all = [{ id: "self", names: [state.persona + "（自己）"], facts: d.self_facts, episodes: 0, accounts: {} }, ...d.people];
+  if (!state.person || !all.some(p => p.id === state.person)) state.person = (d.people[0] || all[0]).id;
+  main.innerHTML = `
+    <div class="page-head"><div><h2>人物与记忆</h2>
+      <p>她认识的人、知道的事和一起经历过的事。不想让她记得的，可以在这里让她彻底忘掉。</p></div></div>
+    <div class="people">
+      <div class="plist">${all.map(p => `
+        <button class="pitem ${p.id === state.person ? "active" : ""}" data-pid="${esc(p.id)}">
+          <div class="pav">${esc((p.names[0] || p.id).slice(0, 1))}</div>
+          <div><div>${esc(p.names.join(" / "))}</div>
+            <div class="meta">${p.facts} 条事实 · ${p.episodes} 段经历${Object.entries(p.accounts).map(([k, v]) => " · " + k + " " + v.length).join("")}</div></div>
+        </button>`).join("")}</div>
+      <div id="personDetail"><div class="card empty">加载中…</div></div>
+    </div>`;
+  main.querySelectorAll(".pitem").forEach(b => b.onclick = () => {
+    state.person = b.dataset.pid;
+    main.querySelectorAll(".pitem").forEach(x => x.classList.toggle("active", x === b));
+    loadPerson();
+  });
+  loadPerson();
+};
+
+const STATE_CHIP = { vivid: ["鲜活", "green"], faded: ["淡化", "amber"], compressed: ["压缩", "grey"], dormant: ["沉睡", "grey"] };
+async function loadPerson() {
+  const box = $("#personDetail");
+  const p = await api("people/" + encodeURIComponent(state.person));
+  box.innerHTML = `
+    ${p.profile ? `<div class="card md" style="margin-bottom:18px">${md(p.profile)}</div>` : ""}
+    <div class="card" style="margin-bottom:18px"><h3>📌 知道的事 <span class="chip grey">${p.facts.length}</span></h3>
+      ${p.facts.length ? p.facts.map(f => `
+        <div class="memo"><div class="body">${esc(f.statement)}
+          <div class="when">${fmtDate(f.since)} 得知 ${f.pinned ? '<span class="chip">📌 钉住</span>' : ""}
+            ${f.confidence < 0.7 ? '<span class="chip amber">不太确定</span>' : ""}</div></div>
+          <button class="btn small danger" data-forget="fact:${f.id}">忘掉</button></div>`).join("") : '<p class="faint">还没有</p>'}
+    </div>
+    <div class="card"><h3>🕰️ 一起经历的事 <span class="chip grey">${p.episodes.length}</span></h3>
+      ${p.episodes.length ? p.episodes.map(e => `
+        <div class="memo"><div class="body">${esc(e.summary)}
+          <div class="when">${fmtTime(e.when)} <span class="chip ${STATE_CHIP[e.state][1]}">${STATE_CHIP[e.state][0]}</span></div></div>
+          <button class="btn small danger" data-forget="episode:${e.id}">忘掉</button></div>`).join("") : '<p class="faint">还没有</p>'}
+    </div>`;
+  box.querySelectorAll("[data-forget]").forEach(b => b.onclick = async () => {
+    const [kind, id] = b.dataset.forget.split(":");
+    const text = b.closest(".memo").querySelector(".body").firstChild.textContent.trim();
+    const ok = await confirmBox("让她彻底忘掉这条记忆？",
+      `<p>「${esc(text)}」</p><p class="faint">会同时删除这条记忆依据的原始聊天记录，以及引用同一段对话的其他记忆。删除后无法恢复。</p>`, "忘掉");
+    if (!ok) return;
+    try {
+      const r = await api("forget", { kind, id });
+      toast(`已经忘掉了 ${r.memories} 条记忆、${r.messages} 条聊天记录`);
+      pages.people();
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
+// ---------- 日记 ----------
+pages.journal = async () => {
+  const d = await api("journal");
+  if (!d.entries.length) {
+    main.innerHTML = `<div class="page-head"><div><h2>日记</h2></div></div>
+      <div class="card empty">📔 她还没有写过日记。<br>每天睡眠（默认凌晨 4 点后）会把当天的经历写成一篇。</div>`;
+    return;
+  }
+  if (!state.journal || !d.entries.some(e => e.date === state.journal)) state.journal = d.entries[0].date;
+  main.innerHTML = `
+    <div class="page-head"><div><h2>日记</h2><p>${esc(state.persona)}每天睡前写下的日记。</p></div></div>
+    <div class="journal">
+      <div class="card" style="padding:10px">${d.entries.map(e => `
+        <div class="jitem ${e.date === state.journal ? "active" : ""}" data-date="${esc(e.date)}"><b>${esc(e.date)}</b><span>${esc(e.preview)}</span></div>`).join("")}</div>
+      <div id="paper" class="paper"></div>
+    </div>`;
+  main.querySelectorAll(".jitem").forEach(el => el.onclick = () => {
+    state.journal = el.dataset.date;
+    main.querySelectorAll(".jitem").forEach(x => x.classList.toggle("active", x === el));
+    loadJournal();
+  });
+  loadJournal();
+};
+async function loadJournal() {
+  const j = await api("journal/" + state.journal);
+  $("#paper").innerHTML = `<h3>${esc(j.date)}</h3>${esc(j.text).replace(/\n/g, "<br>")}`;
+}
+
+go("overview");
+</script>
+</body>
+</html>
