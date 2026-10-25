@@ -96,6 +96,12 @@ FIELDS: list[SettingField] = [
     SettingField("qq.conversation_seconds", "群聊对话延续时间", "number", "QQ",
                  "她回复某人后，这段时间里对方不用 @ 也能接着聊；每次回复都会刷新",
                  min=0, max=600, step=10, unit="秒"),
+    SettingField("qq.peer_bots", "群里其他机器人的 QQ 号", "list", "QQ",
+                 "和它们连着聊满下面的轮数就停下，防止两个机器人无限对聊"),
+    SettingField("qq.max_bot_rounds", "和机器人最多连聊几轮", "number", "QQ",
+                 "有真人说话就重新计数", min=1, max=50, step=1, unit="轮"),
+    SettingField("qq.bot_pause_minutes", "停下后多久再理机器人", "number", "QQ",
+                 "期间真人说话会立刻恢复", min=1, max=1440, step=1, unit="分钟"),
     SettingField("qq.others_join_conversation", "允许旁人加入对话", "bool", "QQ",
                  "对话进行中，其他人的话也交给她判断要不要接（会多用一些额度）"),
     # 看图

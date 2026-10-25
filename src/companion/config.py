@@ -31,6 +31,7 @@ ENV_MAP: dict[str, tuple[str, ...]] = {
     "QQ_WS_URL": ("qq", "ws_url"),
     "QQ_OWNER_ACCOUNTS": ("qq", "owner_accounts"),
     "QQ_GROUPS": ("qq", "groups"),
+    "QQ_PEER_BOTS": ("qq", "peer_bots"),
 }
 
 # 只允许出现在环境变量里的配置路径
@@ -142,8 +143,13 @@ class QQConfig(_Section):
     # 对话延续：她在群里说完话后这么久内算“还在聊”，每回复一次就刷新
     conversation_seconds: float = 90.0
     others_join_conversation: bool = True  # 活跃期内别人插话也交给模型判断（更严格）
+    # 防止和别的机器人无限对聊：和它们连着聊满 max_bot_rounds 轮就停下，
+    # 直到有真人说话、或过了 bot_pause_minutes 分钟
+    peer_bots: list[str] = []  # 其他机器人的 QQ 号
+    max_bot_rounds: int = 5
+    bot_pause_minutes: float = 10.0
 
-    @field_validator("owner_accounts", "groups", "aliases", mode="before")
+    @field_validator("owner_accounts", "groups", "aliases", "peer_bots", mode="before")
     @classmethod
     def _split_csv(cls, value: Any) -> Any:
         if isinstance(value, str):

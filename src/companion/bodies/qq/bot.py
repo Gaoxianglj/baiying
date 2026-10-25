@@ -134,7 +134,9 @@ class QQBot:
         self._partners: dict[str, dict[str, datetime]] = {}  # 频道 → {刚和她聊过的人: 时间}
         self._pending: dict[str, _Pending] = {}
         self._jobs: set[asyncio.Task[None]] = set()
-        self._approvals: dict[str, list[Any]] = {}  # 审批码 → [threading.Event, 是否批准]
+        self._approvals: dict[str, list[Any]] = {}
+        self._bot_rounds: dict[str, int] = {}  # 频道 → 和别的机器人连着聊了几轮
+        self._bot_paused_until: dict[str, datetime] = {}  # 审批码 → [threading.Event, 是否批准]
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
 
     # ---- 运行 ----
@@ -207,6 +209,9 @@ class QQBot:
             now=src.received_at,
             meta=meta,
         )
+
+        if self._bot_paused(src):  # 和别的机器人聊太久了，先只听不回
+            return
 
         # 决定这条消息算哪一类：必须回 / 对话延续中 / 主动插话 / 只记录
         if addressed:
@@ -336,6 +341,8 @@ class QQBot:
         partners = self._partners.setdefault(src.channel, {})
         for s in pending.sources:
             partners[s.user_id] = self.now()
+        if any(s.user_id in self.cfg.peer_bots for s in pending.sources):
+            self._count_bot_round(src.channel)
 
     async def _run_later(self, src: Source, ctx: SkillContext, call: SkillCall) -> None:
         assert call.later is not None
@@ -351,6 +358,35 @@ class QQBot:
         paths = await self._call(self.c.deliver, "qq", src.channel, result, self.now())
         for path in paths:
             await self._send_image(src, path)
+
+    # ---- 防止和别的机器人无限对聊 ----
+
+    def _bot_paused(self, src: Source) -> bool:
+        """别的机器人发来的消息：和它们连着聊满轮数后暂停回复。真人一说话就重新计数。"""
+        channel = src.channel
+        if src.user_id not in self.cfg.peer_bots:
+            self._bot_rounds.pop(channel, None)
+            self._bot_paused_until.pop(channel, None)
+            return False
+        until = self._bot_paused_until.get(channel)
+        if until is None:
+            return False
+        if self.now() < until:
+            log.info("%s：和机器人聊了 %d 轮，暂停中，不回复", channel, self.cfg.max_bot_rounds)
+            return True
+        self._bot_paused_until.pop(channel, None)
+        return False
+
+    def _count_bot_round(self, channel: str) -> None:
+        rounds = self._bot_rounds.get(channel, 0) + 1
+        if rounds >= self.cfg.max_bot_rounds:
+            self._bot_rounds.pop(channel, None)
+            self._bot_paused_until[channel] = self.now() + timedelta(
+                minutes=self.cfg.bot_pause_minutes
+            )
+            log.info("%s：和机器人连着聊了 %d 轮，先停一下", channel, rounds)
+        else:
+            self._bot_rounds[channel] = rounds
 
     def _source(self, ev: dict[str, Any]) -> Source | None:
         user_id = str(ev.get("user_id", ""))

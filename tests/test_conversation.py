@@ -170,6 +170,38 @@ def test_others_can_be_excluded(bot):
     assert len(bot.client.sends()) == 1
 
 
+# ---------- 防止和别的机器人无限对聊 ----------
+
+PEER = "5000"
+
+
+def test_stops_after_five_rounds_with_peer_bot(bot):
+    bot.cfg.peer_bots = [PEER]
+    for i in range(7):  # 对方机器人每次都 @她
+        bot.clock["now"] = T0 + timedelta(seconds=10 * i)
+        run(bot, msg(f"机器人第{i}句", group=GROUP, user=PEER, at_bot=True, mid=i, name="机器人"))
+    assert len(bot.client.sends()) == 5
+    # 消息照样记下来
+    assert sum(e.actor.person_id != "self" for e in bot.c.log.iter_events()) == 7
+
+
+def test_human_resets_and_pause_expires(bot):
+    bot.cfg.peer_bots = [PEER]
+    bot.cfg.max_bot_rounds = 2
+    for i in range(3):
+        run(bot, msg("嗨", group=GROUP, user=PEER, at_bot=True, mid=i, name="机器人"))
+    assert len(bot.client.sends()) == 2
+    run(bot, msg("白璎你们在聊啥", group=GROUP, user=FRIEND, at_bot=True, mid=10))  # 真人说话
+    run(bot, msg("嗨", group=GROUP, user=PEER, at_bot=True, mid=11, name="机器人"))
+    assert len(bot.client.sends()) == 4  # 回了真人，也重新开始理机器人
+    run(bot, msg("嗨", group=GROUP, user=PEER, at_bot=True, mid=12, name="机器人"))  # 又满 2 轮
+    run(bot, msg("嗨", group=GROUP, user=PEER, at_bot=True, mid=13, name="机器人"))
+    assert len(bot.client.sends()) == 5
+    bot.clock["now"] = T0 + timedelta(minutes=11)  # 过了暂停时间
+    run(bot, msg("还在吗", group=GROUP, user=PEER, at_bot=True, mid=14, name="机器人"))
+    assert len(bot.client.sends()) == 6
+
+
 # ---------- C-04 引用解析 ----------
 
 
