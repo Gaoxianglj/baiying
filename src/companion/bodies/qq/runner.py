@@ -42,6 +42,8 @@ def run_qq(config: Config, log_file: Path | None = None) -> int:
             sleeper = Sleeper(companion)
 
             def daily() -> None:
+                if not sleeper.due():  # 今天已经睡过（比如重启过服务）
+                    return
                 report = sleeper.run()
                 log.info("睡眠完成：%s", report)
 

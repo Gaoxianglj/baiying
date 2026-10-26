@@ -17,6 +17,7 @@ from companion.core.context import ContextAssembler, ContextBundle
 from companion.core.extract import Extraction, SessionExtractor, ended, split_sessions
 from companion.core.ingest import Ingest
 from companion.core.retrieval import Embedder, HybridRetriever, sync_vectors
+from companion.life import Life, split_mood
 from companion.memory.events import Event
 from companion.memory.index import Fact, MemoryIndex, MemoryKind
 from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
@@ -71,6 +72,7 @@ class Companion:
         self.embedder = embedder if embedder is not None else build_embedder(config)
         self.gateway = gateway if gateway is not None else build_gateway(config)
         emb_cfg = config.models.embedding
+        self.life = Life(config=config, layout=self.layout, index=self.index, gateway=self.gateway)
         self.retriever = HybridRetriever(
             self.index,
             self.embedder,
@@ -86,6 +88,7 @@ class Companion:
             people=self.people,
             log=self.log,
             config=config.retrieval,
+            life=self.life,
         )
         self.extractor = SessionExtractor(
             persona_name=self.name, gateway=self.gateway, index=self.index, people=self.people
@@ -189,7 +192,10 @@ class Companion:
             extra_sections=[p] if (p := self.skills.prompt(skill_ctx)) else None,
         )
         result, calls = self._chat_with_skills(bundle, skill_ctx, on_interim)
-        text, wanted = split_sticker(self.skills.strip_markers(result.text))
+        text = self._take_mood(
+            self.skills.strip_markers(result.text), channel, incoming.actor.person_id, now
+        )
+        text, wanted = split_sticker(text)
         images = [p for c in calls for p in c.images]
         if not images and (
             SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted)
@@ -237,7 +243,7 @@ class Companion:
                 return result, calls
             before, skill, marker, arg = found
             assert ctx is not None
-            interim = SILENT_MARK.sub("", split_sticker(before)[0]).strip()
+            interim = SILENT_MARK.sub("", split_sticker(split_mood(before)[0])[0]).strip()
             if interim:
                 self.ingest.record_self(
                     body=ctx.body, channel=ctx.channel, content=interim, ts=ctx.now
@@ -295,7 +301,10 @@ class Companion:
         )
         try:
             answer = self.gateway.chat([*bundle.messages, ChatMessage("skill", note)])
-            text = split_sticker(self.skills.strip_markers(answer.text))[0]
+            text = self._take_mood(
+                self.skills.strip_markers(answer.text), ctx.channel, ctx.person_id, None
+            )
+            text = split_sticker(text)[0]
             text = SILENT_MARK.sub("", text).strip()
         except ModelError as e:
             log.warning("转述任务结果失败：%s", e)
@@ -304,6 +313,15 @@ class Companion:
         self.ingest.record_self(
             body=ctx.body, channel=ctx.channel, content=text, meta={"report": skill_name}
         )
+        return text
+
+    def _take_mood(
+        self, text: str, channel: str, person_id: str | None, now: datetime | None
+    ) -> str:
+        """拿掉回复里的【心情：…】；写了就记下她的心情变化（沉默时也算）。"""
+        text, mood = split_mood(text)
+        if mood is not None:
+            self.life.note_mood(*mood, channel=channel, person_id=person_id, now=now)
         return text
 
     def _choose_sticker(self, channel: str, emotion: str, now: datetime | None) -> Sticker | None:

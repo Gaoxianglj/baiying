@@ -528,6 +528,12 @@ class MemoryIndex:
         ).fetchall()
         return [self._episode(r) for r in rows]
 
+    def episodes_started_since(self, since: datetime) -> list[Episode]:
+        rows = self._conn.execute(
+            "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (_iso(since),)
+        ).fetchall()
+        return [self._episode(r) for r in rows]
+
     def facts_created_since(self, since: datetime) -> list[Fact]:
         rows = self._conn.execute(
             "SELECT * FROM facts WHERE created_at >= ? ORDER BY valid_from", (_iso(since),)

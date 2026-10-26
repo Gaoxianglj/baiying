@@ -1,4 +1,5 @@
-"""每日“睡眠”：整理会话 → 遗忘 → 合并重复事实 → 反思（人物档案、自我认知、日记）→ 提交记忆仓库。
+"""每日“睡眠”：整理会话 → 遗忘 → 合并重复事实 → 反思（人物档案、自我认知、日记）
+→ 生成新一天的安排 → 提交记忆仓库。
 
 反思写下的每一条认识都要附出处（记忆 id 的前 8 位），或者是档案里原本就有的内容；
 模型编出来、找不到依据的条目一律丢弃。
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from companion.life import day_key, day_start
 from companion.memory import forgetting
 from companion.memory.index import Episode, Fact
 from companion.memory.layout import commit_memory, render_template
@@ -67,7 +69,8 @@ SELF_PROMPT = """你是 {name}，正在做每周一次的自我反思。请输�
 json 格式：{{"我是谁": [{{"text": "...", "sources": ["ab12cd34", "cd34ef56"]}}], ...}}"""
 
 JOURNAL_PROMPT = """你是 {name}。根据今天的经历写一篇很短的日记（100~200 字），用第一人称，
-语气符合你的性格，写下今天和谁做了什么、你的感受。提到别人时用名字或 ta，不知道性别时不要用 他/她。只输出日记正文。"""
+语气符合你的性格，写下今天和谁做了什么、自己做了什么、心情有什么起伏。
+提到别人时用名字或 ta，不知道性别时不要用 他/她。只输出日记正文。"""
 
 
 @dataclass
@@ -79,12 +82,19 @@ class SleepReport:
     people_reflected: list[str] = field(default_factory=list)
     identity_reflected: bool = False
     journal: str | None = None
+    planned: bool = False  # 新一天的安排已经有了
     errors: list[str] = field(default_factory=list)
 
 
 class Sleeper:
     def __init__(self, companion: Companion) -> None:
         self.c = companion
+
+    def due(self, now: datetime | None = None) -> bool:
+        """这一天（从睡眠钟点算起）还没睡过。记在索引里，服务重启也不会让她一天睡好几次。"""
+        now = now or datetime.now(UTC)
+        last = self._last(LAST_SLEEP)
+        return last is None or last < day_start(now, self.c.config.sleep.hour)
 
     def run(self, now: datetime | None = None) -> SleepReport:
         now = now or datetime.now(UTC)
@@ -120,13 +130,21 @@ class Sleeper:
             except ModelError as e:
                 report.errors.append(f"自我反思：{e}")
 
-        today = [ep for ep in new_episodes if ep.state != "dormant"]
-        if today:
+        # 日记写的是“上次睡到现在”这段时间，记在这段时间中点所在的那一天
+        key = day_key(last + (now - last) / 2, self.c.config.sleep.hour).isoformat()
+        today = [
+            ep
+            for ep in new_episodes
+            if ep.state != "dormant" and not ep.channel.startswith("self:")  # 自己做的事见 notes
+        ]
+        notes = self.c.life.day_notes(key)
+        if today or notes:
             try:
-                report.journal = self._journal(today, now)
+                report.journal = self._journal(today, notes, key, now)
             except ModelError as e:
                 report.errors.append(f"日记：{e}")
 
+        report.planned = self.c.life.ensure_plan(now) is not None
         self.c.index.set_meta(LAST_SLEEP, now.isoformat())
         commit_memory(self.c.layout, self.c.name, _summary(report, now))
         return report
@@ -232,18 +250,25 @@ class Sleeper:
         )
         return True
 
-    def _journal(self, episodes: list[Episode], now: datetime) -> str:
+    def _journal(self, episodes: list[Episode], notes: str, key: str, now: datetime) -> str:
         lines = "\n".join(f"- {e.started_at.astimezone():%H:%M} {e.summary}" for e in episodes)
+        user = f"今天的经历：\n{lines or '（今天没怎么和人聊天）'}"
+        if notes:
+            user += f"\n\n今天自己的状态：\n{notes}"
         result = self.c.gateway.chat(
             [
                 ChatMessage("system", JOURNAL_PROMPT.format(name=self.c.name)),
-                ChatMessage("user", f"今天的经历：\n{lines}"),
+                ChatMessage("user", user),
             ],
             purpose="journal",
         )
-        day = (now - timedelta(hours=self.c.config.sleep.hour)).astimezone()
-        path = self.c.layout.journal_dir / f"{day:%Y-%m-%d}.md"
-        path.write_text(f"# {day:%Y-%m-%d}\n\n{result.text.strip()}\n", encoding="utf-8")
+        text = result.text.strip()
+        path = self.c.layout.journal_dir / f"{key}.md"
+        if path.exists():  # 这一天已经写过（如手动整理过一次）：接在后面，不覆盖
+            with path.open("a", encoding="utf-8", newline="\n") as f:
+                f.write(f"\n（{now.astimezone():%H:%M} 补记）\n\n{text}\n")
+        else:
+            path.write_text(f"# {key}\n\n{text}\n", encoding="utf-8", newline="\n")
         return str(path)
 
     def _ask(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -315,4 +340,6 @@ def _summary(report: SleepReport, now: datetime) -> str:
         bits.append(f"更新了 {len(report.people_reflected)} 个人的档案")
     if report.identity_reflected:
         bits.append("更新了自我认知")
+    if report.planned:
+        bits.append("排好了今天的安排")
     return "：".join([bits[0], "，".join(bits[1:]) or "没有变化"])

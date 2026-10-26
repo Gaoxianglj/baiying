@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from companion.config import RetrievalConfig
 from companion.core.retrieval import HybridRetriever
@@ -23,6 +24,9 @@ from companion.memory.index import Episode, Fact, MemoryIndex, MemoryKind
 from companion.memory.layout import MemoryLayout
 from companion.memory.people import SELF_ID, PeopleRegistry, Person
 from companion.models.openai_compat import ChatMessage
+
+if TYPE_CHECKING:
+    from companion.life import Life
 
 _SILENT_HOW = "不需要接话时，只输出【不回复】这四个字（加括号），不要输出别的。"
 
@@ -97,6 +101,7 @@ class ContextAssembler:
         people: PeopleRegistry,
         log: EventLog,
         config: RetrievalConfig,
+        life: Life | None = None,
     ) -> None:
         self.name = persona_name
         self.layout = layout
@@ -105,6 +110,7 @@ class ContextAssembler:
         self.people = people
         self.log = log
         self.cfg = config
+        self.life = life  # 今日状态与心情（没有就不加这两段）
 
     def build(
         self,
@@ -227,7 +233,10 @@ class ContextAssembler:
             _section("你的种子（核心性格与底线，必须遵守）", self._read_self("seed.md")),
             _section("你对自己的认识", self._read_self("identity.md")),
             _section("你的表达习惯", self._read_self("style.md")),
-            _section("说话时注意", _TALK_RULES),
+            _section(
+                "说话时注意",
+                "\n".join(r for r in (_TALK_RULES, self.life and self.life.talk_rules()) if r),
+            ),
             _section("要不要接话", _REPLY_RULES.get(reply_mode, _REPLY_RULES["required"])),
         ]
         if sticker_emotions:
@@ -279,6 +288,8 @@ class ContextAssembler:
                 for r in recalled
             ]
             sections.append(_section("此刻想起的相关记忆（越靠前越清晰）", "\n".join(lines)))
+        if self.life is not None:
+            sections += self.life.sections(person_id, channel, now)
         if len(openings) >= 3:
             sections.append(
                 _section(

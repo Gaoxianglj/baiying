@@ -187,6 +187,29 @@ class SleepConfig(_Section):
     identity_every_days: int = 7  # 自我认知多久反思一次
 
 
+class MoodConfig(_Section):
+    """心情：她在回复末尾写【心情：词｜原因】，之后随时间回落到当天的基调。"""
+
+    enabled: bool = True
+    half_life_minutes: float = 90.0  # 心情减弱一半要多久
+    negative_half_life_minutes: float = 45.0  # 难过、生气这类回落得更快
+
+
+class DayConfig(_Section):
+    """今日状态（AI 版日常）：每天生成当天的安排；回复时带上“你的今天”。"""
+
+    enabled: bool = True
+    history_days: int = 3  # 生成安排时参考最近几天的安排和日记
+    max_happenings: int = 6  # “今天真实发生的”最多列几条
+
+
+class LifeConfig(_Section):
+    """情感与生活：今日状态、心情。"""
+
+    day: DayConfig = DayConfig()
+    mood: MoodConfig = MoodConfig()
+
+
 class SearchSkillConfig(_Section):
     """联网搜索与读网页：DeepSeek Search / Fetch API（用兜底 API 的 key，计入它的月预算）。"""
 
@@ -254,6 +277,7 @@ class Config(_Section):
     stickers: StickerConfig = StickerConfig()
     skills: SkillsConfig = SkillsConfig()
     sleep: SleepConfig = SleepConfig()
+    life: LifeConfig = LifeConfig()
 
     @property
     def data_dir(self) -> Path:

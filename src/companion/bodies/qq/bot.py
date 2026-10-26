@@ -145,7 +145,7 @@ class QQBot:
         await asyncio.gather(self.client.run_forever(), self._maintenance())
 
     async def _maintenance(self, every: float = 300.0) -> None:
-        """定时整理已结束的会话；每天到点做一次“睡眠”。"""
+        """定时整理已结束的会话；每天到点做一次“睡眠”；确保今天有安排。"""
         last_daily: str | None = None
         while True:
             await asyncio.sleep(every)
@@ -157,6 +157,7 @@ class QQBot:
                     if today != last_daily:
                         last_daily = today
                         await self._call(self.on_daily)
+                await self._call(self.c.life.ensure_plan)  # 今天的安排（睡眠时没排成就补上）
             except Exception:
                 log.exception("后台整理出错")
 
