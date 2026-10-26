@@ -122,8 +122,10 @@ class CodexAppServerBackend:
         timeout: float = 120.0,
         name: str = "subscription",
         env: dict[str, str] | None = None,
+        instructions: str = INSTRUCTIONS,
     ) -> None:
         self.name = name
+        self.instructions = instructions  # 每个线程的基础指令（替换内置的编程助手指令）
         self._env = env
         self.model = model
         self.effort = effort
@@ -220,7 +222,7 @@ class CodexAppServerBackend:
                 "cwd": str(self._workdir),
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
-                "baseInstructions": INSTRUCTIONS,  # 替换内置的编程助手指令
+                "baseInstructions": self.instructions,
                 "ephemeral": True,  # 不把聊天存进 Codex 的历史
             }
             if self.model:

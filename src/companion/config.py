@@ -203,11 +203,57 @@ class DayConfig(_Section):
     max_happenings: int = 6  # “今天真实发生的”最多列几条
 
 
+class OwnerChatConfig(_Section):
+    """主动找主人：只在主人私聊里主动开口（早晚安、分享自己做的事）；群聊从不主动。"""
+
+    enabled: bool = True
+    greetings: bool = True  # 早安、晚安
+    morning: str = "08:30"  # 本地时间；每天前后随机 jitter_minutes 分钟
+    night: str = "23:30"
+    jitter_minutes: float = 20.0
+    max_per_day: int = 4  # 每天最多主动找几次（含早晚安）
+    min_gap_minutes: float = 120.0  # 两次主动找之间至少隔多久
+    quiet_start: str = "00:30"  # 这段时间不主动找（晚安除外）
+    quiet_end: str = "08:00"
+    skip_if_chatted_minutes: float = 60.0  # 刚聊过就不主动找
+
+    @field_validator("morning", "night", "quiet_start", "quiet_end")
+    @classmethod
+    def _clock(cls, value: str) -> str:
+        hour, _, minute = value.partition(":")
+        if not (hour.isdigit() and minute.isdigit() and int(hour) < 24 and int(minute) < 60):
+            raise ValueError(f"时间格式应为 HH:MM：{value}")
+        return f"{int(hour):02d}:{int(minute):02d}"
+
+
+class ActivityConfig(_Section):
+    """额度充足时自主活动：只用 GPT 订阅额度，在用 DeepSeek 时一律不做。
+
+    5 小时窗口快重置、却还剩很多额度时，按心情、日程和兴趣挑一件事做：
+    联网查感兴趣的东西或趣事、写短诗随笔、画画、找主人聊天。
+    """
+
+    enabled: bool = True
+    trigger_used_below: float = 15.0  # 5 小时窗口用量低于这个百分比才开始
+    trigger_minutes_before_reset: float = 90.0  # 距离 5 小时窗口重置不到这么久才开始
+    budget_percent: float = 15.0  # 每个 5 小时窗口里，自主活动最多花掉多少
+    weekly_max_percent: float = 60.0  # 7 天窗口用到这么多就不做
+    min_gap_minutes: float = 20.0  # 两件事之间至少隔多久
+    max_per_window: int = 8  # 每个窗口最多做几件（额度读数不准时的保险）
+    explore: bool = True  # 联网查感兴趣的东西、收集趣事
+    write: bool = True  # 写短诗、随笔
+    draw: bool = True  # 画画
+    chat_owner: bool = True  # 找主人聊天（还受“主动找主人”的限制）
+    timeout_seconds: float = 600.0  # 后台做事，慢一点没关系；画图偶尔要三四分钟
+
+
 class LifeConfig(_Section):
-    """情感与生活：今日状态、心情。"""
+    """情感与生活：今日状态、心情、主动找主人、自主活动。"""
 
     day: DayConfig = DayConfig()
     mood: MoodConfig = MoodConfig()
+    owner_chat: OwnerChatConfig = OwnerChatConfig()
+    activities: ActivityConfig = ActivityConfig()
 
 
 class SearchSkillConfig(_Section):
@@ -226,7 +272,7 @@ class ImageSkillConfig(_Section):
     enabled: bool = True
     group_limit: int = 5  # 所有群加起来，每个窗口最多画几张
     group_window_minutes: float = 20.0
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 600.0  # 实测偶尔要近 4 分钟（2026-10-26），原来的 300 秒太紧
 
 
 class AgentSkillConfig(_Section):

@@ -44,6 +44,10 @@ _REPLY_RULES = {
         "这条消息不是冲你来的，是群里别人在说话。只有当话题明显和你有关、或你有很想说的一句话时才插嘴，"
         "大多数时候都不要接。" + _SILENT_HOW
     ),
+    "initiative": (
+        "这次是你主动开口，不是在回复谁。像随口一提，一两句话；"
+        "觉得现在不合适打扰，就只输出【不回复】。"
+    ),
 }
 
 _REMINDERS = {
@@ -124,8 +128,10 @@ class ContextAssembler:
         reply_mode: str = "required",
         extra_sections: list[str] | None = None,
         reminder: bool = True,
+        initiative: str | None = None,
     ) -> ContextBundle:
-        """reminder：在消息最后再提醒一次要不要接话、别重复开头（转述任务结果等场合不需要）。"""
+        """reminder：在消息最后再提醒一次要不要接话、别重复开头（转述任务结果等场合不需要）。
+        initiative：她主动开口（如早安）时的说明，放在最后；这时不加对方的话，也不加提醒。"""
         now = now or datetime.now(UTC)
         person_id = self.people.canonical(person_id)
         person = self.people.get(person_id)
@@ -146,6 +152,9 @@ class ContextAssembler:
         )
         prompt = stable + "\n\n" + dynamic
         messages = [ChatMessage("system", prompt), *dialogue]
+        if initiative is not None:
+            messages.append(ChatMessage("system", initiative))
+            return ContextBundle(prompt, messages, recalled, [f.id for f in facts])
         if not dialogue or dialogue[-1].role != "user":
             messages.append(ChatMessage("user", query))
         if reminder:

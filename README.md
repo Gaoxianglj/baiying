@@ -14,6 +14,7 @@
 ```
 src/companion/
   core/      记忆核心编排：事件入口、上下文组装、睡眠整理
+  life/      情感与生活：今日状态、心情、主动找主人、额度充足时的自主活动
   memory/    存储层：事件日志、SQLite 索引、自我与人物档案
   models/    模型网关：GPT 订阅、兜底 API、本地模型
   bodies/    身体适配器：QQ、我的世界
@@ -32,8 +33,9 @@ uv run companion config    # 查看生效配置（密钥打码）
 uv run companion init      # 创建记忆文件夹 data/memory/
 uv run companion chat --as <你的id>   # 命令行聊天
 uv run companion qq        # 连接 NapCat，在 QQ 上运行
-uv run companion web       # 本机控制台：状态、设置、种子、人物与记忆、日记
+uv run companion web       # 本机控制台：状态、今天、设置、种子、人物与记忆、日记
 uv run companion sleep     # 手动做一次“睡眠”
+uv run python scripts/replay.py   # 用现在的提示词重放真实聊天，和当时的回复并排对比
 uv run pytest
 uv run ruff check .
 ```

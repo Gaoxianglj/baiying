@@ -144,6 +144,44 @@ def test_api_overview_people_seed_forget_journal(app, root):
     assert call(app, "GET", "/api/journal/..%2Fseed")[0] == 400
 
 
+def test_api_today(app):
+    from datetime import UTC, datetime
+
+    from companion.life import DayPlan
+    from companion.life.days import SLOT_NAMES
+
+    life = app.companion.life
+    now = datetime.now(UTC)
+    life.days.set_plan(now, DayPlan("安静", "《雪国》", {n: f"{n}在读书" for n in SLOT_NAMES}))
+    life.note_mood("开心", "被夸了", channel="private:1", person_id=None, now=now)
+    act = {"ts": now.isoformat(), "kind": "write", "title": "写了《初雪》", "summary": "雪"}
+    life.days.append(now, "activities", act)
+    life.owner.record(now, "morning", "早呀")
+    life.owner.record(now, "share", "", skipped=True)
+    folder = app.companion.layout.self_dir / "writings"
+    folder.mkdir(parents=True)
+    (folder / "2026-10-27-1500.md").write_text("# 初雪\n\n雪落在书页上。\n", "utf-8")
+
+    status, _, d = call(app, "GET", "/api/today")
+    assert status == 200 and d["plan"]["reading"] == "《雪国》"
+    assert d["mood"]["word"] == "开心" and d["slot"] in SLOT_NAMES
+    assert [p["kind"] for p in d["proactive"]] == ["morning"]  # 跳过的不显示
+    assert d["writings"][0] == {
+        "name": "2026-10-27-1500",
+        "title": "初雪",
+        "text": "雪落在书页上。",
+    }
+
+
+def test_life_settings_validate(root):
+    settings.save(root, {"life.owner_chat.morning": "7:45", "life.activities.budget_percent": 10})
+    config = load_config(root)
+    assert config.life.owner_chat.morning == "07:45"
+    assert config.life.activities.budget_percent == 10
+    with pytest.raises(settings.SettingsError):
+        settings.save(root, {"life.owner_chat.night": "半夜"})
+
+
 def test_post_requires_json(app):
     status, _, _ = app.handle("POST", "/api/seed", {**AUTH, "content-type": "text/plain"}, b"x")
     assert status == 415

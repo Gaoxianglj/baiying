@@ -18,9 +18,18 @@ from companion.core.extract import Extraction, SessionExtractor, ended, split_se
 from companion.core.ingest import Ingest
 from companion.core.retrieval import Embedder, HybridRetriever, sync_vectors
 from companion.life import Life, split_mood
+from companion.life.activities import (
+    LIFE_INSTRUCTIONS,
+    ActivityPrep,
+    ActivityResult,
+    ActivityRunner,
+    LifeBackend,
+)
+from companion.life.core import LIFE_CHANNEL
 from companion.memory.events import Event
 from companion.memory.index import Fact, MemoryIndex, MemoryKind
 from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
+from companion.models.codex_app_server import CodexAppServerBackend
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
@@ -32,6 +41,34 @@ log = logging.getLogger(__name__)
 
 _CURSOR = "extract_cursor:"
 SILENT_MARK = re.compile(r"[【\[]\s*(不回复|SILENT)\s*[】\]]", re.IGNORECASE)
+
+
+_GREETINGS = {
+    "morning": "（现在是早上，你想主动跟{who}说声早安。可以顺口提一句今天打算做什么；"
+    "一两句话，别连着问问题。）",
+    "night": "（夜深了，你想主动跟{who}道声晚安。可以提一句今天真实发生的事或你自己做的事；"
+    "一两句话。）",
+}
+
+
+def _share_note(result: ActivityResult, who: str, with_image: bool) -> str:
+    """自主活动做完、想告诉主人时的说明。"""
+    if result.kind == "chat_owner":
+        return (
+            f"（你想主动找{who}聊聊：{result.topic}（{result.why}）。"
+            "自然地开个头，一两句话；不合适就只输出【不回复】。）"
+        )
+    if result.kind == "write":
+        detail = f"你写的：\n{result.text}\n想拿给{who}看，可以把它贴出来，再随口说一句。"
+    elif with_image:
+        detail = "画好了，图会跟着你的话一起发过去。"
+    else:
+        detail = f"你查到的：{result.text}"
+    return (
+        f"（你刚才自己{result.title}。{detail}\n"
+        f"你想随口跟{who}分享一下：用你的语气，像顺口一提，不要像汇报；"
+        "不值得打扰就只输出【不回复】。）"
+    )
 
 
 @dataclass
@@ -72,7 +109,10 @@ class Companion:
         self.embedder = embedder if embedder is not None else build_embedder(config)
         self.gateway = gateway if gateway is not None else build_gateway(config)
         emb_cfg = config.models.embedding
-        self.life = Life(config=config, layout=self.layout, index=self.index, gateway=self.gateway)
+        self.life = Life(
+            config=config, layout=self.layout, index=self.index, gateway=self.gateway, log=self.log
+        )
+        self.activities = ActivityRunner(self._life_backend_factory())
         self.retriever = HybridRetriever(
             self.index,
             self.embedder,
@@ -108,6 +148,7 @@ class Companion:
         self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl")
 
     def close(self) -> None:
+        self.activities.close()
         self.skills.close()
         self.gateway.close()
         close = getattr(self.embedder, "close", None)
@@ -216,13 +257,7 @@ class Companion:
             body=body, channel=channel, content=text or "…", ts=now, meta=meta
         )
         if sticker is not None:
-            self.ingest.record_self(
-                body=body,
-                channel=channel,
-                content=f"[表情包：{sticker.description}]",
-                ts=now,
-                meta={"sticker": sticker.digest, "emotion": sticker.emotion},
-            )
+            self._record_sticker(body, channel, sticker, now)
         return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images,
                      skill_ctx=skill_ctx)  # fmt: skip
 
@@ -314,6 +349,185 @@ class Companion:
             body=ctx.body, channel=ctx.channel, content=text, meta={"report": skill_name}
         )
         return text
+
+    # ---- 主动开口（只在主人私聊里） ----
+
+    def greet(
+        self, *, person_id: str, body: str, channel: str, kind: str, now: datetime | None = None
+    ) -> Reply | None:
+        """早安（morning）或晚安（night）。"""
+        note = _GREETINGS[kind].format(who=self._display(person_id))
+        return self.initiate(
+            person_id=person_id, body=body, channel=channel, kind=kind, note=note, now=now
+        )
+
+    def initiate(
+        self,
+        *,
+        person_id: str,
+        body: str,
+        channel: str,
+        kind: str,
+        note: str,
+        topic: str = "",
+        now: datetime | None = None,
+    ) -> Reply | None:
+        """她主动说一句（早晚安、分享）。她觉得不合适打扰、或生成失败时返回 None，记为跳过。"""
+        now = now or datetime.now(UTC)
+        cfg = self.config.stickers
+        emotions = (
+            self.stickers.emotions()
+            if cfg.enabled and len(self.stickers) >= cfg.min_library
+            else []
+        )
+        bundle = self.context.build(
+            person_id=person_id,
+            body=body,
+            channel=channel,
+            query=topic or note,
+            now=now,
+            sticker_emotions=emotions,
+            reply_mode="initiative",
+            initiative=note,
+        )
+        try:
+            result = self.gateway.chat(bundle.messages, purpose="initiative")
+        except ModelError as e:
+            log.warning("主动开口失败：%s", e)
+            self.life.owner.record(now, kind, "", skipped=True)
+            return None
+        text = self._take_mood(self.skills.strip_markers(result.text), channel, person_id, now)
+        text, wanted = split_sticker(text)
+        if SILENT_MARK.search(text) or not text.strip():
+            log.info("想主动找 %s（%s），想了想没开口", self._display(person_id), kind)
+            self.life.owner.record(now, kind, "", skipped=True)
+            return None
+        sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
+        meta = {"proactive": kind, "backend": result.backend, "model": result.model}
+        event = self.ingest.record_self(body=body, channel=channel, content=text, ts=now, meta=meta)
+        if sticker is not None:
+            self._record_sticker(body, channel, sticker, now)
+        self.life.owner.record(now, kind, text)
+        return Reply(text, result, bundle, event, sticker)
+
+    # ---- 额度充足时的自主活动 ----
+
+    def prepare_activity(
+        self,
+        now: datetime | None = None,
+        *,
+        owner_id: str | None = None,
+        owner_channel: str | None = None,
+    ) -> ActivityPrep | None:
+        """该不该现在做点自己的事；该做就返回挑事情的材料（交给 activities.perform 在后台做）。"""
+        if not self.activities.available:
+            return None
+        now = now or datetime.now(UTC)
+        owner_ok = False
+        if owner_id and owner_channel:
+            owner_ok = self.life.owner.can_share(owner_id, owner_channel, now)[0]
+        return self.life.prepare_activity(
+            now, owner_name=self._display(owner_id) if owner_id else None, owner_ok=owner_ok
+        )
+
+    def finish_activity(
+        self,
+        result: ActivityResult | None,
+        now: datetime | None = None,
+        *,
+        owner_id: str | None = None,
+        owner_channel: str | None = None,
+        body: str = "qq",
+    ) -> tuple[Reply | None, list[Path]]:
+        """记下做完的事（生活记录、记忆、心情）；值得分享且不打扰时，主动告诉主人。
+        返回（要发给主人的话，要一起发的图片）。"""
+        now = now or datetime.now(UTC)
+        self.life.activity_done(now)
+        if result is None or result.kind == "rest":
+            return None, []
+        digests: list[str] = []
+        paths: list[Path] = []
+        if result.image is not None:
+            try:
+                stored = self.media.save(result.image.read_bytes())
+                digests, paths = [stored.digest], [stored.path]
+            except (OSError, media.MediaError) as e:
+                log.warning("保存自己画的图失败：%s", e)
+        self.life.record_activity(result, now, image=digests[0] if digests else None)
+        meta: dict[str, object] = {"activity": result.kind, "topic": result.topic}
+        if digests:
+            meta["images"] = digests
+        if result.sources:
+            meta["sources"] = result.sources
+        self.ingest.record_self(
+            body="life",
+            channel=LIFE_CHANNEL,
+            kind="action",
+            content=f"[{result.title}] {result.text}".strip()[:800],
+            ts=now,
+            meta=meta,
+        )
+        if result.mood is not None:
+            self.life.note_mood(*result.mood, channel=LIFE_CHANNEL, person_id=None, now=now)
+        if not (result.share and owner_id and owner_channel):
+            return None, []
+        ok, why = self.life.owner.can_share(owner_id, owner_channel, now)
+        if not ok:
+            log.info("想跟主人分享“%s”，但先不打扰：%s", result.title, why)
+            return None, []
+        reply = self.initiate(
+            person_id=owner_id,
+            body=body,
+            channel=owner_channel,
+            kind="chat_owner" if result.kind == "chat_owner" else "share",
+            note=_share_note(result, self._display(owner_id), bool(paths)),
+            topic=result.topic,
+            now=now,
+        )
+        if reply is None or not paths:
+            return reply, []
+        self.ingest.record_self(
+            body=body,
+            channel=owner_channel,
+            content=f"[我画的图：{result.topic}]",
+            ts=now,
+            meta={"images": digests},
+        )
+        return reply, paths
+
+    def _life_backend_factory(self) -> Callable[[], LifeBackend] | None:
+        """做自主活动用的 Codex 进程（能联网搜索、能画图）；没有订阅就没有自主活动。"""
+        if self.gateway.subscription is None:
+            return None
+        sub = self.config.models.subscription
+        timeout = self.config.life.activities.timeout_seconds
+        workdir = self.config.data_dir / "codex-life"
+        instructions = LIFE_INSTRUCTIONS.format(name=self.name)
+
+        def make() -> LifeBackend:
+            return CodexAppServerBackend.from_codex(
+                sub.codex_command,
+                workdir,
+                overrides={"features.shell_tool": "false", "web_search": '"live"'},
+                model=sub.model,
+                effort="low",
+                timeout=timeout,
+                name="life",
+                instructions=instructions,
+            )
+
+        return make
+
+    def _record_sticker(
+        self, body: str, channel: str, sticker: Sticker, now: datetime | None
+    ) -> None:
+        self.ingest.record_self(
+            body=body,
+            channel=channel,
+            content=f"[表情包：{sticker.description}]",
+            ts=now,
+            meta={"sticker": sticker.digest, "emotion": sticker.emotion},
+        )
 
     def _take_mood(
         self, text: str, channel: str, person_id: str | None, now: datetime | None

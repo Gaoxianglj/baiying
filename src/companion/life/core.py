@@ -1,15 +1,18 @@
-"""情感与生活：今日状态（AI 版日常）与心情。
+"""情感与生活：今日状态（AI 版日常）、心情、主动找主人、自主活动。
 
 Companion 持有一个 Life：组装上下文时向它要“你的今天”“你现在的心情”两段；回复里的
 【心情：…】交给它记下；睡眠时由它生成新一天的安排，并给日记提供当天的心情和自己做过的事。
+主动找主人的规矩在 `owner`；额度充足时做什么、做完记在哪，也在这里。
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from companion.config import Config
+from companion.life.activities import KINDS, ActivityPrep, ActivityResult, QuotaSession, quota_check
 from companion.life.days import (
     DayBook,
     DayPlan,
@@ -17,16 +20,24 @@ from companion.life.days import (
     day_start,
     generate_plan,
     render_today,
+    slot_of,
 )
 from companion.life.mood import RULE, MoodNow, current_mood, render_mood
+from companion.life.owner import OwnerPolicy
+from companion.memory.events import EventLog
 from companion.memory.index import Episode, MemoryIndex
 from companion.memory.layout import MemoryLayout
+from companion.models.codex_app_server import RateLimits
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ModelError
 
 log = logging.getLogger(__name__)
 
 PLAN_RETRY = timedelta(minutes=30)  # 生成安排失败后，隔多久再试
+LIMITS_MAX_AGE = timedelta(minutes=5)  # 判断要不要自主活动时，额度读数最多用多旧的
+LIFE_CHANNEL = "self:life"  # 她自己做的事记在这个频道，之后像聊天一样整理成记忆
+QUOTA_META = "life:quota"
+LAST_ACTIVITY_META = "life:last_activity"
 
 
 class Life:
@@ -37,6 +48,7 @@ class Life:
         layout: MemoryLayout,
         index: MemoryIndex,
         gateway: ModelGateway,
+        log: EventLog,
     ) -> None:
         self.cfg = config.life
         self.name = config.persona.name
@@ -45,7 +57,9 @@ class Life:
         self.index = index
         self.gateway = gateway
         self.days = DayBook(layout.self_dir / "days", self.start_hour)
+        self.owner = OwnerPolicy(self.cfg.owner_chat, self.days, log)
         self._plan_failed_at: datetime | None = None
+        self._limits: tuple[datetime, RateLimits] | None = None
 
     # ---- 提示词 ----
 
@@ -178,6 +192,124 @@ class Life:
             lines.append("自己做的事：" + "；".join(str(a.get("title", "")) for a in acts))
         return "\n".join(lines)
 
+    # ---- 自主活动 ----
+
+    def prepare_activity(
+        self, now: datetime, *, owner_name: str | None, owner_ok: bool
+    ) -> ActivityPrep | None:
+        """额度充足、离上次够久，就准备好挑事情的材料；否则返回 None。"""
+        cfg = self.cfg.activities
+        if not cfg.enabled:
+            return None
+        kinds = [k for k in KINDS if getattr(cfg, k)]
+        if not owner_ok:
+            kinds = [k for k in kinds if k != "chat_owner"]
+        if not kinds:
+            return None
+        last = self.index.get_meta(LAST_ACTIVITY_META)
+        if last and now - datetime.fromisoformat(last) < timedelta(minutes=cfg.min_gap_minutes):
+            return None
+        # 只用订阅额度：被手动指定别的后端、额度不合适、或订阅暂停（在用 DeepSeek）时不做。
+        # 额度读数缓存 5 分钟，先看它，免得每分钟都去问订阅。
+        if self.gateway.prefer not in ("auto", "subscription"):
+            return None
+        limits = self._rate_limits(now)
+        if limits is None:
+            return None
+        session = QuotaSession.from_json(self.index.get_meta(QUOTA_META))
+        session, why = quota_check(limits, session, cfg, now)
+        if session is None:
+            log.debug("先不做自主活动：%s", why)
+            return None
+        if not self.gateway.subscription_available(now):
+            return None
+        self.index.set_meta(QUOTA_META, session.to_json())
+        return ActivityPrep(
+            name=self.name,
+            owner_name=owner_name if owner_ok else None,
+            kinds=kinds,
+            context=self._activity_context(now),
+            now=now,
+        )
+
+    def activity_done(self, now: datetime) -> None:
+        """做完（或没做成）一件：记下时间，算进这段自主时间的件数。"""
+        self.index.set_meta(LAST_ACTIVITY_META, now.isoformat())
+        self._limits = None  # 下次重新读额度，看这件事花了多少
+        session = QuotaSession.from_json(self.index.get_meta(QUOTA_META))
+        if session is not None:
+            session.count += 1
+            self.index.set_meta(QUOTA_META, session.to_json())
+
+    def record_activity(
+        self, result: ActivityResult, now: datetime, image: str | None = None
+    ) -> Path | None:
+        """记进当天的生活记录；写的东西另存一份，返回它的路径。"""
+        entry: dict[str, object] = {
+            "ts": now.isoformat(),
+            "kind": result.kind,
+            "title": result.title,
+            "summary": _clip(result.text, 80),
+        }
+        saved = None
+        if result.kind == "write" and result.text:
+            folder = self.layout.self_dir / "writings"
+            folder.mkdir(parents=True, exist_ok=True)
+            saved = folder / f"{self.days.key(now)}-{now.astimezone():%H%M}.md"
+            title = result.title.removeprefix("写了")
+            saved.write_text(f"# {title}\n\n{result.text}\n", encoding="utf-8", newline="\n")
+            entry["file"] = f"writings/{saved.name}"
+        if image:
+            entry["image"] = image
+        if result.sources:
+            entry["sources"] = result.sources
+        self.days.append(now, "activities", entry)
+        return saved
+
+    def _rate_limits(self, now: datetime) -> RateLimits | None:
+        if self._limits is not None and now - self._limits[0] < LIMITS_MAX_AGE:
+            return self._limits[1]
+        sub = self.gateway.subscription
+        if sub is None:
+            return None
+        try:
+            limits = sub.read_rate_limits()
+        except ModelError as e:
+            log.warning("读取订阅额度失败：%s", e)
+            return None
+        self._limits = (now, limits)
+        return limits
+
+    def _activity_context(self, now: datetime) -> str:
+        """挑事情时参考：兴趣、今天的安排、心情、最近做过的事、群里最近在聊的（不含私聊）。"""
+        seed = self._read("seed.md")
+        parts = ["【你的兴趣】\n" + (_seed_section(seed, "闲下来") or _clip(seed, 600))]
+        plan = self.days.plan(now)
+        if plan is not None:
+            slot = slot_of(now)
+            parts.append(
+                f"【你的今天】\n基调：{plan.mood}；在读：{plan.reading}；"
+                f"现在（{slot}）本来打算：{plan.slots.get(slot, '')}"
+            )
+        mood = self.mood(now)
+        if mood is not None:
+            parts.append(
+                f"【你现在的心情】\n{mood.word}" + (f"（{mood.cause}）" if mood.cause else "")
+            )
+        done = self.days.entries(now, "activities", days=7)
+        if done:
+            parts.append(
+                "【最近做过的事】\n" + "\n".join(f"- {a.get('title', '')}" for a in done[-12:])
+            )
+        talk = [
+            ep.summary
+            for ep in self.index.episodes_started_since(now - timedelta(days=1))
+            if ep.channel.startswith("group:") and ep.state != "dormant"
+        ]
+        if talk:
+            parts.append("【最近大家在聊的】\n" + "\n".join(f"- {_clip(t, 80)}" for t in talk[-5:]))
+        return "\n\n".join(parts)
+
     def _journal(self, key: str) -> str:
         path = self.layout.journal_dir / f"{key}.md"
         if not path.exists():
@@ -197,6 +329,20 @@ def _visible(ep: Episode, person_id: str, channel: str) -> bool:
     if ep.channel == channel or ep.channel.startswith("group:"):
         return True
     return person_id in ep.participants
+
+
+def _seed_section(seed: str, keyword: str) -> str:
+    """种子里标题含 keyword 的那一节（没有就返回空）。"""
+    lines = seed.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("## ") and keyword in line:
+            body = []
+            for x in lines[i + 1 :]:
+                if x.startswith("## "):
+                    break
+                body.append(x)
+            return "\n".join(body).strip()
+    return ""
 
 
 def _clip(text: object, limit: int) -> str:

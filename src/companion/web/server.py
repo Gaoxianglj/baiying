@@ -22,6 +22,9 @@ from urllib.parse import parse_qs, urlparse
 
 from companion.config import load_config
 from companion.core.companion import Companion
+from companion.life import slot_of
+from companion.life.activities import QuotaSession
+from companion.life.core import QUOTA_META
 from companion.memory.layout import commit_memory
 from companion.memory.people import SELF_ID
 from companion.models.openai_compat import ModelError
@@ -138,6 +141,8 @@ class ConsoleApp:
             return {"removed": removed, **self.sticker_list()}
         if route == ("GET", "skills"):
             return self.skill_list()
+        if route == ("GET", "today"):
+            return self.today()
         if route == ("GET", "journal") and len(parts) == 1:
             return self.journal_list()
         if route == ("GET", "journal") and len(parts) == 2:
@@ -321,6 +326,36 @@ class ConsoleApp:
             ],
             "recent": recent_usage(c.config.data_dir / "skills.jsonl"),
         }
+
+    def today(self) -> dict[str, Any]:
+        """今天的安排、现在的心情、心情变化、自己做的事、主动找主人的记录、最近写的东西。"""
+        life = self.companion.life
+        now = datetime.now(UTC)
+        key = life.days.key(now)
+        data = life.days.load(key)
+        mood = life.mood(now)
+        writings = []
+        folder = self.companion.layout.self_dir / "writings"
+        for p in sorted(folder.glob("*.md"), reverse=True)[:10] if folder.exists() else []:
+            head, _, body = p.read_text("utf-8").partition("\n")
+            writings.append(
+                {"name": p.stem, "title": head.lstrip("# ").strip(), "text": body.strip()}
+            )
+        session = QuotaSession.from_json(self.companion.index.get_meta(QUOTA_META))
+        return {
+            "date": key,
+            "slot": slot_of(now),
+            "plan": data.get("plan"),
+            "mood": None
+            if mood is None
+            else {"word": mood.word, "cause": mood.cause, "strength": round(mood.strength, 2)},
+            "moods": data.get("moods") or [],
+            "activities": data.get("activities") or [],
+            "proactive": [p for p in data.get("proactive") or [] if not p.get("skipped")],
+            "writings": writings,
+            "quota_session": None if session is None else {"start_used": session.start_used,
+                                                           "count": session.count},
+        }  # fmt: skip
 
     def journal_list(self) -> dict[str, Any]:
         d = self.companion.layout.journal_dir

@@ -30,7 +30,8 @@ from companion import media
 from companion.bodies.qq.message import ImageRef, Incoming, parse_segments, text_segments
 from companion.bodies.qq.onebot import OneBotClient, OneBotError
 from companion.config import QQConfig
-from companion.core.companion import Companion
+from companion.core.companion import Companion, Reply
+from companion.life.activities import ActivityPrep
 from companion.media import MediaError
 from companion.memory.events import Event
 from companion.memory.index import MemoryKind
@@ -134,15 +135,82 @@ class QQBot:
         self._partners: dict[str, dict[str, datetime]] = {}  # 频道 → {刚和她聊过的人: 时间}
         self._pending: dict[str, _Pending] = {}
         self._jobs: set[asyncio.Task[None]] = set()
-        self._approvals: dict[str, list[Any]] = {}
+        self._approvals: dict[str, list[Any]] = {}  # 审批码 → [threading.Event, 是否批准]
         self._bot_rounds: dict[str, int] = {}  # 频道 → 和别的机器人连着聊了几轮
-        self._bot_paused_until: dict[str, datetime] = {}  # 审批码 → [threading.Event, 是否批准]
+        self._bot_paused_until: dict[str, datetime] = {}
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
+        self._activity: asyncio.Task[None] | None = None  # 正在做的自主活动
 
     # ---- 运行 ----
 
     async def run(self) -> None:
-        await asyncio.gather(self.client.run_forever(), self._maintenance())
+        await asyncio.gather(self.client.run_forever(), self._maintenance(), self._life_loop())
+
+    # ---- 主动找主人、自主活动 ----
+
+    async def _life_loop(self, every: float = 60.0) -> None:
+        """每分钟看一次：该不该跟主人说早安 / 晚安；额度充足时要不要自己找点事做。"""
+        while True:
+            await asyncio.sleep(every)
+            try:
+                await self.life_tick()
+            except Exception:
+                log.exception("主动找主人 / 自主活动出错")
+
+    async def life_tick(self) -> None:
+        now = self.now()
+        owner = await self._owner()
+        if owner is not None and self._can_send():
+            kind = await self._call(self.c.life.owner.greeting_due, owner[1], owner[0].channel, now)
+            if kind is not None:
+                reply = await self._call(
+                    self.c.greet, person_id=owner[1], body="qq", channel=owner[0].channel,
+                    kind=kind, now=now,
+                )  # fmt: skip
+                if reply is not None:
+                    await self._send_proactive(owner[0], reply, [])
+        if self._activity is not None and not self._activity.done():
+            return  # 上一件还没做完
+        prep = await self._call(
+            self.c.prepare_activity,
+            now,
+            owner_id=owner[1] if owner else None,
+            owner_channel=owner[0].channel if owner else None,
+        )
+        if prep is not None:
+            self._activity = asyncio.create_task(self._do_activity(prep, owner))
+            self._jobs.add(self._activity)
+            self._activity.add_done_callback(self._jobs.discard)
+
+    async def _do_activity(self, prep: ActivityPrep, owner: tuple[Source, str] | None) -> None:
+        # 做事（几十秒到几分钟）放在别的线程，不占用记忆核心的工作线程，聊天照常
+        result = await asyncio.to_thread(self.c.activities.perform, prep)
+        reply, images = await self._call(
+            self.c.finish_activity,
+            result,
+            self.now(),
+            owner_id=owner[1] if owner else None,
+            owner_channel=owner[0].channel if owner else None,
+        )
+        if reply is not None and owner is not None:
+            await self._send_proactive(owner[0], reply, images)
+
+    async def _owner(self) -> tuple[Source, str] | None:
+        """主人的私聊（第一个主人 QQ 号）和 ta 的人物 id；没配置主人就是 None。"""
+        if not self.cfg.owner_accounts:
+            return None
+        account = self.cfg.owner_accounts[0]
+        pid = await self._call(self.c.people.ensure, "qq", account, None)
+        src = Source("private", account, "", "", None, Incoming(text=""))
+        return src, pid
+
+    async def _send_proactive(self, src: Source, reply: Reply, images: list[Path]) -> None:
+        self._sent_times.append(self.now())
+        await self._send(src, reply.text)
+        for path in images:
+            await self._send_image(src, path)
+        if reply.sticker is not None:
+            await self._send_sticker(src, reply.sticker.digest)
 
     async def _maintenance(self, every: float = 300.0) -> None:
         """定时整理已结束的会话；每天到点做一次“睡眠”；确保今天有安排。"""
