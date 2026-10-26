@@ -281,7 +281,11 @@ class Companion:
         """后台任务做完了：让她用自己的话把结果告诉对方，记下并返回这句话。"""
         label = next((s.label for s in self.skills.all if s.name == skill_name), skill_name)
         bundle = self.context.build(
-            person_id=ctx.person_id, body=ctx.body, channel=ctx.channel, query=result.text[:300]
+            person_id=ctx.person_id,
+            body=ctx.body,
+            channel=ctx.channel,
+            query=result.text[:300],
+            reminder=False,
         )
         done = "完成了" if result.ok else "没有完成"
         note = (

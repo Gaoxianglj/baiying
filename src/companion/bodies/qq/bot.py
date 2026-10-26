@@ -431,7 +431,7 @@ class QQBot:
         for ref in inc.images:
             label = "表情包" if ref.sticker else "图片"
             if not read:
-                descriptions.append(f"[{label}]")
+                descriptions.append(f"[{label}（没看）]")  # 明说没看，免得她猜
                 continue
             desc, digest = await self._look(ref, src)
             descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看清）]")
@@ -464,7 +464,7 @@ class QQBot:
                 desc, digest = await self._look(ref, None)
                 if digest:
                     digests.append(digest)
-            descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}]")
+            descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看）]")
         body = quoted.fill_images(descriptions).strip()
         if len(body) > 120:
             body = body[:119] + "…"

@@ -197,7 +197,7 @@ def test_private_image_is_seen_by_main_model(bot):
 
 def test_group_image_ignored_when_not_active(bot):
     run(bot, image_msg(group=GROUP, mid=2))
-    assert contents(bot) == ["[图片]"] and bot.fetched == []  # 不看也不下载
+    assert contents(bot) == ["[图片（没看）]"] and bot.fetched == []  # 不看也不下载
 
 
 def test_group_image_seen_while_active(bot):
@@ -207,7 +207,7 @@ def test_group_image_seen_while_active(bot):
     bot.clock["now"] = T0 + timedelta(seconds=61)
     run(bot, image_msg(group=GROUP, mid=5))
     theirs = [e.content for e in bot.c.log.iter_events() if e.actor.person_id != "self"]
-    assert theirs[-1] == "[图片]"  # 过了看图的 60 秒，不看也不下载
+    assert theirs[-1] == "[图片（没看）]"  # 过了看图的 60 秒，不看也不下载
 
 
 def test_mentioned_with_image_and_quoted_image(bot):

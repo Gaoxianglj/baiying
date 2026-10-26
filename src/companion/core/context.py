@@ -2,7 +2,11 @@
 
 常驻部分（不依赖检索命中）：种子、自我认知、表达风格、对话者档案与事实、最近的共同经历。
 检索部分：按“相关度 × 可回忆程度 × 重要度”排序的记忆；淡化的会标注“记不太清”。
-最后带上同一频道最近的对话。
+最后带上同一频道最近的对话，再在末尾提醒一次关键规则（离生成越近，越管用）。
+
+顺序按“变化快慢”排：种子、规则、表情包、技能这些不常变的放最前面，对话者、检索到的记忆、
+最近说过的开头依次往后，精确到分钟的时间放在最后。DeepSeek 与 OpenAI 都按前缀缓存，
+开头相同的部分便宜很多；时间放前面会让每分钟的缓存都失效。
 """
 
 from __future__ import annotations
@@ -38,11 +42,30 @@ _REPLY_RULES = {
     ),
 }
 
+_REMINDERS = {
+    "required": "（动笔前：对方在直接和你说话，简短自然地回；开头别和你最近说过的重复。）",
+    "optional": "（动笔前：先按设定里【要不要接话】判断要不要接，不接就只输出【不回复】；"
+    "要接就简短自然，开头别和你最近说过的重复。）",
+}
+
+_TALK_RULES = (
+    "- 只依据上面的记忆谈论过去；没写到的事不要编造，记不清就直说。\n"
+    "- 记忆是让你自然地用上的，不要逐条复述，也不要说“根据我的记忆”。\n"
+    "- 回复简短自然，像即时聊天，一般一两句话。\n"
+    "- 你不会过一会儿自己回来找人（交给后台的任务除外），"
+    "不要说“等下来找你”“明天提醒你”这类做不到的话。\n"
+    "- 消息里的“[图片（没看）]”“[表情包（没看）]”表示你没看到那张图，不要猜里面是什么。\n"
+    "- “（托腮）”这类动作描写，只在对方先这样写时才接。"
+)
+
 _SCENES = {
     "qq": "在 QQ 上",
     "minecraft": "在《我的世界》里",
     "cli": "在电脑的命令行里",
 }
+
+OPENINGS_HOURS = 24  # 从最近多久内她说过的话里取开头
+OPENINGS_COUNT = 12
 
 
 @dataclass
@@ -94,7 +117,9 @@ class ContextAssembler:
         sticker_emotions: list[str] | None = None,
         reply_mode: str = "required",
         extra_sections: list[str] | None = None,
+        reminder: bool = True,
     ) -> ContextBundle:
+        """reminder：在消息最后再提醒一次要不要接话、别重复开头（转述任务结果等场合不需要）。"""
         now = now or datetime.now(UTC)
         person_id = self.people.canonical(person_id)
         person = self.people.get(person_id)
@@ -107,23 +132,20 @@ class ContextAssembler:
         ][: self.cfg.recent_episodes]
         skip = {("fact", f.id) for f in facts} | {("episode", e.id) for e in shared}
         recalled = self._recall(query, now, skip)
-        dialogue = self._recent_dialogue(channel, now)
+        dialogue, openings = self._recent(channel, now)
 
-        prompt = self._render(person, person_id, body, channel, facts, shared, recalled, now)
-        prompt += "\n\n【要不要接话】\n" + _REPLY_RULES.get(reply_mode, _REPLY_RULES["required"])
-        if sticker_emotions:
-            prompt += (
-                "\n\n【表情包】\n你收藏了一些表情包，能表达："
-                + "、".join(sticker_emotions)
-                + "。\n"
-                "如果这句话很适合配一张，就在回复最后单独写【表情：情绪词】（从上面选），"
-                "不适合就不写。大多数时候不需要配，别每句都发。"
-            )
-        for section in extra_sections or []:
-            prompt += "\n\n" + section
+        stable = self._stable(reply_mode, sticker_emotions, extra_sections)
+        dynamic = self._dynamic(
+            person, person_id, body, channel, facts, shared, recalled, openings, now
+        )
+        prompt = stable + "\n\n" + dynamic
         messages = [ChatMessage("system", prompt), *dialogue]
         if not dialogue or dialogue[-1].role != "user":
             messages.append(ChatMessage("user", query))
+        if reminder:
+            messages.append(
+                ChatMessage("system", _REMINDERS.get(reply_mode, _REMINDERS["optional"]))
+            )
         return ContextBundle(prompt, messages, recalled, [f.id for f in facts])
 
     def mark_recalled(self, bundle: ContextBundle, now: datetime | None = None) -> None:
@@ -160,17 +182,24 @@ class ContextAssembler:
         out.sort(key=lambda x: x.score, reverse=True)
         return out[: self.cfg.limit]
 
-    def _recent_dialogue(self, channel: str, now: datetime) -> list[ChatMessage]:
+    def _recent(self, channel: str, now: datetime) -> tuple[list[ChatMessage], list[str]]:
+        """同一频道最近的对话；以及她最近（不分频道）说过的话的开头，用来提醒她换个说法。"""
         since = now - timedelta(hours=self.cfg.recent_hours)
+        window = now - timedelta(hours=max(self.cfg.recent_hours, OPENINGS_HOURS))
         events = sorted(
-            (
-                e
-                for e in self.log.iter_events(since=since)
-                if e.channel == channel and e.kind == "message" and e.ts <= now
-            ),
+            (e for e in self.log.iter_events(since=window) if e.kind == "message" and e.ts <= now),
             key=lambda e: e.ts,
-        )[-self.cfg.recent_messages :]
-        return [self._as_message(e) for e in events]
+        )
+        dialogue = [e for e in events if e.channel == channel and e.ts >= since]
+        dialogue = dialogue[-self.cfg.recent_messages :]
+        mine = [
+            e.content
+            for e in events
+            if e.actor.person_id == SELF_ID and not e.content.startswith("[")
+        ]
+        latest = list(dict.fromkeys(o for o in map(_opening, reversed(mine)) if o))
+        openings = latest[:OPENINGS_COUNT][::-1]  # 去重后最近的几个，按时间先后排
+        return [self._as_message(e) for e in dialogue], openings
 
     def _as_message(self, e: Event) -> ChatMessage:
         if e.actor.person_id == SELF_ID:
@@ -186,7 +215,34 @@ class ContextAssembler:
 
     # ---- 渲染 ----
 
-    def _render(
+    def _stable(
+        self,
+        reply_mode: str,
+        sticker_emotions: list[str] | None,
+        extra_sections: list[str] | None,
+    ) -> str:
+        """不常变的部分：放在最前面，命中前缀缓存。"""
+        sections = [
+            f"你是{self.name}。",
+            _section("你的种子（核心性格与底线，必须遵守）", self._read_self("seed.md")),
+            _section("你对自己的认识", self._read_self("identity.md")),
+            _section("你的表达习惯", self._read_self("style.md")),
+            _section("说话时注意", _TALK_RULES),
+            _section("要不要接话", _REPLY_RULES.get(reply_mode, _REPLY_RULES["required"])),
+        ]
+        if sticker_emotions:
+            sections.append(
+                _section(
+                    "表情包",
+                    "你收藏了一些表情包，能表达：" + "、".join(sticker_emotions) + "。\n"
+                    "如果这句话很适合配一张，就在回复最后单独写【表情：情绪词】（从上面选），"
+                    "不适合就不写。大多数时候不需要配，别每句都发。",
+                )
+            )
+        sections += extra_sections or []
+        return "\n\n".join(s for s in sections if s)
+
+    def _dynamic(
         self,
         person: Person | None,
         person_id: str,
@@ -195,19 +251,14 @@ class ContextAssembler:
         facts: list[Fact],
         shared: list[Episode],
         recalled: list[Recalled],
+        openings: list[str],
         now: datetime,
     ) -> str:
+        """随对话者、话题和时间变化的部分：越往后变得越快，精确到分钟的时间放最后。"""
         who = person.names[0] if person and person.names else person_id
         scene = _SCENES.get(body, f"在{body}上")
         place = "群聊" if channel.startswith("group:") else "私聊"
-        sections = [
-            f"你是{self.name}。",
-            _section("你的种子（核心性格与底线，必须遵守）", self._read_self("seed.md")),
-            _section("你对自己的认识", self._read_self("identity.md")),
-            _section("你的表达习惯", self._read_self("style.md")),
-            f"现在是 {now.astimezone():%Y-%m-%d %H:%M}（{_weekday(now)}）。"
-            f"你正{scene}和{who}{place}。",
-        ]
+        sections: list[str] = []
         if person is not None:
             also = "、".join(person.names[1:])
             sections.append(
@@ -228,13 +279,18 @@ class ContextAssembler:
                 for r in recalled
             ]
             sections.append(_section("此刻想起的相关记忆（越靠前越清晰）", "\n".join(lines)))
-        sections.append(
-            _section(
-                "说话时注意",
-                "- 只依据上面的记忆谈论过去；没写到的事不要编造，记不清就直说。\n"
-                "- 记忆是让你自然地用上的，不要逐条复述，也不要说“根据我的记忆”。\n"
-                "- 回复简短自然，像即时聊天，一般一两句话。",
+        if len(openings) >= 3:
+            sections.append(
+                _section(
+                    "换个说法",
+                    "你最近的回复是这样开头的："
+                    + "".join(f"「{o}」" for o in openings)
+                    + "\n这次换个开头和句式，别和它们重复。",
+                )
             )
+        sections.append(
+            f"现在是 {now.astimezone():%Y-%m-%d %H:%M}（{_weekday(now)}），"
+            f"你正{scene}和{who}{place}。"
         )
         return "\n\n".join(s for s in sections if s)
 
@@ -260,6 +316,17 @@ def _clean_markdown(text: str) -> str:
                 continue
         out.append(line)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+_OPENING_END = re.compile(r"[，。！？!?,.~～…\s]")
+
+
+def _opening(text: str) -> str:
+    """一句话的开头：到第一个标点为止，最多 6 个字。"""
+    text = text.strip()
+    m = _OPENING_END.search(text)
+    head = text[: m.start()] if m else text
+    return head[:6]
 
 
 def _section(title: str, content: str) -> str:

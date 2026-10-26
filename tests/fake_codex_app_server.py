@@ -11,6 +11,9 @@ import os
 import sys
 import time
 
+sys.stdin.reconfigure(encoding="utf-8")  # 不受系统代码页影响（父进程按 UTF-8 读写）
+sys.stdout.reconfigure(encoding="utf-8")
+
 used = float(os.environ.get("FAKE_USED_PERCENT", "10"))
 fail = os.environ.get("FAKE_FAIL", "")
 reply = os.environ.get("FAKE_REPLY", "你好呀")
