@@ -71,7 +71,7 @@ _QQ_GROUP_RULES = (
 )
 
 
-def _qq_action_rules(qq: QQConfig) -> list[str]:
+def _qq_action_rules(qq: QQConfig, group: bool) -> list[str]:
     """QQ 上能用的小动作（按设置开关）。"""
     rules = []
     if qq.reactions:
@@ -81,7 +81,7 @@ def _qq_action_rules(qq: QQConfig) -> list[str]:
         )
     if qq.poke:
         rules.append("- 别人戳了你一下（“（戳了戳你）”）、你想戳回去时，写【戳一戳】。")
-    if qq.voice_out:
+    if qq.voice_out and group:  # QQ 的 AI 声音只能发在群里
         rules.append(
             "- 偶尔想用声音说一句时（比如道晚安、念一句诗），写【语音：要说的话】，"
             "程序会用你的声音发出去；大多数时候还是打字，一次只说一两句。"
@@ -267,7 +267,7 @@ class ContextAssembler:
         """不常变的部分：放在最前面，命中前缀缓存。"""
         rules = [_TALK_RULES, _QQ_GROUP_RULES if qq_group else None]
         if on_qq and self.qq is not None:
-            rules += _qq_action_rules(self.qq)
+            rules += _qq_action_rules(self.qq, qq_group)
         if self.life is not None:
             rules.append(self.life.talk_rules())
         sections = [

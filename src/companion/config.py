@@ -153,7 +153,7 @@ class QQConfig(_Section):
     poke: bool = True  # 被戳一戳会回应，也可以戳回去【戳一戳】
     poke_cooldown_seconds: float = 60.0  # 同一个聊天里多久才理一次戳一戳（防止来回戳）
     voice_in: bool = True  # 语音消息用 QQ 自带的语音转文字听
-    voice_out: bool = True  # 她可以用 QQ 的 AI 声音说话【语音：…】
+    voice_out: bool = True  # 她可以在群里用 QQ 的 AI 声音说话【语音：…】（私聊做不到）
     voice_character: str = "lucy-voice-f37"  # 声音（文艺少女）；可选见 NapCat get_ai_characters
     ocr: bool = True  # 没看的图片用 QQ 自带的文字识别读出图里的字（本机，不花额度）
     long_text_chars: int = 300  # 她一次说的话超过这么多字，就打包成聊天记录发；0 = 不打包

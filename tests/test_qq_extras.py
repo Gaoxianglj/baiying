@@ -3,7 +3,6 @@
 import asyncio
 import random
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
@@ -94,9 +93,10 @@ def test_qq_rules_only_on_qq(bot):
                                    now=T0).system_prompt  # fmt: skip
 
     assert "【回应：" in system("qq", "private:1") and "【语音：" in system("qq", "group:4000")
+    assert "【语音：" not in system("qq", "private:1")  # 语音只能发在群里
     assert "【回应：" not in system("cli", "cli:x")
     bot.c.context.qq.voice_out = False
-    assert "【语音：" not in system("qq", "private:1")
+    assert "【语音：" not in system("qq", "group:4000")
 
 
 # ---- 表情回应 ----
@@ -170,36 +170,22 @@ def test_she_speaks_with_voice_in_group(bot):
     assert contents(bot, mine=True) == ["（用语音说）晚安，做个好梦"]
 
 
-def test_voice_in_private_goes_through_ai_record(bot, monkeypatch):
-    """生成的是 SILK 语音（标成 mp3）：先下到本地再发，NapCat 才不会拿 ffmpeg 转码失败。"""
-    silk = b"\x03#!SILK_V3" + b"\x00" * 20
-    monkeypatch.setattr("companion.bodies.qq.bot.media.fetch", lambda url, max_bytes: silk)
+def test_no_voice_in_private(bot):
+    """私聊不发语音：get_ai_record 会把语音发到群里（2026-10-28 出过事），一律改发文字。"""
     bot.brain["reply"] = "【语音：早安】"
-    bot.client.replies["get_ai_record"] = "http://voice/1.mp3"
     run(bot, ev([text("早")]))
-    assert actions(bot) == ["get_ai_record", "send_private_msg"]
-    seg = bot.client.sent[1][1]["message"][0]
-    assert seg["type"] == "record" and seg["data"]["file"].endswith(".silk")
-    assert Path(seg["data"]["file"]).read_bytes() == silk
-
-
-def test_voice_that_is_not_silk_falls_back_to_text(bot, monkeypatch):
-    monkeypatch.setattr("companion.bodies.qq.bot.media.fetch", lambda url, max_bytes: b"<html>")
-    bot.brain["reply"] = "【语音：早安】"
-    bot.client.replies["get_ai_record"] = "http://voice/1.mp3"
-    run(bot, ev([text("早")]))
-    assert actions(bot) == ["get_ai_record", "send_private_msg"]
+    assert actions(bot) == ["send_private_msg"]
     assert bot.client.texts("send_private_msg") == ["早安"]
 
 
-def test_voice_failure_falls_back_to_text(bot):
+def test_group_voice_failure_falls_back_to_text(bot):
     from companion.bodies.qq.onebot import OneBotError
 
-    bot.brain["reply"] = "【语音：早安】"
-    bot.client.replies["get_ai_record"] = OneBotError("不行")
-    run(bot, ev([text("早")]))
-    assert actions(bot)[-1] == "send_private_msg"
-    assert bot.client.texts("send_private_msg")[-1] == "早安"
+    bot.brain["reply"] = "【语音：晚安】"
+    bot.client.replies["send_group_ai_record"] = OneBotError("不行")
+    run(bot, ev([{"type": "at", "data": {"qq": BOT}}, text(" 晚安")], group=GROUP))
+    assert actions(bot) == ["send_group_ai_record", "send_group_msg"]
+    assert bot.client.texts("send_group_msg") == ["晚安"]
 
 
 # ---- 图里的字 ----

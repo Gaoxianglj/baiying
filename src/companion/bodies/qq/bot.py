@@ -17,7 +17,6 @@ import logging
 import random
 import re
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +25,6 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
-from uuid import uuid4
 
 from companion import media
 from companion.bodies.qq.message import (
@@ -58,7 +56,6 @@ T = TypeVar("T")
 
 OCR_MAX_CHARS = 150  # 图里的字最多带这么多
 LONG_CHUNK = 400  # 打包成聊天记录时，每条最多这么多字
-VOICE_MAX_BYTES = 5_000_000  # 生成的语音最多这么大（一句话通常只有几 KB）
 
 NOTICE = """大家好，我是{name}，一个 AI。
 我会记住群里的聊天，这样以后还能记得和大家一起经历过的事。
@@ -661,47 +658,23 @@ class QQBot:
         self._last_poke[src.channel] = self.now()
 
     async def _send_voice(self, src: Source, text: str) -> None:
-        """用 QQ 的 AI 声音说一句：群里直接发；私聊先在某个群里生成语音，再把它发过去。"""
-        character = self.cfg.voice_character
+        """用 QQ 的 AI 声音说一句，只在群里。
+
+        私聊做不到：NapCat 的 get_ai_record 和 send_group_ai_record 调的是同一个 QQ 功能，
+        生成语音的同时就把它发到了那个群里（2026-10-28 私聊试语音时，群里多出了三条）。
+        所以私聊里她说的“语音”一律改发文字。
+        """
+        if src.message_type != "group":
+            await self._send(src, text)
+            return
+        params = {"group_id": src.group_id, "character": self.cfg.voice_character, "text": text}
         try:
-            if src.message_type == "group":
-                params = {"group_id": src.group_id, "character": character, "text": text}
-                await self.client.call("send_group_ai_record", params, timeout=60)
-            else:
-                if not self.cfg.groups:
-                    raise OneBotError("没有可以生成语音的群")
-                params = {"group_id": self.cfg.groups[0], "character": character, "text": text}
-                data = await self.client.call("get_ai_record", params, timeout=60)
-                url = data.get("url") if isinstance(data, dict) else data
-                if not url:
-                    raise OneBotError("没生成语音")
-                # 生成的是 QQ 自己的 SILK 语音（服务器却标成 mp3）。直接把链接给 NapCat，
-                # 它会拿 ffmpeg 转码而失败；先下到本地，NapCat 认出文件头是 SILK 就原样发出去。
-                path = await asyncio.to_thread(self._save_voice, str(url))
-                record = [{"type": "record", "data": {"file": str(path)}}]
-                await self.client.call(
-                    "send_private_msg", {"user_id": int(src.user_id), "message": record}
-                )
-        except (OneBotError, TimeoutError, MediaError, OSError) as e:
+            await self.client.call("send_group_ai_record", params, timeout=60)
+        except (OneBotError, TimeoutError) as e:
             log.info("用声音说话失败，改发文字：%s", e)
             await self._send(src, text)
             return
         self._last_spoke[src.channel] = self.now()
-
-    def _save_voice(self, url: str) -> Path:
-        """（在后台线程里）把生成的语音下到 data/run/voice/，顺手清掉一天前的旧文件。"""
-        folder = self.c.config.data_dir / "run" / "voice"
-        folder.mkdir(parents=True, exist_ok=True)
-        cutoff = time.time() - 24 * 3600
-        for old in folder.glob("*.silk"):
-            if old.stat().st_mtime < cutoff:
-                old.unlink(missing_ok=True)
-        data = media.fetch(url, max_bytes=VOICE_MAX_BYTES)
-        if b"#!SILK" not in data[:10]:
-            raise MediaError("生成的语音不是 SILK 格式")
-        path = folder / f"{uuid4().hex}.silk"
-        path.write_bytes(data)
-        return path.resolve()
 
     async def _send_reply(self, src: Source, text: str, reply_to: str | None = None) -> None:
         """她说的话：太长就打包成一条聊天记录发（不刷屏），发不出去再分开发。"""

@@ -121,7 +121,7 @@ FIELDS: list[SettingField] = [
     SettingField("qq.voice_in", "听语音", "bool", "QQ",
                  "发给她的语音用 QQ 自带的语音转文字听（群里没冲她来的不听）"),
     SettingField("qq.voice_out", "用声音说话", "bool", "QQ",
-                 "她偶尔用 QQ 的 AI 声音发语音；私聊需要她至少在一个群里"),
+                 "她偶尔在群里用 QQ 的 AI 声音发语音（只在群里：私聊做不到，会被发到群里）"),
     SettingField("qq.voice_character", "声音", "select", "QQ", "QQ AI 声聊的角色",
                  options=["lucy-voice-f37", "lucy-voice-xueling", "lucy-voice-female1",
                           "lucy-voice-f38", "lucy-voice-suxinjiejie", "lucy-voice-daji"]),
