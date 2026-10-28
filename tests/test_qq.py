@@ -21,12 +21,14 @@ T0 = datetime(2026, 10, 23, 12, tzinfo=UTC)
 class FakeClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, dict]] = []
-        self.replies: dict[str, object] = {}  # 动作 → 返回值（是异常就抛出）
+        self.replies: dict[str, object] = {}  # 动作 → 返回值（函数就按参数算；是异常就抛出）
 
     async def call(self, action, params, timeout=30.0):
         self.sent.append((action, params))
         if action in self.replies:
             reply = self.replies[action]
+            if callable(reply):
+                reply = reply(params)
             if isinstance(reply, Exception):
                 raise reply
             return reply
@@ -364,3 +366,84 @@ def test_quoted_forward_stays_short(bot):
     run(bot, msg("你怎么看", reply="77"))
     contents = [e.content for e in bot.c.log.iter_events()]
     assert contents[0] == "你怎么看（引用了小明的话：[聊天记录]）"
+
+
+# ---- 她发的 @ 变成真正的 @ ----
+
+FORTUNE_BOT = "2854197266"
+
+
+def at(qq):
+    return {"type": "at", "data": {"qq": qq}}
+
+
+def txt(text):
+    return {"type": "text", "data": {"text": text}}
+
+
+def test_mention_segments():
+    names = {"小明": "3000", "小明同学": "3001", "全体成员": "3002", "all": "3003", "自己": BOT}
+
+    def segs(text, reply_to=None):
+        return text_segments(text, reply_to, mentions=names, self_id=BOT)
+
+    assert segs(f"@{FORTUNE_BOT} /今日运势") == [at(FORTUNE_BOT), txt(" /今日运势")]
+    assert segs("@小明同学 早，@小明你好") == [at("3001"), txt(" 早，"), at("3000"), txt("你好")]
+    assert segs("@小红 在吗") == [txt("@小红 在吗")]  # 不认识的名字照原样发
+    assert segs("@全体成员 开会了 @all") == [txt("@全体成员 开会了 @all")]
+    assert segs(f"@自己 @{BOT} 和 a@123456.com") == [txt(f"@自己 @{BOT} 和 a@123456.com")]
+    assert segs("@1234") == [txt("@1234")]  # 太短，不是 QQ 号
+    assert segs("@小明") == [at("3000")]
+    assert segs(f"@{FORTUNE_BOT} /今日运势", "77") == [
+        {"type": "reply", "data": {"id": "77"}},
+        at(FORTUNE_BOT),
+        txt(" /今日运势"),
+    ]
+    # 私聊不给 mentions：原样一段文字
+    assert text_segments(f"@{FORTUNE_BOT} /今日运势") == [txt(f"@{FORTUNE_BOT} /今日运势")]
+
+
+def say(bot, text):
+    bot.chat.handler = lambda messages, json_mode: text
+
+
+def test_group_reply_mentions_recent_speaker_by_name(bot):
+    bot.cfg.unsolicited_probability = 0
+    fortune = msg("今日运势已更新", group=GROUP, user=FORTUNE_BOT, name="运势机器人", mid=10)
+    say(bot, "@运势机器人 /今日运势")
+    run(bot, fortune, msg("帮我测下运势", group=GROUP, at_bot=True, mid=11))
+    action, params = bot.client.sent[-1]
+    assert action == "send_group_msg"
+    assert params["message"] == [
+        {"type": "reply", "data": {"id": "11"}},
+        at(FORTUNE_BOT),
+        txt(" /今日运势"),
+    ]
+    # 记下的还是她说的原话
+    assert [e.content for e in bot.c.log.iter_events()][-1] == "@运势机器人 /今日运势"
+
+    # 重启后（内存里的名字没了）也能从最近的聊天记录里认出来
+    bot._speakers.clear()
+    run(bot, msg("再来一次", group=GROUP, at_bot=True, mid=12))
+    assert bot.client.sent[-1][1]["message"][1] == at(FORTUNE_BOT)
+
+
+def test_private_reply_stays_plain_text(bot):
+    say(bot, f"@{FORTUNE_BOT} /今日运势")
+    run(bot, msg("在吗"))
+    action, params = bot.client.sent[-1]
+    assert action == "send_private_msg"
+    assert params["message"] == [txt(f"@{FORTUNE_BOT} /今日运势")]
+
+
+def test_mention_send_failure_falls_back_to_text(bot):
+    def group_send(params):
+        if any(s["type"] == "at" for s in params["message"]):
+            return OneBotError("群成员不存在")
+        return {"message_id": 9999}
+
+    bot.client.replies["send_group_msg"] = group_send
+    say(bot, "@99999999 你好")
+    run(bot, msg("白璎", group=GROUP, mid=11))
+    sends = [p["message"] for a, p in bot.client.sent if a == "send_group_msg"]
+    assert sends[-2][1] == at("99999999") and sends[-1][1] == txt("@99999999 你好")

@@ -65,6 +65,10 @@ _TALK_RULES = (
     "- 消息里的“[图片（没看）]”“[表情包（没看）]”表示你没看到那张图，不要猜里面是什么。\n"
     "- “（托腮）”这类动作描写，只在对方先这样写时才接。"
 )
+_QQ_GROUP_RULES = (
+    "- 群里要 @ 某人时（比如让别的机器人执行指令），"
+    "写“@”加对方的 QQ 号或群里显示的名字（一字不差），程序会把它变成真正的 @；不要 @全体成员。"
+)
 
 _SCENES = {
     "qq": "在 QQ 上",
@@ -146,7 +150,8 @@ class ContextAssembler:
         recalled = self._recall(query, now, skip)
         dialogue, openings = self._recent(channel, now)
 
-        stable = self._stable(reply_mode, sticker_emotions, extra_sections)
+        qq_group = body == "qq" and channel.startswith("group:")
+        stable = self._stable(reply_mode, sticker_emotions, extra_sections, qq_group)
         dynamic = self._dynamic(
             person, person_id, body, channel, facts, shared, recalled, openings, now
         )
@@ -235,17 +240,18 @@ class ContextAssembler:
         reply_mode: str,
         sticker_emotions: list[str] | None,
         extra_sections: list[str] | None,
+        qq_group: bool = False,
     ) -> str:
         """不常变的部分：放在最前面，命中前缀缓存。"""
+        rules = [_TALK_RULES, _QQ_GROUP_RULES if qq_group else None]
+        if self.life is not None:
+            rules.append(self.life.talk_rules())
         sections = [
             f"你是{self.name}。",
             _section("你的种子（核心性格与底线，必须遵守）", self._read_self("seed.md")),
             _section("你对自己的认识", self._read_self("identity.md")),
             _section("你的表达习惯", self._read_self("style.md")),
-            _section(
-                "说话时注意",
-                "\n".join(r for r in (_TALK_RULES, self.life and self.life.talk_rules()) if r),
-            ),
+            _section("说话时注意", "\n".join(r for r in rules if r)),
             _section("要不要接话", _REPLY_RULES.get(reply_mode, _REPLY_RULES["required"])),
         ]
         if sticker_emotions:

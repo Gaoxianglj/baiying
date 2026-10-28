@@ -27,6 +27,9 @@ _NESTED_MAX_LINES = 10  # 记录里套着的记录：只展开这一层，篇幅
 _NESTED_MAX_CHARS = 500
 _FORWARD_LINE_CHARS = 200  # 每行最多这么多字，免得一条长消息占满篇幅
 
+_QQ_NUMBER = r"\d{5,12}(?!\d)"
+_NO_MENTION = {"全体成员", "all"}  # 她发的话里不会变成真正的 @
+
 
 @dataclass(frozen=True)
 class ImageRef:
@@ -184,9 +187,43 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def text_segments(text: str, reply_to: str | None = None) -> list[dict[str, Any]]:
+def text_segments(
+    text: str,
+    reply_to: str | None = None,
+    *,
+    mentions: dict[str, str] | None = None,
+    self_id: str = "",
+) -> list[dict[str, Any]]:
+    """她要发的话 → 消息段。
+
+    `mentions`（只在群聊给）：最近在群里说过话的人，名字 → QQ 号。给了就把“@QQ号”和
+    “@名字”（名字一字不差，长的优先）换成真正的 @，好让别的机器人认出指令；
+    不认识的名字照原样发，也不会 @全体成员 或 @她自己。
+    """
     segs: list[dict[str, Any]] = []
     if reply_to:
         segs.append({"type": "reply", "data": {"id": reply_to}})
-    segs.append({"type": "text", "data": {"text": text}})
+    if mentions is None:
+        segs.append({"type": "text", "data": {"text": text}})
+        return segs
+    names = {
+        name: qq
+        for name, qq in mentions.items()
+        if name and qq.isdigit() and qq != self_id and name not in _NO_MENTION
+    }
+    alternatives = [re.escape(n) for n in sorted(names, key=len, reverse=True)]
+    # “@”前面紧挨着字母数字的（如邮箱）不算
+    pattern = re.compile(r"(?<![A-Za-z0-9_.])@(" + "|".join([*alternatives, _QQ_NUMBER]) + ")")
+    pos = 0
+    for m in pattern.finditer(text):
+        target = m.group(1)
+        qq = names.get(target, target)
+        if qq == self_id:
+            continue
+        if m.start() > pos:
+            segs.append({"type": "text", "data": {"text": text[pos : m.start()]}})
+        segs.append({"type": "at", "data": {"qq": qq}})
+        pos = m.end()
+    if pos < len(text) or len(segs) == (1 if reply_to else 0):
+        segs.append({"type": "text", "data": {"text": text[pos:]}})
     return segs

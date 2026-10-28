@@ -100,3 +100,15 @@ def test_report_has_no_reply_reminder(companion):
 )
 def test_opening(text, head):
     assert _opening(text) == head
+
+
+def test_qq_group_mention_rule(companion):
+    def system(body, channel):
+        bundle = companion.context.build(
+            person_id="xiang", body=body, channel=channel, query="在吗", now=T0
+        )
+        return bundle.system_prompt
+
+    assert "写“@”加对方的 QQ 号或群里显示的名字" in system("qq", "group:4000")
+    assert "真正的 @" not in system("qq", "private:2000")
+    assert "真正的 @" not in system("cli", "cli:test")

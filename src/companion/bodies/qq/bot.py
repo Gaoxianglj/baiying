@@ -69,6 +69,7 @@ BIND_PREFIX = "bind_request:"
 
 
 _MODE_RANK = {"other": 0, "chime": 1, "partner": 2, "required": 3}
+MAX_SPEAKER_NAMES = 200  # 每个群记住多少个最近说过话的名字（用来把她写的“@名字”变成真正的 @）
 
 
 @dataclass
@@ -141,6 +142,7 @@ class QQBot:
         self._last_unsolicited: dict[str, datetime] = {}
         self._last_spoke: dict[str, datetime] = {}
         self._partners: dict[str, dict[str, datetime]] = {}  # 频道 → {刚和她聊过的人: 时间}
+        self._speakers: dict[str, dict[str, str]] = {}  # 群 → {最近说过话的名字: QQ 号}
         self._pending: dict[str, _Pending] = {}
         self._jobs: set[asyncio.Task[None]] = set()
         self._approvals: dict[str, list[Any]] = {}  # 审批码 → [threading.Event, 是否批准]
@@ -259,6 +261,8 @@ class QQBot:
         src = self._source(ev)
         if src is None:
             return
+        if src.message_type == "group":
+            await self._note_speaker(src, ev.get("sender") or {})
         text = src.incoming.text
         if text[:1] in ("/", "／"):
             await self._command(src, text[1:].strip())
@@ -624,22 +628,54 @@ class QQBot:
         return len(self._sent_times) < self.cfg.max_replies_per_minute
 
     async def _send(self, src: Source, text: str, reply_to: str | None = None) -> None:
-        message = text_segments(text, reply_to)
-        try:
-            if src.message_type == "group":
-                data = await self.client.call(
-                    "send_group_msg", {"group_id": int(src.group_id), "message": message}
-                )
-            else:
-                data = await self.client.call(
-                    "send_private_msg", {"user_id": int(src.user_id), "message": message}
-                )
-        except OneBotError as e:
-            log.error("发送失败：%s", e)
+        if src.message_type == "group":
+            action, params = "send_group_msg", {"group_id": int(src.group_id)}
+        else:
+            action, params = "send_private_msg", {"user_id": int(src.user_id)}
+        attempts = [text_segments(text, reply_to)]
+        if src.message_type == "group":  # 群里把“@QQ号”“@名字”变成真正的 @；发不出去再退回纯文字
+            names = await self._speakers_in(src.channel)
+            with_at = text_segments(text, reply_to, mentions=names, self_id=self.self_id)
+            if with_at != attempts[0]:
+                attempts.insert(0, with_at)
+        for message in attempts:
+            try:
+                data = await self.client.call(action, params | {"message": message})
+                break
+            except OneBotError as e:
+                log.error("发送失败：%s", e)
+        else:
             return
         self._last_spoke[src.channel] = self.now()
         if isinstance(data, dict) and data.get("message_id") is not None:
             self._sent_ids.append(str(data["message_id"]))
+
+    async def _speakers_in(self, channel: str) -> dict[str, str]:
+        """群里最近说过话的人：名字（群名片、昵称）→ QQ 号。第一次用时从事件日志里补上重启前的。"""
+        names = self._speakers.get(channel)
+        if names is None:
+            loaded = await self._call(self._recent_speakers, channel)
+            names = self._speakers.setdefault(channel, loaded)
+        return names
+
+    def _recent_speakers(self, channel: str) -> dict[str, str]:
+        """（在工作线程里）她在上下文里能看到的那段时间内，这个群里说过话的人。"""
+        since = self.now() - timedelta(hours=self.c.config.retrieval.recent_hours)
+        names: dict[str, str] = {}
+        for e in self.c.log.iter_events(since=since):
+            if e.channel == channel and e.actor.platform == "qq" and e.actor.display_name:
+                names.pop(e.actor.display_name, None)
+                names[e.actor.display_name] = e.actor.platform_id
+        return names
+
+    async def _note_speaker(self, src: Source, sender: dict[str, Any]) -> None:
+        names = await self._speakers_in(src.channel)
+        for name in (sender.get("card"), sender.get("nickname")):
+            if name := str(name or "").strip():
+                names.pop(name, None)  # 挪到最后：同名时以最近说话的为准
+                names[name] = src.user_id
+        while len(names) > MAX_SPEAKER_NAMES:
+            names.pop(next(iter(names)))
 
     async def _announce_groups(self) -> None:
         """第一次接入某个群时，主动说明她会怎样使用聊天记录（每个群只说一次）。"""
