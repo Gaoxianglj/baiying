@@ -301,6 +301,17 @@ class AgentSkillConfig(_Section):
         return value
 
 
+class FilesSkillConfig(_Section):
+    """收发文件。收到的存进工作文件夹的 inbox/（助手也能用）；发的只能是工作文件夹里的文件。"""
+
+    enabled: bool = True
+    max_mb: float = 10.0  # 收发都不超过这么大
+    inbox: Path = Path("data/workspace/inbox")  # 相对于项目根目录；按日期分子文件夹
+    preview_chars: int = 1500  # 小的文本文件，把开头这么多字直接给她看
+    send_owner_only: bool = True  # 只给主人发（工作文件夹里多是替主人做的东西）
+    send_in_groups: bool = False  # 群里也能发（否则只在私聊）
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
@@ -310,6 +321,7 @@ class SkillsConfig(_Section):
     search: SearchSkillConfig = SearchSkillConfig()
     image: ImageSkillConfig = ImageSkillConfig()
     agent: AgentSkillConfig = AgentSkillConfig()
+    files: FilesSkillConfig = FilesSkillConfig()
 
 
 class Config(_Section):

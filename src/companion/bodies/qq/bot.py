@@ -29,6 +29,7 @@ from typing import Any, TypeVar
 from companion import media
 from companion.bodies.qq.message import (
     FORWARD_UNREAD,
+    FileRef,
     ForwardRef,
     ImageRef,
     Incoming,
@@ -46,6 +47,7 @@ from companion.memory.index import MemoryKind
 from companion.memory.people import PeopleError
 from companion.models.openai_compat import ModelError
 from companion.skills import SkillCall, SkillContext
+from companion.skills.files import FileInbox
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +152,8 @@ class QQBot:
         self._bot_paused_until: dict[str, datetime] = {}
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
         self._activity: asyncio.Task[None] | None = None  # 正在做的自主活动
+        skills = companion.config.skills
+        self.inbox = FileInbox(skills.files, companion.config.root, skills.agent.workspace)
 
     # ---- 运行 ----
 
@@ -417,6 +421,8 @@ class QQBot:
             await self._send(src, reply.text, reply_to=quote)
         for path in reply.images:
             await self._send_image(src, path)
+        for path in reply.files:
+            await self._send_file(src, path)
         if reply.sticker is not None:
             await self._send_sticker(src, reply.sticker.digest)
         partners = self._partners.setdefault(src.channel, {})
@@ -429,8 +435,10 @@ class QQBot:
         assert call.later is not None
         result = await asyncio.to_thread(call.later)  # 不占用记忆核心的工作线程，聊天照常
         if result.report:  # 让她用自己的话转述结果
-            text = await self._call(self.c.report, ctx, call.skill, result)
+            text, files = await self._call(self.c.report, ctx, call.skill, result)
             await self._send(src, text)
+            for path in files:
+                await self._send_file(src, path)
             return
         if not result.ok:
             log.warning("%s：后台技能没成功：%s", src.channel, result.text)
@@ -520,7 +528,9 @@ class QQBot:
             if digest:
                 digests.append(digest)
         forwards = [await self._read_forward(ref) for ref in inc.forwards]
-        text = inc.fill(descriptions, forwards)
+        receive = addressed or self._active(src.channel)
+        files = [await self._receive_file(ref, src, receive) for ref in inc.files]
+        text = inc.fill(descriptions, forwards, files)
 
         if inc.reply_to:
             text += await self._describe_quote(inc.reply_to, read and addressed, digests)
@@ -567,6 +577,61 @@ class QQBot:
         if not isinstance(nodes, list) or not nodes:
             return FORWARD_UNREAD
         return render_forward(nodes, self.self_id)
+
+    # ---- 文件 ----
+
+    async def _receive_file(self, ref: FileRef, src: Source, receive: bool) -> str:
+        """收一个文件：发给她的（私聊、@她、她刚说完话时）且不太大，就存进工作文件夹的 inbox。"""
+        inbox = self.inbox
+        if not (inbox.cfg.enabled and receive):
+            return inbox.skipped(ref.name, ref.size, "没收")
+        if ref.size and ref.size > inbox.max_bytes:
+            return inbox.skipped(ref.name, ref.size, f"超过 {inbox.cfg.max_mb:g} MB，没收")
+        try:
+            data = await self._download_file(ref, src)
+            path = await asyncio.to_thread(inbox.save, ref.name, data, self.now())
+            text = await asyncio.to_thread(inbox.describe, path, ref.name)
+        except (MediaError, OneBotError, OSError, TimeoutError) as e:
+            log.warning("收文件失败（%s）：%s", ref.name, e)
+            return inbox.skipped(ref.name, ref.size, "没收到")
+        log.info("收到文件：%s", path)
+        return text
+
+    async def _download_file(self, ref: FileRef, src: Source) -> bytes:
+        max_bytes = self.inbox.max_bytes
+        url = ref.url
+        if not url and ref.file_id:
+            # 没有直链时向 NapCat 要：可能给本地路径，也可能给链接
+            data = await self.client.call("get_file", {"file_id": ref.file_id}) or {}
+            local = data.get("file")
+            if local and Path(local).is_file():
+                if Path(local).stat().st_size > max_bytes:
+                    raise MediaError("文件太大")
+                return await asyncio.to_thread(Path(local).read_bytes)
+            url = data.get("url")
+            if not url and src.message_type == "group":
+                params = {"group_id": int(src.group_id), "file_id": ref.file_id}
+                url = (await self.client.call("get_group_file_url", params) or {}).get("url")
+        if not url:
+            raise MediaError("拿不到文件地址")
+        return await asyncio.to_thread(media.fetch, url, max_bytes=max_bytes)
+
+    async def _send_file(self, src: Source, path: Path) -> None:
+        """发文件（NapCat 和这里在同一台电脑上，直接给本地路径）。"""
+        if src.message_type == "group":
+            action = "upload_group_file"
+            params: dict[str, object] = {"group_id": int(src.group_id)}
+        else:
+            action = "upload_private_file"
+            params = {"user_id": int(src.user_id)}
+        params |= {"file": str(path.resolve()), "name": path.name}
+        try:
+            await self.client.call(action, params, timeout=120.0)
+        except (OneBotError, TimeoutError) as e:
+            log.error("发文件失败（%s）：%s", path.name, e)
+            await self._send(src, f"（文件 {path.name} 没发出去）")
+            return
+        self._last_spoke[src.channel] = self.now()
 
     async def _look(self, ref: ImageRef, src: Source | None) -> tuple[str | None, str | None]:
         """看一张图；表情包顺便判断能否收藏，并记下是谁发的。"""

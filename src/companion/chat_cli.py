@@ -61,6 +61,7 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
                 print(f"（{c.name}没有回复）\n")
             else:
                 extras = "".join(f"\n{c.name}：[图片] {p}" for p in last.images)
+                extras += "".join(f"\n{c.name}：[文件] {p}" for p in last.files)
                 if last.sticker:
                     extras += (
                         f"\n{c.name}：[表情包·{last.sticker.emotion}] {last.sticker.description}"
@@ -71,7 +72,10 @@ def run_chat(config: Config, person_id: str, name: str | None, backend: str) -> 
                 print("（后台进行中，请稍候……）", flush=True)
                 done = call.later()
                 if done.report:
-                    print(f"{c.name}：{c.report(last.skill_ctx, call.skill, done)}\n")
+                    text, files = c.report(last.skill_ctx, call.skill, done)
+                    print(f"{c.name}：{text}\n")
+                    for path in files:
+                        print(f"{c.name}：[文件] {path}\n")
                     continue
                 for path in c.deliver("cli", channel, done):
                     print(f"{c.name}：[图片] {path}\n")

@@ -11,7 +11,6 @@ _PLACEHOLDERS = {
     "mface": "[表情]",
     "record": "[语音]",
     "video": "[视频]",
-    "file": "[文件]",
     "forward": "[聊天记录]",
     "json": "[卡片]",
     "xml": "[卡片]",
@@ -46,6 +45,21 @@ class ForwardRef:
     nodes: list[dict[str, Any]] | None  # NapCat 通常直接带上每条消息
 
 
+@dataclass(frozen=True)
+class FileRef:
+    """一个文件：NapCat 给文件名、file_id、大小，有时直接带下载链接。"""
+
+    name: str
+    file_id: str | None
+    size: int | None
+    url: str | None
+
+
+def file_marker(i: int) -> str:
+    """正文里第 i 个文件的占位符，收下（或没收）之后换成说明。"""
+    return f"⟦文件{i}⟧"
+
+
 def image_marker(i: int) -> str:
     """正文里第 i 张图的占位符，看完图后替换成描述。"""
     return f"⟦图{i}⟧"
@@ -64,12 +78,18 @@ class Incoming:
     at: list[str] = field(default_factory=list)  # 被 @ 的 QQ 号
     images: list[ImageRef] = field(default_factory=list)
     forwards: list[ForwardRef] = field(default_factory=list)
+    files: list[FileRef] = field(default_factory=list)
 
-    def fill(self, images: list[str], forwards: list[str] | None = None) -> str:
-        """把占位符换成看图结果和展开的聊天记录；没给记录内容的记作“[聊天记录]”。"""
+    def fill(
+        self, images: list[str], forwards: list[str] | None = None, files: list[str] | None = None
+    ) -> str:
+        """把占位符换成看图结果、展开的聊天记录和文件说明；没给内容的记作“[聊天记录]”“[文件：名字]”。"""
         text = self.text
         for i, desc in enumerate(images):
             text = text.replace(image_marker(i), desc)
+        for i, ref in enumerate(self.files):
+            given = files[i] if files and i < len(files) else f"[文件：{ref.name}]"
+            text = text.replace(file_marker(i), given)
         forwards = forwards or []
         for i in range(len(self.forwards)):
             body = forwards[i] if i < len(forwards) else _PLACEHOLDERS["forward"]
@@ -123,6 +143,19 @@ def _parse(message: Any, self_id: str, names: dict[str, str], depth: int) -> Inc
                 continue
             out.images.append(ref)
             parts.append(image_marker(len(out.images) - 1))
+        elif kind == "file":
+            name = str(data.get("file") or data.get("name") or "文件")
+            if depth:  # 记录里的文件不收
+                parts.append(f"[文件：{name}]")
+                continue
+            try:
+                size = int(data.get("file_size") or data.get("size") or 0) or None
+            except (TypeError, ValueError):
+                size = None
+            out.files.append(
+                FileRef(name, str(data.get("file_id") or "") or None, size, data.get("url") or None)
+            )
+            parts.append(file_marker(len(out.files) - 1))
         elif kind == "forward":
             content = data.get("content")
             nodes = content if isinstance(content, list) and content else None

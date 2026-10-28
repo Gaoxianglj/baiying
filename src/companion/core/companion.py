@@ -34,7 +34,9 @@ from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
 from companion.skills import Skill, SkillCall, SkillContext, SkillResult, Skills
+from companion.skills.base import MARKER, SkillError
 from companion.skills.builtin import build_skills
+from companion.skills.files import SendFile
 from companion.stickers import Sticker, StickerBook, split_sticker
 
 log = logging.getLogger(__name__)
@@ -81,6 +83,7 @@ class Reply:
     silent: bool = False  # 她判断这一轮不需要接话
     skill_calls: list[SkillCall] = field(default_factory=list)
     images: list[Path] = field(default_factory=list)  # 技能产出、要发给对方的图片
+    files: list[Path] = field(default_factory=list)  # 要发给对方的文件（【发文件：…】）
     skill_ctx: SkillContext | None = None
 
     @property
@@ -238,8 +241,11 @@ class Companion:
         )
         text, wanted = split_sticker(text)
         images = [p for c in calls for p in c.images]
-        if not images and (
-            SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted)
+        files = [p for c in calls for p in c.files]
+        if (
+            not images
+            and not files
+            and (SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted))
         ):
             return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls,
                          skill_ctx=skill_ctx)  # fmt: skip
@@ -258,8 +264,9 @@ class Companion:
         )
         if sticker is not None:
             self._record_sticker(body, channel, sticker, now)
+        self._record_files(body, channel, files, now)
         return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images,
-                     skill_ctx=skill_ctx)  # fmt: skip
+                     files=files, skill_ctx=skill_ctx)  # fmt: skip
 
     def _chat_with_skills(
         self,
@@ -318,8 +325,12 @@ class Companion:
             )
         return paths
 
-    def report(self, ctx: SkillContext, skill_name: str, result: SkillResult) -> str:
-        """后台任务做完了：让她用自己的话把结果告诉对方，记下并返回这句话。"""
+    def report(
+        self, ctx: SkillContext, skill_name: str, result: SkillResult
+    ) -> tuple[str, list[Path]]:
+        """后台任务做完了：让她用自己的话把结果告诉对方，记下并返回（这句话，要一起发的文件）。
+
+        这个场合能发文件时，她可以在话里写【发文件：路径】把产出的文件直接发过去。"""
         label = next((s.label for s in self.skills.all if s.name == skill_name), skill_name)
         bundle = self.context.build(
             person_id=ctx.person_id,
@@ -334,8 +345,16 @@ class Companion:
             "这是你之前交给后台的任务的结果，不是对方说的话。请用你自己的话简洁地告诉对方："
             "说重点和产出文件在哪；没做成就说明原因。不要编造结果里没有的内容。"
         )
+        sender = self._file_sender(ctx)
+        if sender is not None:
+            note += (
+                "\n如果对方用得上产出的文件，可以在话里单独写【发文件：工作文件夹里的路径】"
+                f"直接发过去（{self.config.skills.files.max_mb:g} MB 以内）。"
+            )
+        files: list[Path] = []
         try:
             answer = self.gateway.chat([*bundle.messages, ChatMessage("skill", note)])
+            files = self._files_in(answer.text, sender)
             text = self._take_mood(
                 self.skills.strip_markers(answer.text), ctx.channel, ctx.person_id, None
             )
@@ -348,7 +367,34 @@ class Companion:
         self.ingest.record_self(
             body=ctx.body, channel=ctx.channel, content=text, meta={"report": skill_name}
         )
-        return text
+        self._record_files(ctx.body, ctx.channel, files, None)
+        return text, files
+
+    def _file_sender(self, ctx: SkillContext) -> SendFile | None:
+        skill = next((s for s in self.skills.available(ctx) if isinstance(s, SendFile)), None)
+        return skill
+
+    def _files_in(self, text: str, sender: SendFile | None) -> list[Path]:
+        """她话里的【发文件：…】：在工作文件夹里找得到、大小合适的才发。"""
+        if sender is None:
+            return []
+        files = []
+        for match in MARKER.finditer(text):
+            if match.group(1) in sender.markers:
+                try:
+                    files.append(sender.resolve(match.group(2)))
+                except SkillError as e:
+                    log.info("没发文件：%s", e)
+        return list(dict.fromkeys(files))
+
+    def _record_files(
+        self, body: str, channel: str, files: list[Path], now: datetime | None
+    ) -> None:
+        for path in files:
+            self.ingest.record_self(
+                body=body, channel=channel, content=f"[我发的文件：{path.name}]", ts=now,
+                meta={"file": str(path)},
+            )  # fmt: skip
 
     # ---- 主动开口（只在主人私聊里） ----
 
