@@ -55,6 +55,7 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 OCR_MAX_CHARS = 150  # 图里的字最多带这么多
+POKED = "（戳了戳你）"  # 被戳一戳时交给她的话
 LONG_CHUNK = 400  # 打包成聊天记录时，每条最多这么多字
 
 NOTICE = """大家好，我是{name}，一个 AI。
@@ -431,7 +432,12 @@ class QQBot:
             quote = pending.required_message_id
         if reply.text.strip():
             await self._send_reply(src, reply.text, reply_to=quote)
-        await self._do_actions(src, reply.actions, pending.sources[-1].message_id)
+        actions = reply.actions
+        poker = next((s for s in reversed(pending.sources) if s.incoming.text == POKED), None)
+        if actions.poke and poker is None:  # 只能戳回戳了她的人，不随手戳别人
+            log.info("%s：没人戳她，不戳", src.channel)
+            actions.poke = False
+        await self._do_actions(poker or src, actions, pending.sources[-1].message_id)
         for path in reply.images:
             await self._send_image(src, path)
         for path in reply.files:
@@ -723,7 +729,7 @@ class QQBot:
         )
         name = names.get(user_id, user_id)
         received = datetime.fromtimestamp(ev["time"], UTC) if ev.get("time") else None
-        src = Source(kind, user_id, group_id, name, None, Incoming(text="（戳了戳你）"), received)
+        src = Source(kind, user_id, group_id, name, None, Incoming(text=POKED), received)
         last = self._last_poke.get(src.channel)
         if last is not None and self.now() - last < timedelta(
             seconds=self.cfg.poke_cooldown_seconds
@@ -731,7 +737,7 @@ class QQBot:
             return
         self._last_poke[src.channel] = self.now()
         event = await self._call(
-            self.c.observe, body="qq", channel=src.channel, account=user_id, text="（戳了戳你）",
+            self.c.observe, body="qq", channel=src.channel, account=user_id, text=POKED,
             display_name=None if name == user_id else name, now=received,
         )  # fmt: skip
         if self._bot_paused(src):
