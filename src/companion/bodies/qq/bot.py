@@ -27,7 +27,15 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from companion import media
-from companion.bodies.qq.message import ImageRef, Incoming, parse_segments, text_segments
+from companion.bodies.qq.message import (
+    FORWARD_UNREAD,
+    ForwardRef,
+    ImageRef,
+    Incoming,
+    parse_segments,
+    render_forward,
+    text_segments,
+)
 from companion.bodies.qq.onebot import OneBotClient, OneBotError
 from companion.config import QQConfig
 from companion.core.companion import Companion, Reply
@@ -491,6 +499,7 @@ class QQBot:
         """补全一条消息：按规则看图、写明引用了谁的什么话；返回（正文，看过的图片哈希）。
 
         看图：私聊、@她、引用并 @她 时看；群里没冲她来的，只在她活跃时看，否则记作“[图片]”且不下载。
+        转发的聊天记录总是展开成文字（记录里的图不看）。
         """
         inc = src.incoming
         vision = self.c.config.vision
@@ -506,7 +515,8 @@ class QQBot:
             descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看清）]")
             if digest:
                 digests.append(digest)
-        text = inc.fill_images(descriptions)
+        forwards = [await self._read_forward(ref) for ref in inc.forwards]
+        text = inc.fill(descriptions, forwards)
 
         if inc.reply_to:
             text += await self._describe_quote(inc.reply_to, read and addressed, digests)
@@ -534,11 +544,25 @@ class QQBot:
                 if digest:
                     digests.append(digest)
             descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看）]")
-        body = quoted.fill_images(descriptions).strip()
+        body = quoted.fill(descriptions).strip()  # 引用的聊天记录只记作“[聊天记录]”
         if len(body) > 120:
             body = body[:119] + "…"
         said = "你说的" if who == "你" else f"{who}的话"
         return f"（引用了{said}：{body or '……'}）"
+
+    async def _read_forward(self, ref: ForwardRef) -> str:
+        """展开一段合并转发：消息里带了内容就直接用，没带再向 NapCat 要；都拿不到就明说没看。"""
+        nodes = ref.nodes
+        if nodes is None and ref.id:
+            try:
+                data = await self.client.call("get_forward_msg", {"id": ref.id})
+            except (OneBotError, TimeoutError) as e:
+                log.warning("取聊天记录失败：%s", e)
+            else:  # NapCat 给 {"messages": [...]}，有的实现直接给列表
+                nodes = data.get("messages") if isinstance(data, dict) else data
+        if not isinstance(nodes, list) or not nodes:
+            return FORWARD_UNREAD
+        return render_forward(nodes, self.self_id)
 
     async def _look(self, ref: ImageRef, src: Source | None) -> tuple[str | None, str | None]:
         """看一张图；表情包顺便判断能否收藏，并记下是谁发的。"""

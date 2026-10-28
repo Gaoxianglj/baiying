@@ -7,8 +7,8 @@ import pytest
 from websockets.asyncio.server import serve
 
 from companion.bodies.qq.bot import QQBot
-from companion.bodies.qq.message import parse_segments, text_segments
-from companion.bodies.qq.onebot import OneBotClient
+from companion.bodies.qq.message import parse_segments, render_forward, text_segments
+from companion.bodies.qq.onebot import OneBotClient, OneBotError
 from companion.config import QQConfig, load_config
 from companion.core.companion import Companion
 from companion.memory import MemoryLayout, init_memory
@@ -21,9 +21,15 @@ T0 = datetime(2026, 10, 23, 12, tzinfo=UTC)
 class FakeClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, dict]] = []
+        self.replies: dict[str, object] = {}  # 动作 → 返回值（是异常就抛出）
 
     async def call(self, action, params, timeout=30.0):
         self.sent.append((action, params))
+        if action in self.replies:
+            reply = self.replies[action]
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
         return {"message_id": 9000 + len(self.sent)}
 
     def texts(self, action=None):
@@ -194,7 +200,7 @@ def test_parse_segments():
     )
     assert inc.mentioned_self and inc.reply_to == "77" and inc.at == ["3000"]
     assert inc.text == "看 @小明 ⟦图0⟧" and len(inc.images) == 1
-    assert inc.fill_images(["[图片：猫]"]) == "看 @小明 [图片：猫]"
+    assert inc.fill(["[图片：猫]"]) == "看 @小明 [图片：猫]"
     assert text_segments("好", "5")[0]["type"] == "reply"
 
 
@@ -243,3 +249,118 @@ def test_onebot_client_round_trip():
 
     asyncio.run(main())
     assert received == [{"post_type": "message", "raw": "hello"}]
+
+
+# ---- 合并转发的聊天记录 ----
+
+ORIGIN = 5555  # 记录原来所在的群（不该出现在她的记忆里）
+
+
+def node(text=None, *, user=FRIEND, nickname="小明", card="", segs=None, mid=1):
+    """和 NapCat 实际返回的一样：每条就是一个完整的消息事件。"""
+    message = segs if segs is not None else [{"type": "text", "data": {"text": text}}]
+    return {
+        "self_id": int(BOT), "user_id": int(user), "time": 1761600000, "message_id": mid,
+        "message_seq": mid, "real_id": mid, "real_seq": str(mid), "message_type": "group",
+        "sender": {"user_id": int(user), "nickname": nickname, "card": card},
+        "raw_message": text or "", "font": 14, "sub_type": "normal", "message": message,
+        "message_format": "array", "post_type": "message", "group_id": ORIGIN,
+        "group_name": "别的群",
+    }  # fmt: skip
+
+
+def forward_seg(nodes=None, fid="fw1"):
+    data = {"id": fid}
+    if nodes is not None:
+        data["content"] = nodes
+    return {"type": "forward", "data": data}
+
+
+def forward_msg(seg, *, group=None, mid=50):
+    ev = msg(None, group=group, mid=mid)
+    ev["message"] = [seg]
+    return ev
+
+
+def test_render_forward_text_images_and_names():
+    nodes = [
+        node("今晚吃什么", card="群名片小明"),
+        node("火锅！\n要辣的", user="3001", nickname="小红"),
+        node(segs=[{"type": "image", "data": {"file": "a.jpg", "url": "http://x/a.jpg"}},
+                   {"type": "text", "data": {"text": "看这家"}}], user="3002", nickname=""),
+        node(segs=[{"type": "image", "data": {"sub_type": 1}}], nickname="小蓝"),
+        node("你也来吗", user=BOT, nickname="白璎"),
+    ]  # fmt: skip
+    text = render_forward(nodes, BOT)
+    assert text == (
+        "（转发了一段聊天记录，共 5 条：\n"
+        "群名片小明：今晚吃什么\n"
+        "小红：火锅！ 要辣的\n"
+        "3002：[图片（没看）]看这家\n"
+        "小蓝：[表情包（没看）]\n"
+        "你：你也来吗）"
+    )
+    assert str(ORIGIN) not in text and "别的群" not in text
+
+
+def test_render_forward_nested_expands_one_level():
+    deepest = forward_seg([node("最里面")])
+    inner = forward_seg([node("里面一层", nickname="小红"), node(segs=[deepest])])
+    text = render_forward([node("看这个"), node(segs=[inner], nickname="小蓝")], BOT)
+    assert "小蓝：（转发了一段聊天记录，共 2 条：\n小红：里面一层\n小明：[聊天记录]）" in text
+    assert "最里面" not in text
+    # 套着的记录没带内容：不再去要，记作“[聊天记录]”
+    assert render_forward([node(segs=[forward_seg()])], BOT).endswith("小明：[聊天记录]）")
+
+
+def test_render_forward_truncates():
+    many = render_forward([node(f"第{i}条消息") for i in range(50)], BOT)
+    assert many.count("\n") <= 32 and "……（后面还有 20 条）" in many
+    long = render_forward([node("字" * 500, mid=i) for i in range(20)], BOT)
+    lines = long.split("\n")
+    assert len(long) <= 1600 and all(len(line) <= 200 for line in lines)
+    assert lines[1] == "小明：" + "字" * 196 + "…" and lines[-1] == "……（后面还有 13 条））"
+
+
+def test_forward_in_group_is_read_into_memory_and_prompt(bot):
+    bot.cfg.unsolicited_probability = 0
+    seg = forward_seg([node("白璎今天好可爱"), node("[哈哈]", user="3001", nickname="小红")])
+    run(bot, forward_msg(seg, group=GROUP))
+    # 记录里提到她的名字，不算在叫她
+    assert bot.client.sent == []
+    content = [e.content for e in bot.c.log.iter_events()][-1]
+    assert content == "（转发了一段聊天记录，共 2 条：\n小明：白璎今天好可爱\n小红：[哈哈]）"
+
+    run(bot, forward_msg(seg, mid=51))  # 私聊转发：她会回，记录内容进到提示词里
+    assert bot.client.texts() == ["嗯嗯，我在呢。"]
+    prompt = "".join(str(m.content) for m in bot.chat.requests[-1])
+    assert "小明：白璎今天好可爱" in prompt
+    assert all(a != "get_forward_msg" for a, _ in bot.client.sent)
+
+
+def test_forward_without_content_asks_napcat(bot):
+    bot.cfg.unsolicited_probability = 0
+    bot.client.replies["get_forward_msg"] = {"messages": [node("补来的内容")]}
+    run(bot, forward_msg(forward_seg(fid="abc"), group=GROUP))
+    assert ("get_forward_msg", {"id": "abc"}) in bot.client.sent
+    content = [e.content for e in bot.c.log.iter_events()][-1]
+    assert content == "（转发了一段聊天记录，共 1 条：\n小明：补来的内容）"
+
+
+def test_forward_unreadable(bot):
+    bot.cfg.unsolicited_probability = 0
+    bot.client.replies["get_forward_msg"] = OneBotError("消息不存在")
+    run(bot, forward_msg(forward_seg(fid="gone"), group=GROUP))
+    bot.client.replies["get_forward_msg"] = {"messages": []}
+    run(bot, forward_msg(forward_seg(fid="empty"), group=GROUP, mid=51))
+    assert [e.content for e in bot.c.log.iter_events()] == ["[聊天记录（没看）]"] * 2
+
+
+def test_quoted_forward_stays_short(bot):
+    bot.client.replies["get_msg"] = {
+        "sender": {"user_id": int(FRIEND), "nickname": "小明"},
+        "message": [forward_seg([node("很长的一段记录")])],
+    }
+    run(bot, msg("你怎么看", reply="77"))
+    contents = [e.content for e in bot.c.log.iter_events()]
+    assert contents[0] == "你怎么看（引用了小明的话：[聊天记录]）"
