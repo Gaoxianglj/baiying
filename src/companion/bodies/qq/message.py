@@ -60,6 +60,9 @@ def file_marker(i: int) -> str:
     return f"⟦文件{i}⟧"
 
 
+VOICE_MARKER = "⟦语音⟧"  # 正文里语音的占位符，听完换成文字
+
+
 def image_marker(i: int) -> str:
     """正文里第 i 张图的占位符，看完图后替换成描述。"""
     return f"⟦图{i}⟧"
@@ -79,12 +82,18 @@ class Incoming:
     images: list[ImageRef] = field(default_factory=list)
     forwards: list[ForwardRef] = field(default_factory=list)
     files: list[FileRef] = field(default_factory=list)
+    voice: bool = False  # 有一段语音（QQ 一条消息里最多一段）
 
     def fill(
-        self, images: list[str], forwards: list[str] | None = None, files: list[str] | None = None
+        self,
+        images: list[str],
+        forwards: list[str] | None = None,
+        files: list[str] | None = None,
+        voice: str | None = None,
     ) -> str:
-        """把占位符换成看图结果、展开的聊天记录和文件说明；没给内容的记作“[聊天记录]”“[文件：名字]”。"""
-        text = self.text
+        """把占位符换成看图结果、展开的聊天记录、文件说明和听到的语音；
+        没给内容的记作“[聊天记录]”“[文件：名字]”“[语音]”。"""
+        text = self.text.replace(VOICE_MARKER, voice or _PLACEHOLDERS["record"])
         for i, desc in enumerate(images):
             text = text.replace(image_marker(i), desc)
         for i, ref in enumerate(self.files):
@@ -143,6 +152,12 @@ def _parse(message: Any, self_id: str, names: dict[str, str], depth: int) -> Inc
                 continue
             out.images.append(ref)
             parts.append(image_marker(len(out.images) - 1))
+        elif kind == "record":
+            if depth:  # 记录里的语音不听
+                parts.append(_PLACEHOLDERS["record"])
+                continue
+            out.voice = True
+            parts.append(VOICE_MARKER)
         elif kind == "file":
             name = str(data.get("file") or data.get("name") or "文件")
             if depth:  # 记录里的文件不收

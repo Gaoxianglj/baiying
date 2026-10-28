@@ -145,6 +145,18 @@ class QQConfig(_Section):
     others_join_conversation: bool = True  # 活跃期内别人插话也交给模型判断（更严格）
     # 防止和别的机器人无限对聊：和它们连着聊满 max_bot_rounds 轮就停下，
     # 直到有真人说话、或过了 bot_pause_minutes 分钟
+    # 补上离线期间的群消息：连上 NapCat 时，把服务没开时群里的消息补记进来（只记不回）
+    backfill: bool = True
+    backfill_max: int = 100  # 每个群最多补多少条
+    backfill_hours: float = 24.0  # 最多补到多久以前
+    reactions: bool = True  # 她可以给消息点表情回应【回应：😂】
+    poke: bool = True  # 被戳一戳会回应，也可以戳回去【戳一戳】
+    poke_cooldown_seconds: float = 60.0  # 同一个聊天里多久才理一次戳一戳（防止来回戳）
+    voice_in: bool = True  # 语音消息用 QQ 自带的语音转文字听
+    voice_out: bool = True  # 她可以用 QQ 的 AI 声音说话【语音：…】
+    voice_character: str = "lucy-voice-f37"  # 声音（文艺少女）；可选见 NapCat get_ai_characters
+    ocr: bool = True  # 没看的图片用 QQ 自带的文字识别读出图里的字（本机，不花额度）
+    long_text_chars: int = 300  # 她一次说的话超过这么多字，就打包成聊天记录发；0 = 不打包
     peer_bots: list[str] = []  # 其他机器人的 QQ 号
     max_bot_rounds: int = 5
     bot_pause_minutes: float = 10.0

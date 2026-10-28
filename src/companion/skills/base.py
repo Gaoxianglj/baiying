@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 # 【标记：参数】或 [标记:参数]；“表情”“心情”留给表情包和心情
 MARKER = re.compile(r"[【\[]\s*([^\s【】\[\]：:]{1,6})\s*[：:]\s*(.+?)\s*[】\]]", re.DOTALL)
-RESERVED = {"表情", "心情"}
+RESERVED = {"表情", "心情", "回应", "语音"}
 
 
 class SkillError(Exception):

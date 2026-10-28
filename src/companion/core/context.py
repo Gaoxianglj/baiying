@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from companion.config import RetrievalConfig
+from companion.config import QQConfig, RetrievalConfig
 from companion.core.retrieval import HybridRetriever
 from companion.memory import forgetting
 from companion.memory.events import Event, EventLog
@@ -70,6 +70,25 @@ _QQ_GROUP_RULES = (
     "写“@”加对方的 QQ 号或群里显示的名字（一字不差），程序会把它变成真正的 @；不要 @全体成员。"
 )
 
+
+def _qq_action_rules(qq: QQConfig) -> list[str]:
+    """QQ 上能用的小动作（按设置开关）。"""
+    rules = []
+    if qq.reactions:
+        rules.append(
+            "- 想对一条消息表个态、又不用说话时，可以只写【回应：一个表情符号】（如👍😂❤️），"
+            "程序会给那条消息点上这个表情回应；也可以和说的话一起用。"
+        )
+    if qq.poke:
+        rules.append("- 别人戳了你一下（“（戳了戳你）”）、你想戳回去时，写【戳一戳】。")
+    if qq.voice_out:
+        rules.append(
+            "- 偶尔想用声音说一句时（比如道晚安、念一句诗），写【语音：要说的话】，"
+            "程序会用你的声音发出去；大多数时候还是打字，一次只说一两句。"
+        )
+    return rules
+
+
 _SCENES = {
     "qq": "在 QQ 上",
     "minecraft": "在《我的世界》里",
@@ -110,6 +129,7 @@ class ContextAssembler:
         log: EventLog,
         config: RetrievalConfig,
         life: Life | None = None,
+        qq: QQConfig | None = None,
     ) -> None:
         self.name = persona_name
         self.layout = layout
@@ -119,6 +139,7 @@ class ContextAssembler:
         self.log = log
         self.cfg = config
         self.life = life  # 今日状态与心情（没有就不加这两段）
+        self.qq = qq  # QQ 上能用的小动作（表情回应、戳一戳、语音）
 
     def build(
         self,
@@ -151,7 +172,7 @@ class ContextAssembler:
         dialogue, openings = self._recent(channel, now)
 
         qq_group = body == "qq" and channel.startswith("group:")
-        stable = self._stable(reply_mode, sticker_emotions, extra_sections, qq_group)
+        stable = self._stable(reply_mode, sticker_emotions, extra_sections, qq_group, body == "qq")
         dynamic = self._dynamic(
             person, person_id, body, channel, facts, shared, recalled, openings, now
         )
@@ -241,9 +262,12 @@ class ContextAssembler:
         sticker_emotions: list[str] | None,
         extra_sections: list[str] | None,
         qq_group: bool = False,
+        on_qq: bool = False,
     ) -> str:
         """不常变的部分：放在最前面，命中前缀缓存。"""
         rules = [_TALK_RULES, _QQ_GROUP_RULES if qq_group else None]
+        if on_qq and self.qq is not None:
+            rules += _qq_action_rules(self.qq)
         if self.life is not None:
             rules.append(self.life.talk_rules())
         sections = [

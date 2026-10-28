@@ -39,12 +39,13 @@ from companion.bodies.qq.message import (
 )
 from companion.bodies.qq.onebot import OneBotClient, OneBotError
 from companion.config import QQConfig
+from companion.core.actions import Actions, emoji_id
 from companion.core.companion import Companion, Reply
 from companion.life.activities import ActivityPrep
 from companion.media import MediaError
 from companion.memory.events import Event
 from companion.memory.index import MemoryKind
-from companion.memory.people import PeopleError
+from companion.memory.people import SELF_ID, PeopleError
 from companion.models.openai_compat import ModelError
 from companion.skills import SkillCall, SkillContext
 from companion.skills.files import FileInbox
@@ -52,6 +53,9 @@ from companion.skills.files import FileInbox
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+OCR_MAX_CHARS = 150  # 图里的字最多带这么多
+LONG_CHUNK = 400  # 打包成聊天记录时，每条最多这么多字
 
 NOTICE = """大家好，我是{name}，一个 AI。
 我会记住群里的聊天，这样以后还能记得和大家一起经历过的事。
@@ -152,6 +156,7 @@ class QQBot:
         self._bot_paused_until: dict[str, datetime] = {}
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
         self._activity: asyncio.Task[None] | None = None  # 正在做的自主活动
+        self._last_poke: dict[str, datetime] = {}  # 频道 → 上次理会 / 发出戳一戳的时间
         skills = companion.config.skills
         self.inbox = FileInbox(skills.files, companion.config.root, skills.agent.workspace)
 
@@ -220,7 +225,9 @@ class QQBot:
 
     async def _send_proactive(self, src: Source, reply: Reply, images: list[Path]) -> None:
         self._sent_times.append(self.now())
-        await self._send(src, reply.text)
+        if reply.text.strip():
+            await self._send_reply(src, reply.text)
+        await self._do_actions(src, reply.actions, None)
         for path in images:
             await self._send_image(src, path)
         if reply.sticker is not None:
@@ -258,9 +265,14 @@ class QQBot:
             if ev.get("meta_event_type") == "lifecycle" and ev.get("self_id"):
                 self.self_id = str(ev["self_id"])
                 await self._announce_groups()
+                if self.cfg.backfill:  # 每次连上都补一次离线期间的群消息（按消息编号去重）
+                    self._spawn(self.backfill())
+            return
+        if post_type == "notice":
+            await self._notice(ev)
             return
         if post_type != "message":
-            return  # message_sent（自己发出的回显）、notice、request 暂不处理
+            return  # message_sent（自己发出的回显）、request 暂不处理
         self.self_id = str(ev.get("self_id") or self.self_id)
         src = self._source(ev)
         if src is None:
@@ -418,7 +430,8 @@ class QQBot:
         if src.message_type == "group" and pending.mode == "required":
             quote = pending.required_message_id
         if reply.text.strip():
-            await self._send(src, reply.text, reply_to=quote)
+            await self._send_reply(src, reply.text, reply_to=quote)
+        await self._do_actions(src, reply.actions, pending.sources[-1].message_id)
         for path in reply.images:
             await self._send_image(src, path)
         for path in reply.files:
@@ -436,7 +449,7 @@ class QQBot:
         result = await asyncio.to_thread(call.later)  # 不占用记忆核心的工作线程，聊天照常
         if result.report:  # 让她用自己的话转述结果
             text, files = await self._call(self.c.report, ctx, call.skill, result)
-            await self._send(src, text)
+            await self._send_reply(src, text)
             for path in files:
                 await self._send_file(src, path)
             return
@@ -521,16 +534,19 @@ class QQBot:
         for ref in inc.images:
             label = "表情包" if ref.sticker else "图片"
             if not read:
-                descriptions.append(f"[{label}（没看）]")  # 明说没看，免得她猜
+                descriptions.append(await self._unseen(ref, label, "没看"))  # 明说没看，免得她猜
                 continue
             desc, digest = await self._look(ref, src)
-            descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看清）]")
+            descriptions.append(
+                f"[{label}：{desc}]" if desc else await self._unseen(ref, label, "没看清")
+            )
             if digest:
                 digests.append(digest)
         forwards = [await self._read_forward(ref) for ref in inc.forwards]
         receive = addressed or self._active(src.channel)
         files = [await self._receive_file(ref, src, receive) for ref in inc.files]
-        text = inc.fill(descriptions, forwards, files)
+        voice = await self._hear(src, receive) if inc.voice else None
+        text = inc.fill(descriptions, forwards, files, voice)
 
         if inc.reply_to:
             text += await self._describe_quote(inc.reply_to, read and addressed, digests)
@@ -577,6 +593,225 @@ class QQBot:
         if not isinstance(nodes, list) or not nodes:
             return FORWARD_UNREAD
         return render_forward(nodes, self.self_id)
+
+    # ---- 图里的字、语音 ----
+
+    async def _unseen(self, ref: ImageRef, label: str, why: str) -> str:
+        """没看（或没看清）的图：用 QQ 自带的文字识别读出图里的字（本机做，不花模型额度）。"""
+        if self.cfg.ocr and not ref.sticker and (ref.url or ref.file):
+            words = await self._ocr(ref)
+            if words:
+                return f"[{label}（{why}，图里的字：{words}）]"
+        return f"[{label}（{why}）]"
+
+    async def _ocr(self, ref: ImageRef) -> str:
+        try:
+            data = await self.client.call("ocr_image", {"image": ref.url or ref.file}, timeout=30)
+        except (OneBotError, TimeoutError) as e:
+            log.info("识别图里的字失败：%s", e)
+            return ""
+        items = data.get("texts", []) if isinstance(data, dict) else data or []
+        words = " ".join(str(t.get("text", "")).strip() for t in items if isinstance(t, dict))
+        words = " ".join(words.split())
+        return words if len(words) <= OCR_MAX_CHARS else words[: OCR_MAX_CHARS - 1] + "…"
+
+    async def _hear(self, src: Source, receive: bool) -> str:
+        """一段语音：发给她的就用 QQ 自带的语音转文字听一下。"""
+        if not (self.cfg.voice_in and receive and src.message_id):
+            return "[语音（没听）]"
+        try:
+            data = await self.client.call(
+                "fetch_ptt_text", {"message_id": int(src.message_id)}, timeout=30
+            )
+        except (OneBotError, TimeoutError, ValueError) as e:
+            log.info("语音转文字失败：%s", e)
+            return "[语音（没听清）]"
+        text = str((data.get("text") if isinstance(data, dict) else data) or "").strip()
+        return f"[语音：{text}]" if text else "[语音（没听清）]"
+
+    # ---- 回应、戳一戳、用声音说话、长内容 ----
+
+    async def _do_actions(self, src: Source, actions: Actions, message_id: str | None) -> None:
+        if actions.voice and self.cfg.voice_out:
+            await self._send_voice(src, actions.voice)
+        elif actions.voice:
+            await self._send(src, actions.voice)
+        emoji = emoji_id(actions.reaction) if actions.reaction else None
+        if emoji and message_id and self.cfg.reactions:
+            try:
+                params = {"message_id": int(message_id), "emoji_id": emoji, "set": True}
+                await self.client.call("set_msg_emoji_like", params)
+            except (OneBotError, ValueError) as e:
+                log.info("表情回应失败：%s", e)
+        if actions.poke and self.cfg.poke:
+            await self._poke(src)
+
+    async def _poke(self, src: Source) -> None:
+        params: dict[str, object] = {"user_id": src.user_id}
+        if src.message_type == "group":
+            params["group_id"] = src.group_id
+        try:
+            await self.client.call("send_poke", params)
+        except OneBotError as e:
+            log.info("戳一戳失败：%s", e)
+            return
+        self._last_poke[src.channel] = self.now()
+
+    async def _send_voice(self, src: Source, text: str) -> None:
+        """用 QQ 的 AI 声音说一句：群里直接发；私聊先在某个群里生成语音，再把它发过去。"""
+        character = self.cfg.voice_character
+        try:
+            if src.message_type == "group":
+                params = {"group_id": src.group_id, "character": character, "text": text}
+                await self.client.call("send_group_ai_record", params, timeout=60)
+            else:
+                if not self.cfg.groups:
+                    raise OneBotError("没有可以生成语音的群")
+                params = {"group_id": self.cfg.groups[0], "character": character, "text": text}
+                data = await self.client.call("get_ai_record", params, timeout=60)
+                url = data.get("url") if isinstance(data, dict) else data
+                if not url:
+                    raise OneBotError("没生成语音")
+                record = [{"type": "record", "data": {"file": str(url)}}]
+                await self.client.call(
+                    "send_private_msg", {"user_id": int(src.user_id), "message": record}
+                )
+        except (OneBotError, TimeoutError) as e:
+            log.info("用声音说话失败，改发文字：%s", e)
+            await self._send(src, text)
+            return
+        self._last_spoke[src.channel] = self.now()
+
+    async def _send_reply(self, src: Source, text: str, reply_to: str | None = None) -> None:
+        """她说的话：太长就打包成一条聊天记录发（不刷屏），发不出去再分开发。"""
+        limit = self.cfg.long_text_chars
+        if limit and len(text) > limit and await self._send_forward(src, text):
+            return
+        await self._send(src, text, reply_to=reply_to)
+
+    async def _send_forward(self, src: Source, text: str) -> bool:
+        nodes = [
+            {"type": "node", "data": {"user_id": self.self_id, "nickname": self.c.name,
+                                      "content": [{"type": "text", "data": {"text": chunk}}]}}
+            for chunk in split_long(text)
+        ]  # fmt: skip
+        if src.message_type == "group":
+            action, params = "send_group_forward_msg", {"group_id": int(src.group_id)}
+        else:
+            action, params = "send_private_forward_msg", {"user_id": int(src.user_id)}
+        try:
+            data = await self.client.call(action, params | {"messages": nodes}, timeout=60)
+        except (OneBotError, TimeoutError) as e:
+            log.info("打包成聊天记录失败，改成直接发：%s", e)
+            return False
+        self._last_spoke[src.channel] = self.now()
+        if isinstance(data, dict) and data.get("message_id") is not None:
+            self._sent_ids.append(str(data["message_id"]))
+        return True
+
+    # ---- 戳一戳（通知） ----
+
+    async def _notice(self, ev: dict[str, Any]) -> None:
+        """别人戳了她：当成“（戳了戳你）”交给她，同一个聊天里隔一会儿才理一次。"""
+        if not (ev.get("notice_type") == "notify" and ev.get("sub_type") == "poke"):
+            return
+        user_id = str(ev.get("user_id") or "")
+        if not self.cfg.poke or str(ev.get("target_id")) != self.self_id or user_id == self.self_id:
+            return
+        group_id = str(ev.get("group_id") or "")
+        if group_id and group_id not in self.cfg.groups:
+            return
+        kind = "group" if group_id else "private"
+        names = (
+            {v: k for k, v in (await self._speakers_in(f"group:{group_id}")).items()}
+            if group_id
+            else {}
+        )
+        name = names.get(user_id, user_id)
+        received = datetime.fromtimestamp(ev["time"], UTC) if ev.get("time") else None
+        src = Source(kind, user_id, group_id, name, None, Incoming(text="（戳了戳你）"), received)
+        last = self._last_poke.get(src.channel)
+        if last is not None and self.now() - last < timedelta(
+            seconds=self.cfg.poke_cooldown_seconds
+        ):
+            return
+        self._last_poke[src.channel] = self.now()
+        event = await self._call(
+            self.c.observe, body="qq", channel=src.channel, account=user_id, text="（戳了戳你）",
+            display_name=None if name == user_id else name, now=received,
+        )  # fmt: skip
+        if self._bot_paused(src):
+            return
+        self._enqueue(src, event, "required")
+
+    # ---- 补上离线期间的群消息 ----
+
+    async def backfill(self) -> int:
+        """把服务没开时群里的消息补记进来（只记不回）；返回补了几条。"""
+        total = 0
+        for gid in self.cfg.groups:
+            try:
+                n = await self._backfill_group(gid)
+            except (OneBotError, TimeoutError) as e:
+                log.warning("补群 %s 的消息失败：%s", gid, e)
+                continue
+            if n:
+                log.info("补记了群 %s 离线期间的 %d 条消息", gid, n)
+            total += n
+        return total
+
+    async def _backfill_group(self, gid: str) -> int:
+        channel = f"group:{gid}"
+        since = self.now() - timedelta(hours=self.cfg.backfill_hours)
+        last, known = await self._call(self._channel_tail, channel, since)
+        params = {"group_id": gid, "message_seq": 0, "count": self.cfg.backfill_max}
+        data = await self.client.call("get_group_msg_history", params, timeout=60)
+        messages = (data or {}).get("messages") or [] if isinstance(data, dict) else []
+        added = 0
+        for m in sorted(messages, key=lambda x: x.get("time") or 0):
+            uid, mid = str(m.get("user_id") or ""), str(m.get("message_id") or "")
+            if not m.get("time") or uid in ("", self.self_id) or mid in known:
+                continue
+            ts = datetime.fromtimestamp(m["time"], UTC)
+            if ts < since or (last is not None and ts <= last):
+                continue
+            text = self._offline_text(parse_segments(m.get("message"), self.self_id))
+            if not text:
+                continue
+            sender = m.get("sender") or {}
+            name = str(sender.get("card") or sender.get("nickname") or uid)
+            await self._call(
+                self.c.observe, body="qq", channel=channel, account=uid, text=text,
+                display_name=name, now=ts, meta={"message_id": mid, "backfill": True},
+            )  # fmt: skip
+            added += 1
+        return added
+
+    def _offline_text(self, inc: Incoming) -> str:
+        """离线时的消息：图、文件、语音都不补看，只说明是什么；聊天记录有内容就展开。"""
+        images = [f"[{'表情包' if r.sticker else '图片'}（没看）]" for r in inc.images]
+        forwards = [render_forward(r.nodes, self.self_id) if r.nodes else FORWARD_UNREAD
+                    for r in inc.forwards]  # fmt: skip
+        files = [self.inbox.skipped(r.name, r.size, "没收") for r in inc.files]
+        return inc.fill(images, forwards, files, "[语音（没听）]").strip()
+
+    def _channel_tail(self, channel: str, since: datetime) -> tuple[datetime | None, set[str]]:
+        """（在工作线程里）这个频道最后一条记录的时间，以及最近记过的消息编号。"""
+        last: datetime | None = None
+        known: set[str] = set()
+        for e in self.c.log.iter_events(since=since):
+            if e.channel != channel:
+                continue
+            if e.meta.get("message_id"):
+                known.add(str(e.meta["message_id"]))
+            if e.actor.person_id != SELF_ID and (last is None or e.ts > last):
+                last = e.ts
+        return last, known
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self._jobs.add(task)
+        task.add_done_callback(self._jobs.discard)
 
     # ---- 文件 ----
 
@@ -936,3 +1171,24 @@ class QQBot:
             await self._send(src, f"绑定失败：{e}")
             return
         await self._send(src, f"好，{platform}:{account} 现在就是{who or '你'}了。")
+
+
+def split_long(text: str, limit: int = LONG_CHUNK) -> list[str]:
+    """长内容按段落切成几条（每条不超过 limit 字），打包成聊天记录时一段一条。"""
+    chunks: list[str] = []
+    current = ""
+    for para in [p.strip() for p in text.splitlines() if p.strip()]:
+        while len(para) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(para[:limit])
+            para = para[limit:]
+        if current and len(current) + 1 + len(para) > limit:
+            chunks.append(current)
+            current = para
+        else:
+            current = f"{current}\n{para}" if current else para
+    if current:
+        chunks.append(current)
+    return chunks or [text]

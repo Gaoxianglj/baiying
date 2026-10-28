@@ -13,6 +13,7 @@ from pathlib import Path
 
 from companion import media
 from companion.config import Config
+from companion.core.actions import Actions, split_actions
 from companion.core.context import ContextAssembler, ContextBundle
 from companion.core.extract import Extraction, SessionExtractor, ended, split_sessions
 from companion.core.ingest import Ingest
@@ -53,6 +54,18 @@ _GREETINGS = {
 }
 
 
+def _said(text: str, actions: Actions) -> str:
+    """记进日志的“她说了什么”：话本身，加上用声音说的、回应和戳一戳。"""
+    parts = [text] if text else []
+    if actions.voice:
+        parts.append(f"（用语音说）{actions.voice}")
+    if actions.reaction:
+        parts.append(f"[给这条消息点了 {actions.reaction}]")
+    if actions.poke:
+        parts.append("[戳了戳对方]")
+    return " ".join(parts) or "…"
+
+
 def _share_note(result: ActivityResult, who: str, with_image: bool) -> str:
     """自主活动做完、想告诉主人时的说明。"""
     if result.kind == "chat_owner":
@@ -84,6 +97,7 @@ class Reply:
     skill_calls: list[SkillCall] = field(default_factory=list)
     images: list[Path] = field(default_factory=list)  # 技能产出、要发给对方的图片
     files: list[Path] = field(default_factory=list)  # 要发给对方的文件（【发文件：…】）
+    actions: Actions = field(default_factory=Actions)  # 表情回应、戳一戳、用声音说的话
     skill_ctx: SkillContext | None = None
 
     @property
@@ -132,6 +146,7 @@ class Companion:
             log=self.log,
             config=config.retrieval,
             life=self.life,
+            qq=config.qq,
         )
         self.extractor = SessionExtractor(
             persona_name=self.name, gateway=self.gateway, index=self.index, people=self.people
@@ -240,13 +255,12 @@ class Companion:
             self.skills.strip_markers(result.text), channel, incoming.actor.person_id, now
         )
         text, wanted = split_sticker(text)
+        text, actions = split_actions(text)
+        if SILENT_MARK.search(text):  # 说了不回复：话和表情包都不发，但回应、戳一戳照做
+            text, wanted = "", None
         images = [p for c in calls for p in c.images]
         files = [p for c in calls for p in c.files]
-        if (
-            not images
-            and not files
-            and (SILENT_MARK.search(text) or (not SILENT_MARK.sub("", text).strip() and not wanted))
-        ):
+        if not images and not files and not actions and not text.strip() and not wanted:
             return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls,
                          skill_ctx=skill_ctx)  # fmt: skip
         text = SILENT_MARK.sub("", text).strip()
@@ -260,13 +274,13 @@ class Companion:
         if calls:
             meta["skills"] = [{"skill": c.skill, "arg": c.arg[:200], "ok": c.ok} for c in calls]
         event = self.ingest.record_self(
-            body=body, channel=channel, content=text or "…", ts=now, meta=meta
+            body=body, channel=channel, content=_said(text, actions), ts=now, meta=meta
         )
         if sticker is not None:
             self._record_sticker(body, channel, sticker, now)
         self._record_files(body, channel, files, now)
         return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images,
-                     files=files, skill_ctx=skill_ctx)  # fmt: skip
+                     files=files, skill_ctx=skill_ctx, actions=actions)  # fmt: skip
 
     def _chat_with_skills(
         self,
@@ -285,7 +299,8 @@ class Companion:
                 return result, calls
             before, skill, marker, arg = found
             assert ctx is not None
-            interim = SILENT_MARK.sub("", split_sticker(split_mood(before)[0])[0]).strip()
+            interim = split_actions(split_sticker(split_mood(before)[0])[0])[0]
+            interim = SILENT_MARK.sub("", interim).strip()
             if interim:
                 self.ingest.record_self(
                     body=ctx.body, channel=ctx.channel, content=interim, ts=ctx.now
@@ -358,7 +373,7 @@ class Companion:
             text = self._take_mood(
                 self.skills.strip_markers(answer.text), ctx.channel, ctx.person_id, None
             )
-            text = split_sticker(text)[0]
+            text = split_actions(split_sticker(text)[0])[0]
             text = SILENT_MARK.sub("", text).strip()
         except ModelError as e:
             log.warning("转述任务结果失败：%s", e)
@@ -444,17 +459,20 @@ class Companion:
             return None
         text = self._take_mood(self.skills.strip_markers(result.text), channel, person_id, now)
         text, wanted = split_sticker(text)
-        if SILENT_MARK.search(text) or not text.strip():
+        text, actions = split_actions(text)
+        actions.reaction, actions.poke = None, False  # 主动开口时没有可回应、可戳的消息
+        if SILENT_MARK.search(text) or not (text.strip() or actions.voice):
             log.info("想主动找 %s（%s），想了想没开口", self._display(person_id), kind)
             self.life.owner.record(now, kind, "", skipped=True)
             return None
         sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
         meta = {"proactive": kind, "backend": result.backend, "model": result.model}
-        event = self.ingest.record_self(body=body, channel=channel, content=text, ts=now, meta=meta)
+        said = _said(text, actions)
+        event = self.ingest.record_self(body=body, channel=channel, content=said, ts=now, meta=meta)
         if sticker is not None:
             self._record_sticker(body, channel, sticker, now)
-        self.life.owner.record(now, kind, text)
-        return Reply(text, result, bundle, event, sticker)
+        self.life.owner.record(now, kind, said)
+        return Reply(text, result, bundle, event, sticker, actions=actions)
 
     # ---- 额度充足时的自主活动 ----
 
