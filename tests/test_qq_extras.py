@@ -3,6 +3,7 @@
 import asyncio
 import random
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -169,13 +170,26 @@ def test_she_speaks_with_voice_in_group(bot):
     assert contents(bot, mine=True) == ["（用语音说）晚安，做个好梦"]
 
 
-def test_voice_in_private_goes_through_ai_record(bot):
+def test_voice_in_private_goes_through_ai_record(bot, monkeypatch):
+    """生成的是 SILK 语音（标成 mp3）：先下到本地再发，NapCat 才不会拿 ffmpeg 转码失败。"""
+    silk = b"\x03#!SILK_V3" + b"\x00" * 20
+    monkeypatch.setattr("companion.bodies.qq.bot.media.fetch", lambda url, max_bytes: silk)
     bot.brain["reply"] = "【语音：早安】"
     bot.client.replies["get_ai_record"] = "http://voice/1.mp3"
     run(bot, ev([text("早")]))
     assert actions(bot) == ["get_ai_record", "send_private_msg"]
     seg = bot.client.sent[1][1]["message"][0]
-    assert seg == {"type": "record", "data": {"file": "http://voice/1.mp3"}}
+    assert seg["type"] == "record" and seg["data"]["file"].endswith(".silk")
+    assert Path(seg["data"]["file"]).read_bytes() == silk
+
+
+def test_voice_that_is_not_silk_falls_back_to_text(bot, monkeypatch):
+    monkeypatch.setattr("companion.bodies.qq.bot.media.fetch", lambda url, max_bytes: b"<html>")
+    bot.brain["reply"] = "【语音：早安】"
+    bot.client.replies["get_ai_record"] = "http://voice/1.mp3"
+    run(bot, ev([text("早")]))
+    assert actions(bot) == ["get_ai_record", "send_private_msg"]
+    assert bot.client.texts("send_private_msg") == ["早安"]
 
 
 def test_voice_failure_falls_back_to_text(bot):

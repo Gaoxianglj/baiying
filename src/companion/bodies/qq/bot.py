@@ -17,6 +17,7 @@ import logging
 import random
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from companion import media
 from companion.bodies.qq.message import (
@@ -56,6 +58,7 @@ T = TypeVar("T")
 
 OCR_MAX_CHARS = 150  # 图里的字最多带这么多
 LONG_CHUNK = 400  # 打包成聊天记录时，每条最多这么多字
+VOICE_MAX_BYTES = 5_000_000  # 生成的语音最多这么大（一句话通常只有几 KB）
 
 NOTICE = """大家好，我是{name}，一个 AI。
 我会记住群里的聊天，这样以后还能记得和大家一起经历过的事。
@@ -672,15 +675,33 @@ class QQBot:
                 url = data.get("url") if isinstance(data, dict) else data
                 if not url:
                     raise OneBotError("没生成语音")
-                record = [{"type": "record", "data": {"file": str(url)}}]
+                # 生成的是 QQ 自己的 SILK 语音（服务器却标成 mp3）。直接把链接给 NapCat，
+                # 它会拿 ffmpeg 转码而失败；先下到本地，NapCat 认出文件头是 SILK 就原样发出去。
+                path = await asyncio.to_thread(self._save_voice, str(url))
+                record = [{"type": "record", "data": {"file": str(path)}}]
                 await self.client.call(
                     "send_private_msg", {"user_id": int(src.user_id), "message": record}
                 )
-        except (OneBotError, TimeoutError) as e:
+        except (OneBotError, TimeoutError, MediaError, OSError) as e:
             log.info("用声音说话失败，改发文字：%s", e)
             await self._send(src, text)
             return
         self._last_spoke[src.channel] = self.now()
+
+    def _save_voice(self, url: str) -> Path:
+        """（在后台线程里）把生成的语音下到 data/run/voice/，顺手清掉一天前的旧文件。"""
+        folder = self.c.config.data_dir / "run" / "voice"
+        folder.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - 24 * 3600
+        for old in folder.glob("*.silk"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+        data = media.fetch(url, max_bytes=VOICE_MAX_BYTES)
+        if b"#!SILK" not in data[:10]:
+            raise MediaError("生成的语音不是 SILK 格式")
+        path = folder / f"{uuid4().hex}.silk"
+        path.write_bytes(data)
+        return path.resolve()
 
     async def _send_reply(self, src: Source, text: str, reply_to: str | None = None) -> None:
         """她说的话：太长就打包成一条聊天记录发（不刷屏），发不出去再分开发。"""
