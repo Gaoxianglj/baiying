@@ -9,10 +9,11 @@ from companion.skills.agent import CodexAgent
 from companion.skills.base import Skill
 from companion.skills.files import SendFile
 from companion.skills.image import ImageGen, ImagePainter
+from companion.skills.reminder import ReminderBook, Reminders
 from companion.skills.search import WebSearch
 
 
-def build_skills(config: Config, gateway: ModelGateway) -> list[Skill]:
+def build_skills(config: Config, gateway: ModelGateway, reminders: ReminderBook) -> list[Skill]:
     sub = config.models.subscription
     painter = None
     if gateway.subscription is not None:
@@ -43,4 +44,5 @@ def build_skills(config: Config, gateway: ModelGateway) -> list[Skill]:
             ledger=gateway.ledger,
         ),
         SendFile(config.skills.files, config.root, config.skills.agent.workspace),
+        Reminders(config.skills.reminders, reminders),
     ]

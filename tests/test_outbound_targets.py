@@ -155,6 +155,23 @@ def test_backfill_only_reads(bot):
     assert side_effects(bot) == []
 
 
+def test_reminder_goes_only_back_to_who_set_it(bot):
+    book = bot.c.reminders
+    pid = bot.c.people.ensure("qq", FRIEND, "小明")
+    book.add(f"private:{FRIEND}", pid, "开会", T0 - timedelta(minutes=1), None)
+    asyncio.run(bot.reminder_tick())
+    assert_only_private(bot, FRIEND)
+    assert_nothing_forbidden(bot)
+    assert "send_poke" not in {a for a, _ in bot.client.sent}  # 提醒里写了小动作也不做
+
+
+def test_reminder_with_bad_channel_is_dropped(bot):
+    pid = bot.c.people.ensure("qq", FRIEND, "小明")
+    bot.c.reminders.add(f"group:{GROUP}", pid, "开会", T0 - timedelta(minutes=1), None)
+    asyncio.run(bot.reminder_tick())
+    assert bot.client.sent == [] and bot.c.reminders.pending() == []
+
+
 def test_proactive_greeting_goes_only_to_owner(bot):
     bot.brain["reply"] = "早安【语音：早安】【回应：😂】【戳一戳】"
     bot.c.config.life.activities.enabled = False

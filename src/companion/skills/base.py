@@ -89,6 +89,10 @@ class Skill:
         """控制台显示的当前状态（如额度）。"""
         return ""
 
+    def context(self, ctx: SkillContext) -> str:
+        """这个场合她用技能前需要知道的情况（如这个人还有哪些提醒没到），写进技能说明。"""
+        return ""
+
     def close(self) -> None:
         pass
 
@@ -116,6 +120,11 @@ class Skills:
         if not skills:
             return None
         lines = [f"- {usage}" for s in skills for usage in s.markers.values()]
+        notes = [note for s in skills if (note := s.context(ctx))]
+        return "\n".join([self._usage(lines), *notes])
+
+    @staticmethod
+    def _usage(lines: list[str]) -> str:
         return (
             "【技能】\n你可以用下面的技能。需要时在回复里单独写一个标记，程序会执行并把结果告诉你，"
             "你再接着回复；标记前可以先说一句（如“我查一下”），会先发出去。\n"

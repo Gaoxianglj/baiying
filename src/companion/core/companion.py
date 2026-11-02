@@ -38,6 +38,7 @@ from companion.skills import Skill, SkillCall, SkillContext, SkillResult, Skills
 from companion.skills.base import MARKER, SkillError
 from companion.skills.builtin import build_skills
 from companion.skills.files import SendFile
+from companion.skills.reminder import Reminder, ReminderBook
 from companion.stickers import Sticker, StickerBook, split_sticker
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ _CURSOR = "extract_cursor:"
 SILENT_MARK = re.compile(r"[【\[]\s*(不回复|SILENT)\s*[】\]]", re.IGNORECASE)
 
 
+REMINDER_LATE = timedelta(minutes=5)  # 迟了超过这么久，就让她说明迟到了
 _GREETINGS = {
     "morning": "（现在是早上，你想主动跟{who}说声早安。可以顺口提一句今天打算做什么；"
     "一两句话，别连着问问题。）",
@@ -161,8 +163,9 @@ class Companion:
         )
         self._last_sticker: dict[str, datetime] = {}
         self._rng = random.Random()
+        self.reminders = ReminderBook(config.data_dir / "reminders.json")
         if skills is None:
-            skills = build_skills(config, self.gateway)
+            skills = build_skills(config, self.gateway, self.reminders)
         self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl")
 
     def close(self) -> None:
@@ -473,6 +476,75 @@ class Companion:
             self._record_sticker(body, channel, sticker, now)
         self.life.owner.record(now, kind, said)
         return Reply(text, result, bundle, event, sticker, actions=actions)
+
+    # ---- 定时提醒 ----
+
+    def remind_text(self, reminder: Reminder, now: datetime) -> tuple[str, Sticker | None]:
+        """到点了：让她用自己的话提醒。这时还没发出去，发成功后再调 reminder_sent 记下。
+
+        模型不可用或她没写出来时，退回一句直白的话：提醒比措辞重要。
+        """
+        who = self._display(reminder.person_id)
+        late = now - reminder.due
+        lateness = ""
+        if late > REMINDER_LATE:  # 服务没开、NapCat 断线时错过的
+            lateness = (
+                f"这条本该在 {reminder.due.astimezone():%m月%d日 %H:%M} 提醒，现在已经迟了，"
+                "先说明一下迟到了。"
+            )
+        note = (
+            f"（到时间了。{who}之前让你提醒：{reminder.what}。{lateness}"
+            "用你自己的语气提醒 ta，一两句话，把要做的事说清楚；"
+            "可以结合你们的关系和你现在的心情，不要说成“提醒您”这样的通知。）"
+        )
+        fallback = f"到时间啦，提醒你：{reminder.what}", None
+        cfg = self.config.stickers
+        emotions = (
+            self.stickers.emotions()
+            if cfg.enabled and len(self.stickers) >= cfg.min_library
+            else []
+        )
+        bundle = self.context.build(
+            person_id=reminder.person_id,
+            body="qq",
+            channel=reminder.channel,
+            query=reminder.what,
+            now=now,
+            sticker_emotions=emotions,
+            reply_mode="reminder",
+            initiative=note,
+        )
+        try:
+            result = self.gateway.chat(bundle.messages, purpose="reminder")
+        except ModelError as e:
+            log.warning("写提醒的话失败，直接提醒：%s", e)
+            return fallback
+        text = self._take_mood(
+            self.skills.strip_markers(result.text), reminder.channel, reminder.person_id, now
+        )
+        text, wanted = split_sticker(text)
+        text, actions = split_actions(text)
+        if actions.voice:  # 私聊发不了语音
+            text = f"{text} {actions.voice}".strip()
+        text = SILENT_MARK.sub("", text).strip()
+        if not text:
+            return fallback
+        sticker = (
+            self._choose_sticker(reminder.channel, wanted, now) if wanted and emotions else None
+        )
+        return text, sticker
+
+    def reminder_sent(
+        self, reminder: Reminder, text: str, sticker: Sticker | None, now: datetime
+    ) -> None:
+        """提醒发出去了：记成她说的话，一次性的提醒就此结束，重复的排到下一次。"""
+        self.ingest.record_self(
+            body="qq", channel=reminder.channel, content=text, ts=now,
+            meta={"reminder": reminder.id},
+        )  # fmt: skip
+        if sticker is not None:
+            self._record_sticker("qq", reminder.channel, sticker, now)
+        self.reminders.finish(reminder.id, now)
 
     # ---- 额度充足时的自主活动 ----
 

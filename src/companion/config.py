@@ -324,6 +324,14 @@ class FilesSkillConfig(_Section):
     send_in_groups: bool = False  # 群里也能发（否则只在私聊）
 
 
+class RemindersSkillConfig(_Section):
+    """定时提醒：只限私聊，到点她用自己的话主动提醒。关掉后没到点的先留着，打开后再提醒。"""
+
+    enabled: bool = True
+    owner_only: bool = False  # 只给主人设提醒
+    max_per_person: int = 20  # 每个人最多同时有几条
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
@@ -334,6 +342,7 @@ class SkillsConfig(_Section):
     image: ImageSkillConfig = ImageSkillConfig()
     agent: AgentSkillConfig = AgentSkillConfig()
     files: FilesSkillConfig = FilesSkillConfig()
+    reminders: RemindersSkillConfig = RemindersSkillConfig()
 
 
 class Config(_Section):

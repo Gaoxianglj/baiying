@@ -111,7 +111,7 @@ def test_qq_replies_first_then_sends_picture(tmp_path):
     skill = make_skill(tmp_path, painter, {"now": T0})
     c = Companion(config, gateway=gateway, embedder=FakeEmbedder(), skills=[skill])
     cfg = QQConfig(bot_account=BOT, debounce_private_seconds=0)
-    bot = QQBot(c, cfg, client=FakeClient(), rng=random.Random(1), clock=lambda: T0)
+    bot = QQBot(c, cfg, client=FakeClient(), rng=random.Random(1))  # 和回复一样用真实时钟
     ev = {"post_type": "message", "self_id": int(BOT), "user_id": int(FRIEND), "message_id": 1,
           "message_type": "private", "sender": {"nickname": "小明"},
           "message": [{"type": "text", "data": {"text": "画只猫给我"}}]}  # fmt: skip

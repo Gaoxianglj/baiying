@@ -49,6 +49,8 @@ from companion.memory.people import SELF_ID, PeopleError
 from companion.models.openai_compat import ModelError
 from companion.skills import SkillCall, SkillContext
 from companion.skills.files import FileInbox
+from companion.skills.reminder import Reminder
+from companion.stickers import Sticker
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +58,8 @@ T = TypeVar("T")
 
 OCR_MAX_CHARS = 150  # 图里的字最多带这么多
 POKED = "（戳了戳你）"  # 被戳一戳时交给她的话
+REMINDER_GIVE_UP = timedelta(days=1)  # 到点一天后还发不出去的提醒就放弃
+REMINDER_MAX_WAIT_MINUTES = 30  # 提醒发不出去时，最多隔这么久再试
 LONG_CHUNK = 400  # 打包成聊天记录时，每条最多这么多字
 
 NOTICE = """大家好，我是{name}，一个 AI。
@@ -158,13 +162,79 @@ class QQBot:
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
         self._activity: asyncio.Task[None] | None = None  # 正在做的自主活动
         self._last_poke: dict[str, datetime] = {}  # 频道 → 上次理会 / 发出戳一戳的时间
+        self._reminder_text: dict[int, tuple[str, Sticker | None]] = {}  # 写好、还没发出去的提醒
+        self._reminder_retry: dict[int, tuple[int, datetime]] = {}  # 提醒 → （失败次数，下次再试）
         skills = companion.config.skills
         self.inbox = FileInbox(skills.files, companion.config.root, skills.agent.workspace)
 
     # ---- 运行 ----
 
     async def run(self) -> None:
-        await asyncio.gather(self.client.run_forever(), self._maintenance(), self._life_loop())
+        await asyncio.gather(
+            self.client.run_forever(),
+            self._maintenance(),
+            self._life_loop(),
+            self._reminder_loop(),
+        )
+
+    # ---- 定时提醒 ----
+
+    async def _reminder_loop(self, every: float = 15.0) -> None:
+        while True:
+            await asyncio.sleep(every)
+            try:
+                await self.reminder_tick()
+            except Exception:
+                log.exception("定时提醒出错")
+
+    async def reminder_tick(self) -> None:
+        """到点的提醒发出去。NapCat 断线时先不动，连上后再补发（她会说明迟到了）。"""
+        skills = self.c.config.skills
+        connected = getattr(self.client, "connected", None)
+        if not (skills.enabled and skills.reminders.enabled):
+            return
+        if connected is not None and not connected.is_set():
+            return
+        now = self.now()
+        for reminder in await self._call(self.c.reminders.due, now):
+            retry = self._reminder_retry.get(reminder.id)
+            if retry is None or now >= retry[1]:
+                await self._fire_reminder(reminder, now)
+
+    async def _fire_reminder(self, reminder: Reminder, now: datetime) -> None:
+        account = reminder.channel.removeprefix("private:")
+        if not account.isdigit():  # 只发回设提醒的私聊
+            log.error("提醒 %d 的聊天不对，不发：%s", reminder.id, reminder.channel)
+            await self._call(self.c.reminders.finish, reminder.id, now)
+            return
+        written = self._reminder_text.get(reminder.id)
+        if written is None:  # 只写一次：重发时不再调用模型，也不会说出两版
+            written = await self._call(self.c.remind_text, reminder, now)
+            self._reminder_text[reminder.id] = written
+        text, sticker = written
+        src = Source("private", account, "", "", None, Incoming(text=""))
+        self._sent_times.append(now)  # 这是答应过的事，不受每分钟上限限制，但算进去
+        if not await self._send_reply(src, text):
+            self._reminder_failed(reminder, now)
+            return
+        await self._call(self.c.reminder_sent, reminder, text, sticker, now)
+        self._reminder_text.pop(reminder.id, None)
+        self._reminder_retry.pop(reminder.id, None)
+        if sticker is not None:
+            await self._send_sticker(src, sticker.digest)
+
+    def _reminder_failed(self, reminder: Reminder, now: datetime) -> None:
+        """发不出去（比如对方把她删了）：隔一会儿再试，隔得越来越久；过了一天还不行就放弃。"""
+        if now - reminder.due > REMINDER_GIVE_UP:
+            log.error("提醒 %d 一直发不出去，放弃：%s", reminder.id, reminder.what)
+            self.c.reminders.finish(reminder.id, now)
+            self._reminder_text.pop(reminder.id, None)
+            self._reminder_retry.pop(reminder.id, None)
+            return
+        attempts = self._reminder_retry.get(reminder.id, (0, now))[0] + 1
+        wait = min(2**attempts, REMINDER_MAX_WAIT_MINUTES)
+        self._reminder_retry[reminder.id] = (attempts, now + timedelta(minutes=wait))
+        log.warning("提醒 %d 没发出去，%d 分钟后再试", reminder.id, wait)
 
     # ---- 主动找主人、自主活动 ----
 
@@ -682,12 +752,12 @@ class QQBot:
             return
         self._last_spoke[src.channel] = self.now()
 
-    async def _send_reply(self, src: Source, text: str, reply_to: str | None = None) -> None:
-        """她说的话：太长就打包成一条聊天记录发（不刷屏），发不出去再分开发。"""
+    async def _send_reply(self, src: Source, text: str, reply_to: str | None = None) -> bool:
+        """她说的话：太长就打包成一条聊天记录发（不刷屏），发不出去再分开发。返回是否发出去了。"""
         limit = self.cfg.long_text_chars
         if limit and len(text) > limit and await self._send_forward(src, text):
-            return
-        await self._send(src, text, reply_to=reply_to)
+            return True
+        return await self._send(src, text, reply_to=reply_to)
 
     async def _send_forward(self, src: Source, text: str) -> bool:
         nodes = [
@@ -927,7 +997,8 @@ class QQBot:
             self._sent_times.popleft()
         return len(self._sent_times) < self.cfg.max_replies_per_minute
 
-    async def _send(self, src: Source, text: str, reply_to: str | None = None) -> None:
+    async def _send(self, src: Source, text: str, reply_to: str | None = None) -> bool:
+        """发一条文字，返回是否发出去了。"""
         if src.message_type == "group":
             action, params = "send_group_msg", {"group_id": int(src.group_id)}
         else:
@@ -942,13 +1013,14 @@ class QQBot:
             try:
                 data = await self.client.call(action, params | {"message": message})
                 break
-            except OneBotError as e:
+            except (OneBotError, TimeoutError) as e:
                 log.error("发送失败：%s", e)
         else:
-            return
+            return False
         self._last_spoke[src.channel] = self.now()
         if isinstance(data, dict) and data.get("message_id") is not None:
             self._sent_ids.append(str(data["message_id"]))
+        return True
 
     async def _speakers_in(self, channel: str) -> dict[str, str]:
         """群里最近说过话的人：名字（群名片、昵称）→ QQ 号。第一次用时从事件日志里补上重启前的。"""
