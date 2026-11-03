@@ -322,6 +322,10 @@ class FilesSkillConfig(_Section):
     preview_chars: int = 1500  # 小的文本文件，把开头这么多字直接给她看
     send_owner_only: bool = True  # 只给主人发（工作文件夹里多是替主人做的东西）
     send_in_groups: bool = False  # 群里也能发（否则只在私聊）
+    read_enabled: bool = True  # 她能自己读文件（内容进她的上下文，不经过助手）
+    read_local: bool = True  # 主人私聊时还能读这台电脑上的其他文件（黑名单除外）
+    read_chars: int = 20000  # 长文件分段读，每段多少字
+    read_max_mb: float = 20.0  # 超过这么大的文件不读
 
 
 class RemindersSkillConfig(_Section):

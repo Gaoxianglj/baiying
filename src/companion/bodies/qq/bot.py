@@ -894,7 +894,7 @@ class QQBot:
             return inbox.skipped(ref.name, ref.size, f"超过 {inbox.cfg.max_mb:g} MB，没收")
         try:
             data = await self._download_file(ref, src)
-            path = await asyncio.to_thread(inbox.save, ref.name, data, self.now())
+            path = await asyncio.to_thread(inbox.save, ref.name, data, self.now(), src.channel)
             text = await asyncio.to_thread(inbox.describe, path, ref.name)
         except (MediaError, OneBotError, OSError, TimeoutError) as e:
             log.warning("收文件失败（%s）：%s", ref.name, e)

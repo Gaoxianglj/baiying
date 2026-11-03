@@ -100,11 +100,12 @@ def test_safe_name_drops_paths():
 def test_private_text_file_saved_and_previewed(bot, tmp_path):
     napcat_has(bot, tmp_path, "第一行\n第二行".encode())
     run(bot, file_msg("note.txt"))
-    saved = bot.workspace / "inbox" / f"{T0.astimezone():%Y-%m-%d}" / "note.txt"
+    day = f"{T0.astimezone():%Y-%m-%d}"
+    saved = bot.workspace / "inbox" / day / f"private-{FRIEND}" / "note.txt"
     assert saved.read_text("utf-8") == "第一行\n第二行"
     theirs = [e.content for e in bot.c.log.iter_events() if e.actor.person_id != "self"]
     assert theirs[0].startswith("[文件：note.txt（")
-    assert f"inbox/{T0.astimezone():%Y-%m-%d}/note.txt" in theirs[0] and "第二行" in theirs[0]
+    assert f"inbox/{day}/private-{FRIEND}/note.txt" in theirs[0] and "第二行" in theirs[0]
     assert ("get_file", {"file_id": "fid-1"}) in bot.client.sent
 
 
@@ -113,7 +114,7 @@ def test_same_name_is_not_overwritten(bot, tmp_path):
     run(bot, file_msg("a.bin"))
     napcat_has(bot, tmp_path, b"v2", name="a.bin")
     run(bot, file_msg("a.bin"))
-    folder = bot.workspace / "inbox" / f"{T0.astimezone():%Y-%m-%d}"
+    folder = bot.workspace / "inbox" / f"{T0.astimezone():%Y-%m-%d}" / f"private-{FRIEND}"
     assert sorted(p.name for p in folder.iterdir()) == ["a-1.bin", "a.bin"]
 
 
@@ -138,9 +139,10 @@ def test_download_failure_is_explicit(bot):
 
 def test_inbox_describe_binary_has_no_preview(tmp_path):
     inbox = FileInbox(FilesSkillConfig(inbox=tmp_path / "ws" / "inbox"), tmp_path, tmp_path / "ws")
-    path = inbox.save("photo.png", b"\x89PNG....", T0)
+    path = inbox.save("photo.png", b"\x89PNG....", T0, "private:1")
     day = f"{T0.astimezone():%Y-%m-%d}"
-    assert inbox.describe(path, "photo.png").endswith(f"存在工作文件夹的 inbox/{day}/photo.png]")
+    described = inbox.describe(path, "photo.png")
+    assert described.endswith(f"存在工作文件夹的 inbox/{day}/private-1/photo.png]")
 
 
 # ---- 发 ----

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import codecs
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,25 @@ def safe_name(name: str) -> str:
     return stem[:80] + suffix
 
 
+def channel_folder(channel: str) -> str:
+    """聊天对应的子文件夹名：private:123 → private-123。"""
+    return channel.replace(":", "-")
+
+
+def _decode_start(raw: bytes) -> str:
+    """解开文件开头的一段。末尾可能正好切在一个字中间，用增量解码，半个字留着不报错。"""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        codecs_to_try = ("utf-16",)
+    else:
+        codecs_to_try = ("utf-8-sig", "gb18030")
+    for name in codecs_to_try:
+        try:
+            return codecs.getincrementaldecoder(name)().decode(raw, final=False)
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
 class FileInbox:
     """收到的文件放在哪、怎么告诉她。"""
 
@@ -51,10 +71,10 @@ class FileInbox:
     def max_bytes(self) -> int:
         return int(self.cfg.max_mb * 1024 * 1024)
 
-    def save(self, name: str, data: bytes, now: datetime | None = None) -> Path:
-        """存进 inbox/日期/；重名的加序号，不覆盖。"""
+    def save(self, name: str, data: bytes, now: datetime | None, channel: str) -> Path:
+        """存进 inbox/日期/聊天/；重名的加序号，不覆盖。按聊天分开，读文件时才分得清是谁的。"""
         day = (now or datetime.now(UTC)).astimezone()
-        folder = self.folder / f"{day:%Y-%m-%d}"
+        folder = self.folder / f"{day:%Y-%m-%d}" / channel_folder(channel)
         folder.mkdir(parents=True, exist_ok=True)
         clean = safe_name(name)
         path = folder / clean
@@ -88,17 +108,13 @@ class FileInbox:
     def _preview(self, path: Path) -> str:
         if path.suffix.lower() not in TEXT_SUFFIXES or self.cfg.preview_chars <= 0:
             return ""
-        raw = path.read_bytes()[: self.cfg.preview_chars * 4]
-        for encoding in ("utf-8", "gbk"):
-            try:
-                text = raw.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
+        raw = path.read_bytes()
+        whole = len(raw) <= self.cfg.preview_chars * 4
+        text = _decode_start(raw[: self.cfg.preview_chars * 4])
+        if not text:
             return ""
-        if len(text) > self.cfg.preview_chars:
-            text = text[: self.cfg.preview_chars] + "\n……（后面还有）"
+        if len(text) > self.cfg.preview_chars or not whole:
+            text = text[: self.cfg.preview_chars].rstrip() + "\n……（后面还有，可以读全文）"
         return text.strip()
 
 

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from companion.config import Config
 from companion.models.codex_app_server import CodexAppServerBackend
 from companion.models.gateway import ModelGateway
-from companion.skills.agent import CodexAgent
+from companion.skills.agent import CodexAgent, default_deny
 from companion.skills.base import Skill
 from companion.skills.files import SendFile
 from companion.skills.image import ImageGen, ImagePainter
+from companion.skills.reader import ReadFile
 from companion.skills.reminder import ReminderBook, Reminders
 from companion.skills.search import WebSearch
 
@@ -26,6 +29,11 @@ def build_skills(config: Config, gateway: ModelGateway, reminders: ReminderBook)
                 effort="low",
                 timeout=config.skills.image.timeout_seconds,
             )
+
+    def deny() -> list[Path]:  # 读文件的黑名单和助手的一样，每次现算（配置和路径都可能变）
+        extra = [Path(p) for p in config.skills.agent.extra_deny]
+        extra = [p if p.is_absolute() else config.root / p for p in extra]
+        return default_deny(config.root) + extra
 
     return [
         WebSearch(config.skills.search, config.models.fallback, gateway.ledger),
@@ -45,4 +53,5 @@ def build_skills(config: Config, gateway: ModelGateway, reminders: ReminderBook)
         ),
         SendFile(config.skills.files, config.root, config.skills.agent.workspace),
         Reminders(config.skills.reminders, reminders),
+        ReadFile(config.skills.files, config.root, config.skills.agent.workspace, deny),
     ]

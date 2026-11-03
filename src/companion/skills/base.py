@@ -54,6 +54,7 @@ class SkillResult:
     # 耗时的活（如画图）：先交回 text 让她回一句，真正的活放到后台做，做完把图片直接发出去
     later: Callable[[], SkillResult] | None = None
     report: bool = False  # 后台做完后让她用自己的话把结果告诉对方（而不是直接发图）
+    max_chars: int | None = None  # 交回给她时最多多少字（默认按 skills.max_result_chars）
 
 
 @dataclass
@@ -173,7 +174,7 @@ class Skills:
 
     def feedback(self, skill: Skill, marker: str, result: SkillResult) -> str:
         text = result.text
-        limit = self.cfg.max_result_chars
+        limit = result.max_chars or self.cfg.max_result_chars
         if len(text) > limit:
             text = text[:limit] + "\n……（后面省略）"
         return (
