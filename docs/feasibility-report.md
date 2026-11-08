@@ -329,12 +329,40 @@ flowchart TB
 - **DeepSeek 驱动 Codex**：`model_provider` 指向 `https://api.deepseek.com/`、`wire_api = "responses"`，key 用 `env_key` 通过环境变量传入（不出现在命令行），实测能完成文件任务（约 60 秒一个小任务）。
 - **安全加固**：用户的 Codex 配置会把 MCP 服务器和插件（含电脑操控 `cua_repl`、`node_repl` 等）带进 app-server。现在所有 Codex 进程都关掉这些（`features.computer_use / browser_use / plugins / apps … = false`，并逐个关闭配置里的 `mcp_servers`），避免群聊里的诱导借工具碰到本机。
 
+### 实测补充（2026-11-08，群聊沙箱）
+
+问题：能不能让 Codex 进程默认什么都读不到，只放开一个群的文件夹。环境：Codex 0.164，Windows 11 26200.9711，普通权限（未提权）运行。探针文件都是专门建的，放在黑名单之外。
+
+| 配置 | 结果 |
+| --- | --- |
+| elevated 后端，只读打底（现有 Agent 的配置） | 别的群的文件夹、项目文件夹、同盘其他位置、临时目录都读得到；用户文件夹读不到 |
+| elevated 后端，不含 `:root` | 拒绝运行：要求能读整个盘 |
+| unelevated 后端，不含 `:root` | 拒绝运行：限制读取需要 elevated 后端 |
+| mxc 后端，`:minimal` | 上面这些都读不到；但 Program Files、ProgramData 能读，里面真有别的软件的私钥（实测读到了长度，没看内容） |
+| mxc 后端，`:minimal` 加显式拒绝（最终配置） | 全盘 4891 个目录，能列出的只有系统目录和放开的程序目录；3 个权限设得很松的软件目录要加进 `extra_deny` 才挡得住 |
+
+mxc 下逐项实测（`codex sandbox`、app-server 的 `command/exec`、真实模型都试过）：
+
+- **读**：PowerShell、cmd、Python 及其子进程都被拒绝；UNC（`\\localhost\E$`）、`\\?\` 长路径也被拒绝。
+- **写**：只有群文件夹能写。能新建、覆盖、改名，不能删除。放开的程序目录是只读的。
+- **链接**：符号链接、目录联接、硬链接都建不了。
+- **工具**：apply_patch 在群文件夹里也失败，越界同样失败；view_image 起不来（都因为 Codex 的文件 helper 缺 `SYSTEMROOT`，加载 AGENTS.md 也是，所以要设 `project_doc_max_bytes = 0`）。这个 bug 修好后它们可能又能用，所以 view_image 显式关掉。代码模式的 `functions.exec` 里没有 `require`、`process`、`fetch`，动态导入被拒。`spawn_agent` 在临时线程里创建失败。提权参数被禁止。
+- **网络**：外网、IP 直连、本机回环（Ollama 等本地服务）、DNS 全部不通；Python 同样。能在回环上监听（没测外面能否连进来，外面也没有东西会连它）。
+- **环境变量**：默认全部继承，包括传给子进程的 API key；`shell_environment_policy.inherit = "core"` 后只剩基本的；`"none"` 启动不了（缺 `SYSTEMROOT`）。注册表 `HKCU\Environment` 和系统环境变量能读，文件权限管不到，所以自检会检查这些变量的名字。
+- **系统**：计划任务、WMI、服务查询都不通；打开网址没有到达主机（用本机起的监听验证）；读不了剪贴板；`HKCU\...\Run` 读不了；后台进程随沙箱一起结束。
+- **进程外的路径**：app-server 本身不在沙箱里，`.codex/config.toml` 里的 MCP 服务器会在沙箱外启动（这台机器上项目文件夹是 trusted，子目录都算），`AGENTS.md`、技能、`developer_instructions` 也会生效。线程工作目录换到沙箱写不到的地方后全部失效。主人私聊的 Agent 配置也实测确认有同样的问题。
+- **两处踩坑**：收紧后 PowerShell 的模块加载不了（要放开 `Program Files/WindowsPowerShell`），此时扫描脚本全失败，看起来像“什么都列不出来”，是加了对照组才发现的假象。带着“不要越界”的提示时，模型根本不去试，所以验收时要去掉这句，否则通过了也不算数。
+- **本机杀软**：探测脚本里同时写 socket 和 subprocess 的两个文件写完就被删了（疑似杀软，查不到检测记录），脚本拆开后正常。没有绕过这个防护，只是把测试按用途分开。
+
+上游文档的说法（2026-11-08 查阅）：Codex 文档把 mxc 列为兼容设备上的推荐模式，要求 Windows 11 24H2 26100.9278 或 25H2 26200.9278 以上，显式选它时能力不够直接失败。MXC 文档说明，给“所有应用包”开了权限的目录，不在允许列表里也可能读得到，显式的拒绝规则优先；常见基线只是抽样观察，不是保证；`processcontainer` 用原生 BaseContainer，不回退到 AppContainer（本机二进制里还有旧版的回退字样，所以不能只信文档，要靠自检）。MXC 的 README 到 2026-10-06 还写着目前不要把它的配置当安全边界，那次提交删掉了警告，没有说明理由；当前读到的文档既没有重复，也没有收回。
+
 ### 新增来源（2026-10-24 查阅）
 
 - [qq-bridge](https://github.com/Derpyu520/qq-bridge)
 - DeepSeek：[Search / Fetch API](https://api-docs.deepseek.com/guides/search)、[Codex 接入](https://api-docs.deepseek.com/quick_start/agent_integrations/codex)、[价格](https://api-docs.deepseek.com/quick_start/pricing)
 - Codex：[配置参考](https://developers.openai.com/codex/config-reference)；生图额度说明见第三方整理 [Image Generation in Codex CLI](https://codex.danielvaughan.com/2026/04/27/codex-cli-image-generation-gpt-image-2-visual-development-workflows/)
 - [NapCat 文档](https://napneko.github.io/guide/boot/Shell)
+- 沙箱（2026-11-08）：[Codex Windows 沙箱](https://learn.chatgpt.com/docs/windows/windows-sandbox.md)、[microsoft/mxc](https://github.com/microsoft/mxc)、[MXC 文件系统说明](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/filesystem.md)、[MXC schema](https://github.com/microsoft/mxc/blob/main/docs/schema.md)、[删除预览警告的提交](https://github.com/microsoft/mxc/commit/c51e49eac6aaac43edcb21296e91c26f18b66b33)
 
 ## 来源
 

@@ -6,6 +6,7 @@
 - 群聊：另外可以读控制台指定的文件夹（group_read_paths，只读不发）。
 - 黑名单（密钥、记忆、登录信息、浏览器和密码管理器数据）和看起来像密钥的文件，谁都不行。
 - 任何地方都不改已有文件：只新建，重名加序号。可执行的文件类型不能写。
+- 可执行的文件类型只有主人私聊能发：群助手（在沙箱里，见 group_agent.py）能造出来，但不往外递。
 """
 
 from __future__ import annotations
@@ -153,7 +154,12 @@ class FileAccess:
 
     def check_send(self, path: Path, ctx: SkillContext) -> None:
         self._check_secret(path, "发")
-        if self.local(ctx) or self.in_own_places(path, ctx):
+        if self.local(ctx):
+            return
+        # 群助手能在聊天文件夹里造出可运行的文件；她不该把它们递给别人
+        if path.suffix.lower() in RUNNABLE_SUFFIXES or path.name.lower() in RUNNABLE_NAMES:
+            raise SkillError(f"{path.suffix or path.name} 这种可以运行的文件不能发到这里")
+        if self.in_own_places(path, ctx):
             return
         chats, inbox, workspace = (
             self.chats.resolve(),

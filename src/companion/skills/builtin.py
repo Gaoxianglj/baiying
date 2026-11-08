@@ -14,6 +14,7 @@ from companion.skills.agent import CodexAgent, default_deny
 from companion.skills.base import Skill
 from companion.skills.desktop import ReadClipboard, ViewScreen
 from companion.skills.files import SendFile, WriteFile
+from companion.skills.group_agent import GroupAgent
 from companion.skills.history import ChatHistory, ChatImages, ChatScope
 from companion.skills.image import ImageGen, ImagePainter
 from companion.skills.pictures import ImageTools
@@ -75,8 +76,18 @@ def build_skills(
             config.root,
             sub,
             config.models.fallback,
+            config.data_dir / "run",
             quota_ok=lambda: gateway.subscription is not None and gateway.subscription_available(),
             ledger=gateway.ledger,
+        ),
+        GroupAgent(
+            config.skills.group_agent,
+            config.root,
+            sub,
+            access,
+            deny,
+            config.data_dir / "run",
+            quota_ok=lambda: gateway.subscription is not None and gateway.subscription_available(),
         ),
         SendFile(files, access),
         Reminders(config.skills.reminders, reminders),
