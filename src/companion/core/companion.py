@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 _CURSOR = "extract_cursor:"
 SILENT_MARK = re.compile(r"[【\[]\s*(不回复|SILENT)\s*[】\]]", re.IGNORECASE)
+IMAGE_REF_NOTE = re.compile(r"（图片编号：[^）]*）")  # 程序标的，万一被她照抄了也不发出去
 
 
 REMINDER_LATE = timedelta(minutes=5)  # 迟了超过这么久，就让她说明迟到了
@@ -165,7 +166,7 @@ class Companion:
         self._rng = random.Random()
         self.reminders = ReminderBook(config.data_dir / "reminders.json")
         if skills is None:
-            skills = build_skills(config, self.gateway, self.reminders)
+            skills = build_skills(config, self.gateway, self.reminders, self.log, self.media)
         self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl")
 
     def close(self) -> None:
@@ -252,11 +253,13 @@ class Companion:
             sticker_emotions=emotions,
             reply_mode=mode,
             extra_sections=[p] if (p := self.skills.prompt(skill_ctx)) else None,
+            show_image_refs=self.skills.can_use("看图", skill_ctx),
         )
         result, calls = self._chat_with_skills(bundle, skill_ctx, on_interim)
         text = self._take_mood(
             self.skills.strip_markers(result.text), channel, incoming.actor.person_id, now
         )
+        text = IMAGE_REF_NOTE.sub("", text)
         text, wanted = split_sticker(text)
         text, actions = split_actions(text)
         if SILENT_MARK.search(text):  # 说了不回复：话和表情包都不发，但回应、戳一戳照做
@@ -281,6 +284,7 @@ class Companion:
         )
         if sticker is not None:
             self._record_sticker(body, channel, sticker, now)
+        self._record_sent_images(body, channel, images, now)
         self._record_files(body, channel, files, now)
         return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images,
                      files=files, skill_ctx=skill_ctx, actions=actions)  # fmt: skip
@@ -294,7 +298,8 @@ class Companion:
         """生成回复；她写了技能标记就执行，把结果交回给她，直到她给出最终回复。"""
         messages = list(bundle.messages)
         calls: list[SkillCall] = []
-        rounds = self.config.skills.max_rounds
+        cfg = self.config.skills
+        rounds = cfg.owner_max_rounds if ctx and ctx.owner and ctx.private else cfg.max_rounds
         while True:
             result = self.gateway.chat(messages, purpose="chat")
             found = self.skills.find(result.text, ctx) if len(calls) < rounds else None
@@ -315,7 +320,11 @@ class Companion:
             said = f"{before}【{marker}：{arg}】" if before else f"【{marker}：{arg}】"
             messages += [
                 ChatMessage("assistant", said),
-                ChatMessage("skill", self.skills.feedback(skill, marker, outcome)),
+                ChatMessage(
+                    "skill",
+                    self.skills.feedback(skill, marker, outcome),
+                    images=tuple(outcome.view),
+                ),
             ]
 
     def deliver(
@@ -325,19 +334,26 @@ class Companion:
         if not result.ok:
             return []
         paths, digests = [], []
+        animated = False
         for image in result.images:
             try:
                 stored = self.media.save(image.read_bytes())
             except (OSError, media.MediaError) as e:
                 log.warning("保存技能图片失败：%s", e)
                 continue
-            paths.append(stored.path)
+            # 动图要发原图才会动；静态图发压缩过的，省流量
+            gif = image.suffix.lower() == ".gif"
+            animated = animated or gif
+            paths.append(
+                (self.media.original_for(stored.digest) or stored.path) if gif else stored.path
+            )
             digests.append(stored.digest)
         if digests:
+            what = "动图" if animated else "图"
             self.ingest.record_self(
                 body=body,
                 channel=channel,
-                content=f"[我画的图：{media.clean(result.text)}]",
+                content=f"[我画的{what}{result.note}：{media.clean(result.text)}]",
                 ts=now,
                 meta={"images": digests},
             )
@@ -372,7 +388,7 @@ class Companion:
         files: list[Path] = []
         try:
             answer = self.gateway.chat([*bundle.messages, ChatMessage("skill", note)])
-            files = self._files_in(answer.text, sender)
+            files = self._files_in(answer.text, sender, ctx)
             text = self._take_mood(
                 self.skills.strip_markers(answer.text), ctx.channel, ctx.person_id, None
             )
@@ -392,18 +408,28 @@ class Companion:
         skill = next((s for s in self.skills.available(ctx) if isinstance(s, SendFile)), None)
         return skill
 
-    def _files_in(self, text: str, sender: SendFile | None) -> list[Path]:
-        """她话里的【发文件：…】：在工作文件夹里找得到、大小合适的才发。"""
+    def _files_in(self, text: str, sender: SendFile | None, ctx: SkillContext) -> list[Path]:
+        """她话里的【发文件：…】：这个场合能发、大小合适的才发。"""
         if sender is None:
             return []
         files = []
         for match in MARKER.finditer(text):
             if match.group(1) in sender.markers:
                 try:
-                    files.append(sender.resolve(match.group(2)))
+                    files.append(sender.resolve(match.group(2), ctx))
                 except SkillError as e:
                     log.info("没发文件：%s", e)
         return list(dict.fromkeys(files))
+
+    def _record_sent_images(
+        self, body: str, channel: str, images: list[Path], now: datetime | None
+    ) -> None:
+        for path in images:
+            name = path.name.split(".orig.")[0][:8] if ".orig." in path.name else path.name
+            self.ingest.record_self(
+                body=body, channel=channel, content=f"[我发的图：{name}]", ts=now,
+                meta={"file": str(path)},
+            )  # fmt: skip
 
     def _record_files(
         self, body: str, channel: str, files: list[Path], now: datetime | None

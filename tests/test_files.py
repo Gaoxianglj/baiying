@@ -12,6 +12,7 @@ from companion.config import FilesSkillConfig, QQConfig, load_config
 from companion.core.companion import Companion
 from companion.memory import MemoryLayout, init_memory
 from companion.skills import SkillContext, SkillResult
+from companion.skills.access import FileAccess
 from companion.skills.base import SkillError
 from companion.skills.files import FileInbox, SendFile, safe_name
 from tests.fakes import FakeEmbedder, scripted_gateway
@@ -159,19 +160,32 @@ def test_send_file_skill_resolves_inside_workspace(tmp_path):
     ws = tmp_path / "ws"
     (ws / "out").mkdir(parents=True)
     (ws / "out" / "r.csv").write_text("x", "utf-8")
-    (tmp_path / "secret.txt").write_text("x", "utf-8")
-    skill = SendFile(FilesSkillConfig(max_mb=1), tmp_path, ws)
-    assert skill.resolve("out/r.csv") == (ws / "out" / "r.csv").resolve()
-    for bad in ("../secret.txt", str(tmp_path / "secret.txt"), "out/none.csv", ""):
+    (tmp_path / "other.txt").write_text("x", "utf-8")
+    cfg = FilesSkillConfig(max_mb=1, inbox=ws / "inbox")
+    skill = SendFile(cfg, FileAccess(cfg, tmp_path, ws, lambda: []))
+    owner = SkillContext("qq", "private:1", "p", private=True, owner=True)
+    friend = SkillContext("qq", "private:2", "p", private=True, owner=False)
+    group = SkillContext("qq", "group:1", "p", private=False, owner=True)
+    assert skill.resolve("out/r.csv", owner) == (ws / "out" / "r.csv").resolve()
+    # 工作文件夹里替主人做的东西，别人和群里都拿不到
+    for ctx in (friend, group):
+        with pytest.raises(SkillError, match="只能发"):
+            skill.resolve("out/r.csv", ctx)
+    # 这台电脑上的其他文件：只有主人私聊能发
+    assert skill.resolve(str(tmp_path / "other.txt"), owner).name == "other.txt"
+    for bad in ("../other.txt", str(tmp_path / "other.txt")):
+        for ctx in (friend, group):
+            with pytest.raises(SkillError):
+                skill.resolve(bad, ctx)
+    for missing in ("out/none.csv", ""):
         with pytest.raises(SkillError):
-            skill.resolve(bad)
+            skill.resolve(missing, owner)
     (ws / "big.bin").write_bytes(b"0" * (1024 * 1024 + 1))
     with pytest.raises(SkillError, match="太大"):
-        skill.resolve("big.bin")
-    owner = SkillContext("qq", "private:1", "p", private=True, owner=True)
-    assert skill.allowed(owner)
-    assert not skill.allowed(SkillContext("qq", "private:2", "p", private=True, owner=False))
-    assert not skill.allowed(SkillContext("qq", "group:1", "p", private=False, owner=True))
+        skill.resolve("big.bin", owner)
+    assert all(skill.allowed(c) for c in (owner, friend, group))  # 每个聊天都有自己的文件夹
+    cfg.folder_enabled = False
+    assert skill.allowed(owner) and not skill.allowed(friend) and not skill.allowed(group)
 
 
 def test_owner_gets_file_in_private(bot):

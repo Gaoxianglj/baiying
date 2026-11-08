@@ -1,9 +1,10 @@
-"""收发文件。
+"""收发文件，写新文件。
 
 - 收：别人发来的文件（不超过 max_mb）存进工作文件夹的 inbox/日期/，她看到文件名、大小和存放位置；
   小的文本文件把开头一段直接给她看。助手（Agent）在同一个工作文件夹里，可以接着处理。
-- 发：【发文件：路径】把工作文件夹里的文件发给对方（不超过 max_mb）。路径只能落在工作文件夹里，
-  默认只给主人发、只在私聊里发（工作文件夹里多是替主人做的东西）。
+- 发：【发文件：路径】发给对方（不超过 max_mb）。能发什么看 skills/access.py：这个聊天的文件夹和
+  这个聊天收到的文件谁都能发；主人私聊还能发这台电脑上的其他文件（黑名单除外）。
+- 写：【写文件：路径】后面跟 <<<内容>>>，在这个聊天的文件夹里新建文本文件，不改已有的文件。
 """
 
 from __future__ import annotations
@@ -12,9 +13,13 @@ import codecs
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from companion.config import FilesSkillConfig
 from companion.skills.base import Skill, SkillContext, SkillError, SkillResult
+
+if TYPE_CHECKING:
+    from companion.skills.access import FileAccess
 
 TEXT_SUFFIXES = {
     ".txt", ".md", ".csv", ".tsv", ".json", ".log", ".py", ".js", ".ts", ".html", ".xml",
@@ -122,38 +127,43 @@ class SendFile(Skill):
     name = "files"
     label = "发文件"
     markers = {
-        "发文件": "【发文件：工作文件夹里的路径】把工作文件夹里的一个文件发给对方"
-        "（比如助手做好的表格、收到后整理过的文档），不超过 {mb} MB",
+        "发文件": "【发文件：路径】把这个聊天的文件夹里的文件、或这个聊天里收到的文件发给对方"
+        "（不超过 {mb} MB）；路径写相对的就好。发图片本身用【发图】",
     }
+    _local_usage = (
+        "在这里（主人私聊）也能【发文件】这台电脑上的其他文件，路径写完整，如 D:/资料/报告.pdf"
+    )
 
-    def __init__(self, cfg: FilesSkillConfig, root: Path, workspace: Path) -> None:
+    def __init__(self, cfg: FilesSkillConfig, access: FileAccess) -> None:
         self.cfg = cfg
-        self.workspace = workspace if workspace.is_absolute() else root / workspace
+        self.access = access
         self.markers = {k: v.format(mb=f"{cfg.max_mb:g}") for k, v in SendFile.markers.items()}
 
     def enabled(self) -> bool:
         return self.cfg.enabled
 
     def allowed(self, ctx: SkillContext) -> bool:
-        if self.cfg.send_owner_only and not ctx.owner:
-            return False
-        return ctx.private or self.cfg.send_in_groups
+        if self.cfg.folder_enabled:  # 每个聊天都有自己的文件夹可以发
+            return True
+        return (ctx.owner or not self.cfg.send_owner_only) and (
+            ctx.private or self.cfg.send_in_groups
+        )
 
     def status(self) -> str:
-        return f"工作文件夹：{self.workspace}"
+        return f"工作文件夹：{self.access.workspace}"
 
-    def resolve(self, arg: str) -> Path:
-        """把她写的路径落到工作文件夹里；越界、不存在、太大都不行。"""
+    def context(self, ctx: SkillContext) -> str:
+        return self._local_usage if self.access.local(ctx) else ""
+
+    def resolve(self, arg: str, ctx: SkillContext) -> Path:
+        """把她写的路径落到能发的地方；越界、不存在、太大都不行。"""
         text = arg.strip().strip("`'\"“”")
         if not text:
             raise SkillError("没说发哪个文件")
-        base = self.workspace.resolve()
-        path = Path(text)
-        path = (path if path.is_absolute() else base / path).resolve()
-        if not path.is_relative_to(base):
-            raise SkillError("只能发工作文件夹里的文件")
-        if not path.is_file():
-            raise SkillError(f"工作文件夹里没有这个文件：{text}")
+        path, member = self.access.locate(text, ctx)
+        self.access.check_send(path, ctx)
+        if member is not None or not path.is_file():
+            raise SkillError(f"没有这个文件：{text}")
         if path.stat().st_size > self.cfg.max_mb * 1024 * 1024:
             raise SkillError(
                 f"文件太大了（{human_size(path.stat().st_size)}），"
@@ -162,9 +172,52 @@ class SendFile(Skill):
         return path
 
     def run(self, marker: str, arg: str, ctx: SkillContext) -> SkillResult:
-        path = self.resolve(arg)
+        path = self.resolve(arg, ctx)
         return SkillResult(
             f"文件 {path.name}（{human_size(path.stat().st_size)}）会跟着你这句话一起发过去。"
             "简短说一句就好，不要把文件内容再贴一遍。",
             files=[path],
+        )
+
+
+class WriteFile(Skill):
+    name = "write_files"
+    label = "写文件"
+    takes_block = True
+    markers = {
+        "写文件": "【写文件：路径】在这个聊天的文件夹里新建一个文本文件（如 花册/目录.md），"
+        "紧接着写内容：\n<<<\n内容\n>>>\n只能新建，重名会自动加序号；要发出去再用【发文件】",
+    }
+    _local_usage = (
+        "在这里（主人私聊）新文件也能存到别处，路径写完整，如 D:/笔记/周报.md（系统文件夹除外）"
+    )
+
+    def __init__(self, cfg: FilesSkillConfig, access: FileAccess) -> None:
+        self.cfg = cfg
+        self.access = access
+
+    def enabled(self) -> bool:
+        return self.cfg.enabled and self.cfg.folder_enabled
+
+    def status(self) -> str:
+        return f"存在工作文件夹的 chats/ 下，每个聊天一个文件夹；每个最多 {self.cfg.folder_max_mb:g} MB"
+
+    def context(self, ctx: SkillContext) -> str:
+        return self._local_usage if self.access.local(ctx) else ""
+
+    def run(self, marker: str, arg: str, ctx: SkillContext) -> SkillResult:
+        target, sep, content = arg.partition("｜")
+        if not sep or not content.strip():
+            raise SkillError("没写内容：路径写在标记里，内容写在紧跟着的 <<< 和 >>> 中间")
+        data = content.encode("utf-8")
+        if len(data) > self.cfg.max_mb * 1024 * 1024:
+            raise SkillError(f"内容太长了，只能写 {self.cfg.max_mb:g} MB 以内")
+        name = target.strip()
+        if name and not Path(name).suffix:
+            name += ".txt"
+        path = self.access.save_new(name, data, ctx)
+        where = self.access.display(path, ctx)
+        return SkillResult(
+            f"写好了，存在 {where}（{human_size(len(data))}）。要发给对方就用【发文件：{where}】；"
+            "不要把内容再贴一遍。"
         )

@@ -10,7 +10,7 @@ import os
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
@@ -285,6 +285,9 @@ class ImageSkillConfig(_Section):
     group_limit: int = 5  # 所有群加起来，每个窗口最多画几张
     group_window_minutes: float = 20.0
     timeout_seconds: float = 600.0  # 实测偶尔要近 4 分钟（2026-10-26），原来的 300 秒太紧
+    queue_limit: int = 5  # 最多排多少张（一张一张画；做花册时可以一次点好几张）
+    gif_frame_ms: int = 120  # 动图每帧多少毫秒
+    gif_side: int = 320  # 动图长边最多多少像素（一张图切 16 帧，每帧约 310 像素）
 
 
 class AgentSkillConfig(_Section):
@@ -314,18 +317,46 @@ class AgentSkillConfig(_Section):
 
 
 class FilesSkillConfig(_Section):
-    """收发文件。收到的存进工作文件夹的 inbox/（助手也能用）；发的只能是工作文件夹里的文件。"""
+    """文件。每个聊天有自己的文件夹（工作文件夹的 chats/聊天/）：能存新文件、能读、能发。
+
+    收到的存进工作文件夹的 inbox/（助手也能用）。主人私聊还能读、发这台电脑上的其他文件
+    （黑名单除外）。任何地方都不改已有文件：重名加序号。
+    """
 
     enabled: bool = True
     max_mb: float = 10.0  # 收发都不超过这么大
     inbox: Path = Path("data/workspace/inbox")  # 相对于项目根目录；按日期分子文件夹
     preview_chars: int = 1500  # 小的文本文件，把开头这么多字直接给她看
-    send_owner_only: bool = True  # 只给主人发（工作文件夹里多是替主人做的东西）
+    # 下面两项只管工作文件夹里替主人做的东西；每个聊天自己的文件夹和收到的文件不受限
+    send_owner_only: bool = True  # 只给主人发
     send_in_groups: bool = False  # 群里也能发（否则只在私聊）
+    folder_enabled: bool = True  # 每个聊天有自己的文件夹
+    folder_max_mb: float = 500.0  # 群和别人私聊的文件夹最多这么大（主人私聊不限）
+    group_read_paths: list[str] = []  # 另外允许群聊读的文件夹（只读，不能发）
     read_enabled: bool = True  # 她能自己读文件（内容进她的上下文，不经过助手）
     read_local: bool = True  # 主人私聊时还能读这台电脑上的其他文件（黑名单除外）
     read_chars: int = 20000  # 长文件分段读，每段多少字
     read_max_mb: float = 20.0  # 超过这么大的文件不读
+
+    @field_validator("group_read_paths", mode="before")
+    @classmethod
+    def _split(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return value
+
+
+class HistorySkillConfig(_Section):
+    """翻聊天记录、看记录里的图（包括当时没看的）。主人私聊什么记录都能翻。
+
+    scope 管群聊和别人的私聊：self = 只能翻当前聊天；groups = 群里还能翻别的群
+    （默认；私聊记录不行，别人的私聊也只能翻自己的）；all = 任何聊天都能翻任何记录，
+    包括主人的私聊（主人私聊里读过的本机文件内容也可能因此被翻到）。
+    """
+
+    enabled: bool = True
+    scope: Literal["self", "groups", "all"] = "groups"
+    page_size: int = 30  # 一次翻多少条
 
 
 class RemindersSkillConfig(_Section):
@@ -340,12 +371,14 @@ class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
     enabled: bool = True  # 总开关
-    max_rounds: int = 3  # 一轮回复里最多连续用几次技能
+    max_rounds: int = 4  # 一轮回复里最多连续用几次技能
+    owner_max_rounds: int = 10  # 主人私聊时（当电脑助手用，经常要连着做好几步）
     max_result_chars: int = 6000  # 交回给她的结果最长多少字
     search: SearchSkillConfig = SearchSkillConfig()
     image: ImageSkillConfig = ImageSkillConfig()
     agent: AgentSkillConfig = AgentSkillConfig()
     files: FilesSkillConfig = FilesSkillConfig()
+    history: HistorySkillConfig = HistorySkillConfig()
     reminders: RemindersSkillConfig = RemindersSkillConfig()
 
 

@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 # 【标记：参数】或 [标记:参数]；“表情”“心情”留给表情包和心情
 MARKER = re.compile(r"[【\[]\s*([^\s【】\[\]：:]{1,6})\s*[：:]\s*(.+?)\s*[】\]]", re.DOTALL)
 RESERVED = {"表情", "心情", "回应", "语音"}
+# 【写文件：路径】后面跟着 <<<内容>>>（内容里可以有任何括号，所以不能放在标记里）
+BLOCK = re.compile(r"\s*<<<[ \t]*\n?(.*)\n?[ \t]*>>>", re.DOTALL)
 
 
 class SkillError(Exception):
@@ -43,6 +45,9 @@ class SkillContext:
     ask: Callable[[str], bool] | None = (
         None  # 向主人请求批准（会阻塞到主人回复或超时）；None = 一律拒绝
     )
+    # 向 QQ 要一条消息里的图片（她回头看当时没看的图）；None = 这个身体做不到
+    fetch_images: Callable[[str], list[bytes]] | None = None
+    touched_local: bool = False  # 这一轮读过本机文件：不能再打开网页，防止内容被带出去
 
 
 @dataclass
@@ -55,6 +60,8 @@ class SkillResult:
     later: Callable[[], SkillResult] | None = None
     report: bool = False  # 后台做完后让她用自己的话把结果告诉对方（而不是直接发图）
     max_chars: int | None = None  # 交回给她时最多多少字（默认按 skills.max_result_chars）
+    view: list[Path] = field(default_factory=list)  # 放进这一轮给她看的图片（JPEG）
+    note: str = ""  # 后台做完记成消息时附带的说明（如存在哪）
 
 
 @dataclass
@@ -75,6 +82,7 @@ class Skill:
     name = ""  # 配置里的键，如 search
     label = ""  # 显示名，如 联网搜索
     markers: ClassVar[dict[str, str]] = {}  # 标记 → 给她看的用法说明
+    takes_block = False  # 标记后面可以跟 <<<内容>>>，内容接在参数后面（用 ｜ 隔开）
 
     def enabled(self) -> bool:
         return True
@@ -115,6 +123,9 @@ class Skills:
             return []
         return [s for s in self.all if s.enabled() and s.allowed(ctx)]
 
+    def can_use(self, marker: str, ctx: SkillContext | None) -> bool:
+        return any(marker in s.markers for s in self.available(ctx))
+
     def prompt(self, ctx: SkillContext | None) -> str | None:
         """写进提示词的技能说明；没有可用技能时返回 None。"""
         skills = self.available(ctx)
@@ -139,12 +150,18 @@ class Skills:
         for match in MARKER.finditer(text):
             skill = by_marker.get(match.group(1))
             if skill is not None:
-                return text[: match.start()].strip(), skill, match.group(1), match.group(2).strip()
+                arg = match.group(2).strip()
+                if skill.takes_block and (block := BLOCK.match(text, match.end())):
+                    arg = f"{arg}｜{block.group(1).rstrip()}"
+                return text[: match.start()].strip(), skill, match.group(1), arg
         return None
 
     def strip_markers(self, text: str) -> str:
         """去掉没被执行的技能标记（不认识的、不可用的、超过次数的）。"""
         known = {m for s in self.all for m in s.markers}
+        for marker in (m for s in self.all if s.takes_block for m in s.markers):
+            text = re.sub(rf"[【\[]\s*{marker}\s*[：:][^】\]]*[】\]]{BLOCK.pattern}", "", text,
+                          flags=re.DOTALL)  # fmt: skip
         return MARKER.sub(
             lambda m: "" if m.group(1) in known and m.group(1) not in RESERVED else m.group(0),
             text,

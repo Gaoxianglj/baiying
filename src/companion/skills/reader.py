@@ -1,7 +1,8 @@
 """读文件：【读文件：路径】【看目录：路径】把内容直接交给她（进她这一轮的上下文，不经过助手）。
+主人私聊还有【找文件：关键词】按名字找这台电脑上的文件。
 
-谁能读什么（路径都解析成真实路径后再判断）：
-- 任何聊天：只能读这个聊天里收到的文件（inbox/日期/聊天/）。私聊发的文件不会被读到群里去。
+谁能读什么看 skills/access.py：
+- 任何聊天：这个聊天里收到的文件和这个聊天的文件夹。私聊发的文件不会被读到群里去。
 - 主人私聊（及本地命令行）：还能读这台电脑上的其他文件和目录，但黑名单（密钥、记忆、登录信息、
   浏览器和密码管理器数据）和看起来像密钥的文件不行。
 
@@ -12,28 +13,24 @@
 
 from __future__ import annotations
 
-import fnmatch
 import logging
+import os
 import re
+import sys
+import time
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Callable
+from datetime import datetime
 from io import BytesIO
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from companion.config import FilesSkillConfig
+from companion.skills.access import IMAGE_SUFFIXES, FileAccess
 from companion.skills.base import Skill, SkillContext, SkillError, SkillResult
-from companion.skills.files import channel_folder, human_size
+from companion.skills.files import human_size
 
 log = logging.getLogger(__name__)
 
-# 不管在哪个目录，这些名字都不读：密钥、证书、登录信息
-SECRET_NAMES = (
-    ".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12", "*.kdbx", "id_rsa*", "id_ed25519*",
-    "id_ecdsa*", ".git-credentials", ".netrc", ".npmrc", ".pypirc", "credentials*", "auth.json",
-    "*token*", "*secret*", "*password*", "*密码*", "*密钥*", "cookies*", "login data",
-    "ntuser.dat", "sam", "system", "security",
-)  # fmt: skip
 MAX_ENTRIES = 200  # 目录、zip 最多列这么多项
 _WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
@@ -92,6 +89,8 @@ def _read_docx(data: bytes, max_bytes: int) -> str:
 def extract_text(name: str, data: bytes, max_bytes: int) -> str:
     """按文件类型读出文字。"""
     suffix = Path(name).suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        raise Unreadable("这是图片，要用【看图：路径】看")
     if suffix == ".pdf":
         return _read_pdf(data)
     if suffix == ".docx":
@@ -139,24 +138,18 @@ class ReadFile(Skill):
         "读文件": "【读文件：路径】把文件内容读给你自己看（文本、PDF、Word，以及 zip 里的文件，"
         "路径写成 某某.zip/里面的路径）。路径用消息里“存在工作文件夹的……”那个；"
         "长文件分段读，读后面的写【读文件：路径｜第几段】。读到的内容只有这一轮能看到，之后要细聊就再读",
-        "看目录": "【看目录：路径】看一个压缩包里有哪些文件",
+        "看目录": "【看目录：路径】看这个聊天的文件夹（写【看目录：.】）、"
+        "里面的子文件夹或一个压缩包里有哪些文件",
     }
     _local_usage = (
-        "【看目录：路径】看一个文件夹或压缩包里有哪些文件。"
-        "在这里（主人私聊）你也能读这台电脑上的其他文件，路径写完整，如 D:/小说/第一章.md"
+        "在这里（主人私聊）【读文件】【看目录】也能用在这台电脑上的其他文件和文件夹，"
+        "路径写完整，如 D:/小说/第一章.md"
     )
 
-    def __init__(
-        self,
-        cfg: FilesSkillConfig,
-        root: Path,
-        workspace: Path,
-        deny: Callable[[], list[Path]],
-    ) -> None:
+    def __init__(self, cfg: FilesSkillConfig, access: FileAccess) -> None:
         self.cfg = cfg
-        self.workspace = workspace if workspace.is_absolute() else root / workspace
-        self.inbox = cfg.inbox if cfg.inbox.is_absolute() else root / cfg.inbox
-        self._deny = deny
+        self.access = access
+        self.workspace = access.workspace
         self._recent: dict[str, list[str]] = {}  # 频道 → 最近读过的路径
 
     def enabled(self) -> bool:
@@ -166,12 +159,9 @@ class ReadFile(Skill):
         scope = "主人私聊还能读本机文件" if self.cfg.read_local else "只读聊天里收到的文件"
         return f"每段 {self.cfg.read_chars} 字；{scope}"
 
-    def _local_allowed(self, ctx: SkillContext) -> bool:
-        return self.cfg.read_local and ctx.owner and ctx.private
-
     def context(self, ctx: SkillContext) -> str:
         notes = []
-        if self._local_allowed(ctx):
+        if self.access.local(ctx):
             notes.append(self._local_usage)
         recent = self._recent.get(ctx.channel)
         if recent:
@@ -184,46 +174,16 @@ class ReadFile(Skill):
 
     def _resolve(self, text: str, ctx: SkillContext) -> tuple[Path, str | None]:
         """她写的路径 → （真实文件或目录，zip 里的路径）。不让读的直接报错。"""
-        raw = text.strip().strip("`'\"“”").replace("\\", "/")
+        raw = text.strip()
         if not raw:
             raise SkillError("没说读哪个文件")
-        if raw.startswith("//") or ":" in PureWindowsPath(raw).as_posix()[2:]:
-            raise SkillError("这个路径不能读")  # 网络路径、NTFS 备用数据流
-        base = self.workspace.resolve()
-        path = Path(raw)
-        if not path.is_absolute():
-            path = base / path
-        path, member = self._split_zip(path)
-        path = path.resolve()
-        self._check(path, ctx)
+        path, member = self.access.locate(raw, ctx)
+        self.access.check_read(path, ctx)
+        if not self.access.in_own_places(path, ctx):
+            ctx.touched_local = True
         if not path.exists():
             raise SkillError(f"没有这个文件：{raw}")
         return path, member
-
-    @staticmethod
-    def _split_zip(path: Path) -> tuple[Path, str | None]:
-        """`x.zip/a/b.md` 拆成压缩包和里面的路径。"""
-        for parent in [path, *path.parents]:
-            if parent.suffix.lower() == ".zip" and parent.is_file():
-                inner = path.relative_to(parent).as_posix()
-                return parent, None if inner == "." else inner
-        return path, None
-
-    def _check(self, path: Path, ctx: SkillContext) -> None:
-        for denied in self._deny():
-            if path.is_relative_to(denied.resolve()):
-                raise SkillError("这个位置不能读（密钥、记忆、登录信息等）")
-        lowered = path.name.lower()
-        if any(fnmatch.fnmatch(lowered, pattern) for pattern in SECRET_NAMES):
-            raise SkillError("这个文件看起来是密钥或登录信息，不能读")
-        if self._local_allowed(ctx):
-            return
-        inbox = self.inbox.resolve()
-        if path.is_relative_to(inbox):
-            parts = path.relative_to(inbox).parts
-            if len(parts) >= 2 and parts[1] == channel_folder(ctx.channel):
-                return
-        raise SkillError("只能读这个聊天里收到的文件")
 
     # ---- 执行 ----
 
@@ -296,6 +256,8 @@ class ReadFile(Skill):
         )
 
     def _list(self, arg: str, ctx: SkillContext) -> SkillResult:
+        if arg.strip() in (".", "./") and not self.access.folder(ctx.channel).exists():
+            return SkillResult("这个聊天的文件夹里还什么都没有。")
         path, member = self._resolve(arg, ctx)
         if path.suffix.lower() == ".zip" and path.is_file():
             try:
@@ -311,12 +273,10 @@ class ReadFile(Skill):
             ]
             where = f"压缩包 {path.name}"
         elif path.is_dir():
-            if not self._local_allowed(ctx):
-                raise SkillError("只能看压缩包里有什么")
             entries = []
             for child in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
                 try:
-                    self._check(child.resolve(), ctx)
+                    self.access.check_read(child.resolve(), ctx)
                     entries.append(
                         f"{child.name}/"
                         if child.is_dir()
@@ -324,7 +284,7 @@ class ReadFile(Skill):
                     )
                 except (SkillError, OSError):
                     continue  # 不能读的不列出来
-            where = f"文件夹 {path}"
+            where = f"文件夹 {self.access.display(path, ctx)}"
         else:
             raise SkillError("这不是文件夹或压缩包，要读文件用【读文件：路径】")
         if not entries:
@@ -335,3 +295,104 @@ class ReadFile(Skill):
             f"{where} 里有：\n" + "\n".join(shown) + tail,
             max_chars=20000,
         )
+
+
+# 按名字找文件时跳过这些文件夹：又大又不会有人要找的东西
+_SKIP_DIRS = {
+    "windows", "program files", "program files (x86)", "programdata", "appdata", "node_modules",
+    "__pycache__", "$recycle.bin", "system volume information", "site-packages",
+}  # fmt: skip
+FIND_LIMIT = 50  # 最多列这么多个
+FIND_SECONDS = 8.0  # 找文件时最多花这么久（期间别的聊天要等）
+
+
+def _fixed_drives() -> list[Path]:
+    """本机硬盘（网络盘、光驱不算）；不是 Windows 就没有。"""
+    if sys.platform != "win32":
+        return []
+    import ctypes
+
+    drive_fixed = 3
+    return [
+        Path(f"{letter}:/")
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+        if ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:/") == drive_fixed
+    ]
+
+
+class FindFile(Skill):
+    """按名字找文件：只在主人私聊里（比看目录省事，不用一层层翻）。"""
+
+    name = "find_files"
+    label = "找文件"
+    markers = {
+        "找文件": "【找文件：关键词】按名字在这台电脑上找文件（几个词用空格隔开，都要出现）；"
+        "知道大概在哪就写【找文件：关键词｜D:/资料】，更快",
+    }
+
+    def __init__(self, cfg: FilesSkillConfig, access: FileAccess) -> None:
+        self.cfg = cfg
+        self.access = access
+
+    def enabled(self) -> bool:
+        return self.cfg.enabled and self.cfg.read_enabled
+
+    def allowed(self, ctx: SkillContext) -> bool:
+        return self.access.local(ctx)
+
+    def status(self) -> str:
+        return "只限主人私聊；不进系统文件夹，黑名单里的不列"
+
+    def run(self, marker: str, arg: str, ctx: SkillContext) -> SkillResult:
+        words_text, _, where = arg.replace("|", "｜").partition("｜")
+        words = words_text.lower().split()
+        if not words:
+            raise SkillError("没说找什么")
+        ctx.touched_local = True
+        if where.strip():
+            root, _ = self.access.locate(where, ctx)
+            self.access.check_read(root, ctx)
+            roots = [root]
+        else:
+            home = Path.home()
+            roots = [home / n for n in ("Desktop", "Documents", "Downloads", "Pictures")]
+            roots += [self.access.workspace, *_fixed_drives()]
+        found, complete = self._search(roots, words, ctx)
+        if not found:
+            more = "" if complete else "（时间到了，没找完；写上大概在哪个文件夹会更快）"
+            return SkillResult(f"没找到名字里有“{words_text.strip()}”的文件{more}。")
+        lines = []
+        for path in found:
+            info = path.stat()
+            when = datetime.fromtimestamp(info.st_mtime).strftime("%Y-%m-%d")
+            lines.append(f"{path.as_posix()}（{human_size(info.st_size)}，{when}）")
+        tail = "" if complete else "\n……（没找完，可能还有；写上大概在哪个文件夹会更快）"
+        return SkillResult("找到这些：\n" + "\n".join(lines) + tail, max_chars=20000)
+
+    def _search(
+        self, roots: list[Path], words: list[str], ctx: SkillContext
+    ) -> tuple[list[Path], bool]:
+        deadline = time.monotonic() + FIND_SECONDS
+        found: dict[Path, None] = {}
+        seen: set[Path] = set()
+        for root in roots:
+            for folder, dirs, names in os.walk(root):
+                here = Path(folder)
+                if here in seen:
+                    dirs[:] = []
+                    continue
+                seen.add(here)
+                dirs[:] = [d for d in dirs if d.lower() not in _SKIP_DIRS and not d.startswith(".")]
+                for name in names:
+                    if all(word in name.lower() for word in words):
+                        path = here / name
+                        try:
+                            self.access.check_read(path.resolve(), ctx)
+                        except (SkillError, OSError):
+                            continue
+                        found[path] = None
+                        if len(found) >= FIND_LIMIT:
+                            return list(found), False
+                if time.monotonic() > deadline:
+                    return list(found), False
+        return list(found), True

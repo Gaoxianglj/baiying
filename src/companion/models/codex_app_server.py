@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ INSTRUCTIONS = """你是一个对话代理，不是编程助手。
 """
 
 IMAGE_INSTRUCTIONS = """你是一个画师。用你的生图工具，按要求画一张图（只画一张）。
+如果附了图片，那是参考图：按要求参考它的角色、风格或构图。
 不要执行命令，不要读写文件。画完只回复“好了”。如果不能画，简短说明原因。
 """
 
@@ -250,8 +252,10 @@ class CodexAppServerBackend:
                 seconds=time.perf_counter() - started,
             )
 
-    def generate_image(self, prompt: str) -> tuple[Path, str]:
-        """用 Codex 内置的生图工具画一张图，返回（图片路径，模型改写后的画面描述）。"""
+    def generate_image(self, prompt: str, references: Sequence[Path] = ()) -> tuple[Path, str]:
+        """用 Codex 内置的生图工具画一张图，返回（图片路径，模型改写后的画面描述）。
+
+        references：参考图（调用方查过权限的本地文件），实测能保持角色和风格（2026-11-08）。"""
         with self._lock:
             self.start()
             thread = self._request(
@@ -269,7 +273,8 @@ class CodexAppServerBackend:
                 raise ModelError(f"thread/start 返回异常：{str(thread)[:200]}")
             turn: dict[str, Any] = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": f"请画：{prompt}"}],
+                "input": [{"type": "text", "text": f"请画：{prompt}"}]
+                + [{"type": "localImage", "path": str(p.resolve())} for p in references],
             }
             if self.effort:
                 turn["effort"] = self.effort

@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from companion.bodies.qq.bot import QQBot
 from companion.config import QQConfig, load_config
@@ -129,6 +130,34 @@ def test_group_chat_stays_in_group(bot):
     run(bot, msg("晚安呀", group=GROUP, at_bot=True, mid=8), poke(group=GROUP))
     assert_only_group(bot, GROUP)
     assert_nothing_forbidden(bot)
+
+
+def test_saved_files_and_pictures_only_reach_this_chat(bot):
+    """存图、发图、发文件、做图册：发出去的只到触发它的聊天，别的群和私聊一条都没有。"""
+    folder = bot.c.config.root / "data" / "workspace" / "chats" / f"group-{GROUP}" / "花册"
+    folder.mkdir(parents=True)
+    Image.new("RGB", (20, 20), "red").save(folder / "玫瑰.png", "PNG")
+    (folder.parent / "目录.md").write_text("目录", "utf-8")
+    replies = iter(
+        ["【发图：花册/玫瑰.png】", "【发文件：目录.md】", "【做图册：花册｜春】", "好了"]
+    )
+    bot.c.gateway.fallback.client.handler = lambda m, j: next(replies)
+    run(bot, msg("都发出来", group=GROUP, at_bot=True, mid=9))
+    assert_only_group(bot, GROUP)
+    used = {a for a, _ in bot.client.sent}
+    assert "upload_group_file" in used and "send_group_msg" in used
+    assert sum(a == "upload_group_file" for a, _ in bot.client.sent) == 2
+    assert_nothing_forbidden(bot)
+
+
+def test_owner_private_files_only_reach_the_owner(bot, tmp_path):
+    doc = tmp_path / "报告.txt"
+    doc.write_text("x", "utf-8")
+    replies = iter([f"【发文件：{doc}】", "好了"])
+    bot.c.gateway.fallback.client.handler = lambda m, j: next(replies)
+    run(bot, msg("把报告发我", user=OWNER, mid=10))
+    assert_only_private(bot, OWNER)
+    assert any(a == "upload_private_file" for a, _ in bot.client.sent)
 
 
 def test_poke_only_back_at_who_poked(bot):

@@ -27,9 +27,11 @@ class FakePainter:
         self.tmp_path = tmp_path
         self.fail = fail
         self.prompts: list[str] = []
+        self.references: list[tuple] = []
 
-    def generate_image(self, prompt):
+    def generate_image(self, prompt, references=()):
         self.prompts.append(prompt)
+        self.references.append(tuple(references))
         if self.fail:
             raise ModelError("内容不合适")
         path = self.tmp_path / f"gen{len(self.prompts)}.png"
@@ -51,11 +53,21 @@ def test_paints_in_background(tmp_path):
     result = skill.run("画", "橘猫睡在键盘上", PRIVATE_CTX)
     assert painter.prompts == []  # 还没开始画
     assert "不要说已经画好了" in result.text and result.later is not None
-    with pytest.raises(SkillError, match="正在画另一张"):
-        skill.run("画", "第二张", PRIVATE_CTX)
     done = result.later()
     assert done.ok and done.images[0].exists() and done.text == "水彩：橘猫睡在键盘上"
-    assert skill.run("画", "第二张", PRIVATE_CTX).later is not None  # 画完就能再画
+
+
+def test_paintings_queue_up(tmp_path):
+    painter = FakePainter(tmp_path)
+    skill = make_skill(tmp_path, painter, {"now": T0}, queue_limit=2)
+    first = skill.run("画", "玫瑰", PRIVATE_CTX)
+    second = skill.run("画", "百合", PRIVATE_CTX)
+    assert "前面还有 1 张" in second.text
+    with pytest.raises(SkillError, match="已经排了 2 张"):
+        skill.run("画", "第三张", PRIVATE_CTX)
+    assert first.later().ok and second.later().ok
+    assert painter.prompts == ["玫瑰", "百合"]
+    assert skill.run("画", "第三张", PRIVATE_CTX).later is not None  # 画完就又能排了
 
 
 def test_group_limit_shared_and_persisted(tmp_path):

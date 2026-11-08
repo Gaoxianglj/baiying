@@ -1,7 +1,8 @@
 """图片：下载、去重保存、交给主模型看。
 
 看图的结果是一句中文描述，写进事件正文，这样记忆始终是文字，换任何模型都能读懂。
-图片统一转成 JPEG、长边缩到上限，按内容哈希命名存在记忆文件夹的 media/ 下（不进 git）。
+图片统一转成 JPEG、长边缩到上限，按内容哈希命名存在记忆文件夹的 media/ 下（不进 git）；
+原图也留着（<哈希>.orig.png 之类）：她存图、发动图时用，“忘掉”时一起删。
 """
 
 from __future__ import annotations
@@ -37,41 +38,119 @@ class StoredImage:
     path: Path
 
 
+_SUFFIXES = {"JPEG": ".jpg", "PNG": ".png", "GIF": ".gif", "WEBP": ".webp", "BMP": ".bmp"}
+
+
+def image_suffix(data: bytes) -> str:
+    """这段字节实际是什么图片格式（看内容，不信文件名）；不是图片就抛 MediaError。"""
+    try:
+        return _SUFFIXES.get(Image.open(io.BytesIO(data)).format or "", ".png")
+    except (UnidentifiedImageError, OSError) as e:
+        raise MediaError(f"无法识别的图片格式：{e}") from e
+
+
 class MediaStore:
-    def __init__(self, root: Path, *, max_side: int = 1024, max_bytes: int = 10_000_000) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_side: int = 1024,
+        max_bytes: int = 10_000_000,
+        keep_originals: bool = True,
+    ) -> None:
         self.root = root
         self.max_side = max_side
         self.max_bytes = max_bytes
+        self.keep_originals = keep_originals
 
     def path_for(self, digest: str) -> Path:
         return self.root / f"{digest}.jpg"
+
+    def original_for(self, digest: str) -> Path | None:
+        """原图；以前存的图没留原图，就是 None。"""
+        return next(iter(sorted(self.root.glob(f"{digest}.orig.*"))), None)
 
     def save(self, data: bytes) -> StoredImage:
         if len(data) > self.max_bytes:
             raise MediaError(f"图片太大（{len(data) // 1024} KB）")
         digest = hashlib.sha256(data).hexdigest()[:20]
         path = self.path_for(digest)
-        if path.exists():
-            return StoredImage(digest, path)
-        try:
-            img = Image.open(io.BytesIO(data))
-            img.seek(0)  # 动图只取第一帧
-            img = img.convert("RGB")
-        except (UnidentifiedImageError, OSError, EOFError) as e:
-            raise MediaError(f"无法识别的图片格式：{e}") from e
-        img.thumbnail((self.max_side, self.max_side))
-        self.root.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        img.save(tmp, "JPEG", quality=88)
-        tmp.replace(path)
+        if not path.exists():
+            try:
+                img = Image.open(io.BytesIO(data))
+                img.seek(0)  # 动图只取第一帧
+                img = img.convert("RGB")
+            except (UnidentifiedImageError, OSError, EOFError) as e:
+                raise MediaError(f"无法识别的图片格式：{e}") from e
+            img.thumbnail((self.max_side, self.max_side))
+            self.root.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            img.save(tmp, "JPEG", quality=88)
+            tmp.replace(path)
+        if self.keep_originals and self.original_for(digest) is None:
+            original = self.root / f"{digest}.orig{image_suffix(data)}"
+            tmp = original.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(original)
         return StoredImage(digest, path)
 
     def delete(self, digest: str) -> bool:
         path = self.path_for(digest)
+        original = self.original_for(digest)
+        if original is not None:
+            original.unlink()
         if path.exists():
             path.unlink()
             return True
         return False
+
+
+def sheet_to_gif(
+    sheet: Path,
+    out: Path,
+    *,
+    grid: int = 4,
+    frame_ms: int = 120,
+    max_side: int = 320,
+) -> Path:
+    """把一张 grid×grid 的精灵图切开，合成循环的 GIF。
+
+    Codex 的生图工具做不了多帧（2026-11-08 实测会直接拒绝），但画一张排列整齐的 16 格图很稳：
+    每帧的主体对得很齐（误差不到 1 像素），一共只花一张图的额度。
+    """
+    with Image.open(sheet) as raw:
+        img = raw.convert("RGB")
+    # 边界要四舍五入：1254 / 4 = 313.5，直接取整会让后面的格子一格比一格偏
+    xs = [round(i * img.width / grid) for i in range(grid + 1)]
+    ys = [round(i * img.height / grid) for i in range(grid + 1)]
+    frames = [
+        img.crop((xs[c], ys[r], xs[c + 1], ys[r + 1])) for r in range(grid) for c in range(grid)
+    ]
+    size = min(frame.size for frame in frames)
+    scale = min(max_side / max(size), 1.0)
+    size = (max(round(size[0] * scale), 1), max(round(size[1] * scale), 1))
+    frames = [frame.resize(size, Image.Resampling.LANCZOS) for frame in frames]
+    # 所有帧共用一套调色板，不然背景会一帧一帧地闪
+    palette = img.resize((512, 512)).quantize(colors=255, method=Image.Quantize.MEDIANCUT)
+    paletted = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in frames]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    paletted[0].save(
+        out, "GIF", save_all=True, append_images=paletted[1:], duration=frame_ms, loop=0
+    )
+    return out
+
+
+def image_refs(meta: dict[str, object], content: str) -> list[str]:
+    """一条消息里的图片编号：看过的图用哈希开头；没看的用 m + 消息编号（要看时再向 QQ 取）。"""
+    images = meta.get("images")
+    refs = [str(d)[:8] for d in images] if isinstance(images, list) else []
+    message_id = meta.get("message_id")
+    if message_id and _UNSEEN.search(content):
+        refs.append(f"m{message_id}")
+    return refs
+
+
+_UNSEEN = re.compile(r"\[(图片|表情包)（没")
 
 
 def describe(gateway: ModelGateway, image: Path) -> tuple[str, str]:

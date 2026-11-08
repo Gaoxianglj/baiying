@@ -65,9 +65,23 @@ LONG_CHUNK = 400  # 打包成聊天记录时，每条最多这么多字
 NOTICE = """大家好，我是{name}，一个 AI。
 我会记住群里的聊天，这样以后还能记得和大家一起经历过的事。
 记忆保存在主人的电脑上；聊天时，相关的内容会发给 AI 模型服务（OpenAI 或 DeepSeek）用来生成回复。
-图片：只有发给我的、或我刚在群里说完话那一分钟里的图片，我才会看（也会发给模型服务），并保存在主人电脑上；其他时候的图片我不看也不存。
+图片：发给我的、或我刚在群里说完话那一分钟里的图片，我会直接看；其他时候的图片平时不看，\
+但有人让我翻记录时可能回头看。看过的会发给模型服务，并保存在主人电脑上。
+聊天记录：我可以翻这个群的记录，也可能在主人接入的其他群里被问到时翻\
+（私聊的记录不会被翻到群里）。主人也能让我翻。
+群文件夹：这个群有自己的文件夹（在主人电脑上）。我可以把图片和文字存进去，也可以发给群里任何人。\
+存进去的东西不受 /忘掉 影响，要删请找主人。
 想让我记住什么：发「/记住 内容」
 想让我忘掉什么：发「/忘掉 关键词」，我会列出相关的记忆让你挑"""
+
+NOTICE_UPDATE = """我能做的事多了一些，和大家说一声：
+图片：平时没看的图片，有人让我翻记录时我可能回头看\
+（看过的会发给模型服务，并保存在主人电脑上）。
+聊天记录：我可以翻这个群的记录，也可能在主人接入的其他群里被问到时翻\
+（私聊的记录不会被翻到群里）。主人也能让我翻。
+群文件夹：这个群有了自己的文件夹（在主人电脑上）。我可以把图片和文字存进去，也可以发给群里任何人。\
+存进去的东西不受 /忘掉 影响，要删请找主人。
+完整说明发「/说明」。"""
 
 HELP = """可用指令：
 /记住 内容 —— 立刻记下，不会忘
@@ -455,7 +469,9 @@ class QQBot:
 
     async def _reply_batch(self, pending: _Pending) -> None:
         src = pending.sources[-1]
-        if not self._can_send():
+        # 上限是防刷屏、防风控的；主人私聊是一对一，当电脑助手用时连着说几句很正常，不能悄悄不回
+        owner_private = src.message_type == "private" and src.user_id in self.cfg.owner_accounts
+        if not owner_private and not self._can_send():
             log.warning("发言过于频繁，这一轮只记录不回复")
             return
         loop = asyncio.get_running_loop()
@@ -473,6 +489,9 @@ class QQBot:
             now=src.received_at,
             notify=interim,
             ask=lambda question: self._ask_owner(src, question, loop),
+            fetch_images=lambda message_id: asyncio.run_coroutine_threadsafe(
+                self._message_images(message_id), loop
+            ).result(timeout=90),
         )
         try:
             reply = await self._call(
@@ -964,6 +983,21 @@ class QQBot:
             raise MediaError("拿不到图片地址")
         return await asyncio.to_thread(media.fetch, url, max_bytes=max_bytes)
 
+    async def _message_images(self, message_id: str) -> list[bytes]:
+        """（她回头看当时没看的图）向 QQ 要这条消息里的图片。
+
+        不能经过工作线程：它正在等这里的结果。"""
+        msg = await self._get_message(message_id)
+        if msg is None:
+            return []
+        out = []
+        for ref in parse_segments(msg.get("message"), self.self_id).images:
+            try:
+                out.append(await self._download(ref))
+            except (MediaError, OneBotError, OSError) as e:
+                log.info("取消息 %s 的图片失败：%s", message_id, e)
+        return out
+
     async def _get_message(self, message_id: str) -> dict[str, Any] | None:
         try:
             msg = await self.client.call("get_msg", {"message_id": int(message_id)})
@@ -1053,22 +1087,23 @@ class QQBot:
         """第一次接入某个群时，主动说明她会怎样使用聊天记录（每个群只说一次）。"""
         for gid in self.cfg.groups:
             key = f"announced:group:{gid}"
-            if await self._call(self.c.index.get_meta, key):
+            updated_key = f"announced_v2:group:{gid}"  # 能翻记录、有群文件夹以后，要再说一次
+            told = await self._call(self.c.index.get_meta, key)
+            if told and await self._call(self.c.index.get_meta, updated_key):
                 continue
+            text = NOTICE_UPDATE if told else NOTICE.format(name=self.c.name)
             try:
                 data = await self.client.call(
-                    "send_group_msg",
-                    {
-                        "group_id": int(gid),
-                        "message": text_segments(NOTICE.format(name=self.c.name)),
-                    },
+                    "send_group_msg", {"group_id": int(gid), "message": text_segments(text)}
                 )
             except OneBotError as e:
                 log.error("向群 %s 发送说明失败：%s", gid, e)
                 continue
             if isinstance(data, dict) and data.get("message_id") is not None:
                 self._sent_ids.append(str(data["message_id"]))
-            await self._call(self.c.index.set_meta, key, self.now().isoformat())
+            stamp = self.now().isoformat()
+            await self._call(self.c.index.set_meta, key, stamp)
+            await self._call(self.c.index.set_meta, updated_key, stamp)
 
     async def _send_sticker(self, src: Source, digest: str) -> None:
         await self._send_image(src, self.c.stickers.image_path(digest), sticker=True)
@@ -1086,9 +1121,11 @@ class QQBot:
         else:
             action, params = "send_private_msg", {"user_id": int(src.user_id), "message": [segment]}
         try:
-            await self.client.call(action, params)
-        except OneBotError as e:
+            await self.client.call(action, params, timeout=60.0)  # 动图、原图比压缩过的大不少
+        except (OneBotError, TimeoutError) as e:
             log.error("发送图片失败：%s", e)
+            if not sticker:
+                await self._send(src, f"（图片 {path.name} 没发出去）")
             return
         self._last_spoke[src.channel] = self.now()
 

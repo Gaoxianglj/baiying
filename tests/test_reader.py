@@ -14,6 +14,7 @@ from companion.config import FilesSkillConfig, QQConfig, load_config
 from companion.core.companion import Companion
 from companion.memory import MemoryLayout, init_memory
 from companion.skills import SkillContext
+from companion.skills.access import FileAccess
 from companion.skills.base import SkillError
 from companion.skills.files import FileInbox
 from companion.skills.reader import ReadFile, decode_text, extract_text
@@ -35,7 +36,7 @@ def setup(tmp_path):
     secret_dir.mkdir()
     (secret_dir / "note.txt").write_text("机密", "utf-8")
     cfg = FilesSkillConfig(inbox=ws / "inbox", read_chars=100)
-    skill = ReadFile(cfg, tmp_path, ws, lambda: [secret_dir])
+    skill = ReadFile(cfg, FileAccess(cfg, tmp_path, ws, lambda: [secret_dir]))
     inbox = FileInbox(cfg, tmp_path, ws)
     return skill, inbox, tmp_path, cfg
 
@@ -74,13 +75,16 @@ def test_local_files_only_for_owner_in_private(setup):
         skill.run("读文件", str(doc), OWNER_PRIVATE)
 
 
-def test_only_owner_can_list_folders(setup):
-    skill, inbox, _, _ = setup
+def test_folders_can_be_listed_where_they_can_be_read(setup):
+    skill, inbox, root, _ = setup
     saved = inbox.save("a.txt", b"x", T0, f"private:{FRIEND}")
     folder = saved.parent.relative_to(skill.workspace).as_posix()
-    with pytest.raises(SkillError, match="只能看压缩包"):  # 自己聊天的收件夹也只读文件，不列目录
-        skill.run("看目录", folder, FRIEND_PRIVATE)
-    assert "a.txt" in skill.run("看目录", folder, OWNER_PRIVATE).text
+    assert "a.txt" in skill.run("看目录", folder, FRIEND_PRIVATE).text  # 自己聊天收到的
+    assert "a.txt" in skill.run("看目录", folder, OWNER_PRIVATE).text  # 主人能看本机文件夹
+    with pytest.raises(SkillError, match="只能读这个聊天"):  # 别的聊天不行
+        skill.run("看目录", folder, FRIEND_IN_GROUP)
+    with pytest.raises(SkillError, match="只能读这个聊天"):  # 本机其他文件夹也不行
+        skill.run("看目录", str(root), FRIEND_IN_GROUP)
 
 
 @pytest.mark.parametrize(
@@ -179,6 +183,7 @@ def test_local_usage_only_told_to_owner_in_private(setup):
     skill, _, _, _ = setup
     assert "这台电脑" in skill.context(OWNER_PRIVATE)
     assert "这台电脑" not in skill.context(OWNER_IN_GROUP)
+    assert "这台电脑" not in skill.markers["看目录"]
 
 
 # ---- 格式 ----

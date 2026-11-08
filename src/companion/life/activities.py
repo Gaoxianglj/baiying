@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +41,7 @@ class LifeBackend(Protocol):
         self, messages: list[ChatMessage], *, json_schema: dict[str, Any] | None = None
     ) -> ChatResult: ...
 
-    def generate_image(self, prompt: str) -> tuple[Path, str]: ...
+    def generate_image(self, prompt: str, references: Sequence[Path] = ()) -> tuple[Path, str]: ...
 
     def close(self) -> None: ...
 

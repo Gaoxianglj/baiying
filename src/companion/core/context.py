@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from companion.config import QQConfig, RetrievalConfig
 from companion.core.retrieval import HybridRetriever
+from companion.media import image_refs
 from companion.memory import forgetting
 from companion.memory.events import Event, EventLog
 from companion.memory.index import Episode, Fact, MemoryIndex, MemoryKind
@@ -155,9 +156,11 @@ class ContextAssembler:
         extra_sections: list[str] | None = None,
         reminder: bool = True,
         initiative: str | None = None,
+        show_image_refs: bool = False,
     ) -> ContextBundle:
         """reminder：在消息最后再提醒一次要不要接话、别重复开头（转述任务结果等场合不需要）。
-        initiative：她主动开口（如早安）时的说明，放在最后；这时不加对方的话，也不加提醒。"""
+        initiative：她主动开口（如早安）时的说明，放在最后；这时不加对方的话，也不加提醒。
+        show_image_refs：消息后面标上图片编号（她有看图、存图这些技能时）。"""
         now = now or datetime.now(UTC)
         person_id = self.people.canonical(person_id)
         person = self.people.get(person_id)
@@ -170,7 +173,7 @@ class ContextAssembler:
         ][: self.cfg.recent_episodes]
         skip = {("fact", f.id) for f in facts} | {("episode", e.id) for e in shared}
         recalled = self._recall(query, now, skip)
-        dialogue, openings = self._recent(channel, now)
+        dialogue, openings = self._recent(channel, now, show_image_refs)
 
         qq_group = body == "qq" and channel.startswith("group:")
         stable = self._stable(reply_mode, sticker_emotions, extra_sections, qq_group, body == "qq")
@@ -224,7 +227,9 @@ class ContextAssembler:
         out.sort(key=lambda x: x.score, reverse=True)
         return out[: self.cfg.limit]
 
-    def _recent(self, channel: str, now: datetime) -> tuple[list[ChatMessage], list[str]]:
+    def _recent(
+        self, channel: str, now: datetime, show_refs: bool
+    ) -> tuple[list[ChatMessage], list[str]]:
         """同一频道最近的对话；以及她最近（不分频道）说过的话的开头，用来提醒她换个说法。"""
         since = now - timedelta(hours=self.cfg.recent_hours)
         window = now - timedelta(hours=max(self.cfg.recent_hours, OPENINGS_HOURS))
@@ -241,13 +246,15 @@ class ContextAssembler:
         ]
         latest = list(dict.fromkeys(o for o in map(_opening, reversed(mine)) if o))
         openings = latest[:OPENINGS_COUNT][::-1]  # 去重后最近的几个，按时间先后排
-        return [self._as_message(e) for e in dialogue], openings
+        return [self._as_message(e, show_refs) for e in dialogue], openings
 
-    def _as_message(self, e: Event) -> ChatMessage:
+    def _as_message(self, e: Event, show_refs: bool = False) -> ChatMessage:
+        refs = image_refs(e.meta, e.content) if show_refs else []
+        note = f"（图片编号：{'、'.join(refs)}）" if refs else ""
         if e.actor.person_id == SELF_ID:
-            return ChatMessage("assistant", e.content)
+            return ChatMessage("assistant", e.content + note)
         who = e.actor.display_name or self._display(e.actor.person_id) or e.actor.platform_id
-        return ChatMessage("user", f"{who}：{e.content}")
+        return ChatMessage("user", f"{who}：{e.content}{note}")
 
     def _display(self, person_id: str | None) -> str | None:
         if person_id is None:

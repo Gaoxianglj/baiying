@@ -141,7 +141,7 @@ def test_failure_is_reported_back(tmp_path):
 def test_round_limit_strips_leftover_marker(tmp_path):
     brain = Brain("嗯【搜索：再来】")  # 每次都想再搜
     c = make(tmp_path, brain, [Echo()])
-    c.config.skills.max_rounds = 2
+    c.config.skills.owner_max_rounds = 2  # 命令行算主人私聊
     try:
         r = c.reply(body="cli", channel="cli:x", account="x", text="查", now=T0)
         assert len(r.skill_calls) == 2 and len(brain.requests) == 3
