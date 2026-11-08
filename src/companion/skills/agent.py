@@ -1,6 +1,7 @@
 """Agent：让独立的 Codex 进程替主人干活（整理文件、写脚本、查资料……）。
 
-- 【任务：要做的事】：只限主人私聊或本地命令行。她先回一句，任务在后台跑，做完她用自己的话汇报。
+- 【任务：要做的事】：只限主人私聊或本地命令行（群聊另有沙箱版，见 group_agent.py）。
+  她先回一句，任务在后台跑，做完她用自己的话汇报。
 - 每个任务启动一个新的 `codex app-server`，用专属权限配置：
   工作文件夹（默认 data/workspace）可读写；其余位置只读；黑名单路径连读都不行。
   实测 Windows 沙箱会真正拦下黑名单读取和工作文件夹外的写入（2026-10-24）。
@@ -82,15 +83,14 @@ def default_deny(root: Path) -> list[Path]:
 
 def permission_overrides(workspace: Path, deny: list[Path], *, web_search: bool) -> dict[str, str]:
     """专属权限配置（`-c` 覆盖项）：以只读为底，工作文件夹可写，黑名单禁止读取，审批交给我们。"""
-    entries = {_toml_path(workspace): "write"}
+    entries = {toml_path(workspace): "write"}
     for path in deny:
         if path.exists():  # 不存在的路径 Codex 会报错；之后出现的会在下一个任务启动时加上
-            entries[_toml_path(path)] = "deny"
-    table = "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in entries.items()) + "}"
+            entries[toml_path(path)] = "deny"
     return {
         "default_permissions": '"companion_agent"',
         "permissions.companion_agent.extends": '":read-only"',
-        "permissions.companion_agent.filesystem": table,
+        "permissions.companion_agent.filesystem": toml_table(entries),
         "permissions.companion_agent.network.enabled": "true",
         "approval_policy": '"on-request"',
         "approvals_reviewer": '"user"',  # 不让 Codex 自己审，转给主人
@@ -98,8 +98,12 @@ def permission_overrides(workspace: Path, deny: list[Path], *, web_search: bool)
     }
 
 
-def _toml_path(path: Path) -> str:
+def toml_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/")
+
+
+def toml_table(entries: dict[str, str]) -> str:
+    return "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in entries.items()) + "}"
 
 
 @dataclass
@@ -125,6 +129,10 @@ class AgentRun:
         progress: Callable[[str], None] | None,
         timeout: float,
         progress_every: float,
+        preamble: str = TASK_PREAMBLE,
+        approval_policy: str = "on-request",
+        cwd: Path | None = None,
+        on_thread: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.backend = backend
         self.workspace = workspace
@@ -133,6 +141,10 @@ class AgentRun:
         self.progress = progress
         self.timeout = timeout
         self.progress_every = progress_every
+        self.preamble = preamble
+        self.approval_policy = approval_policy
+        self.cwd = cwd or workspace  # 线程的工作目录；app-server 会加载这里的 .codex/config.toml
+        self.on_thread = on_thread  # 拿到线程实际生效的配置后、开始干活前，可以在这里拦下
         self.cancelled = threading.Event()
         self.tokens = (0, 0)  # 输入、输出 token
 
@@ -142,12 +154,14 @@ class AgentRun:
         b.start()
         thread = b._request(
             "thread/start",
-            {"cwd": str(self.workspace), "approvalPolicy": "on-request", "ephemeral": True},
+            {"cwd": str(self.cwd), "approvalPolicy": self.approval_policy, "ephemeral": True},
         )
         thread_id = (thread.get("thread") or {}).get("id")
         if not thread_id:
             raise ModelError(f"thread/start 返回异常：{str(thread)[:200]}")
-        text = TASK_PREAMBLE.format(workspace=self.workspace, task=task)
+        if self.on_thread is not None:
+            self.on_thread(thread)
+        text = self.preamble.format(workspace=self.workspace, task=task)
         params: dict[str, Any] = {"threadId": thread_id, "input": [{"type": "text", "text": text}]}
         if self.effort:
             params["effort"] = self.effort

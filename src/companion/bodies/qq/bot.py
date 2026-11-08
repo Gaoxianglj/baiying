@@ -1214,9 +1214,9 @@ class QQBot:
             entry[0].set()
             await self._send(src, "好，批准了。" if cmd == "批准" else "好，拒绝了。")
         elif cmd == "停止任务" and is_owner:
-            agent = next((s for s in self.c.skills.all if s.name == "agent"), None)
-            stopped = agent is not None and agent.cancel()  # type: ignore[attr-defined]
-            await self._send(src, "好，让助手停下了。" if stopped else "现在没有在做的任务。")
+            agents = [s for s in self.c.skills.all if s.name in ("agent", "group_agent")]
+            stopped = [agent.cancel() for agent in agents]  # type: ignore[attr-defined]
+            await self._send(src, "好，让助手停下了。" if any(stopped) else "现在没有在做的任务。")
         elif cmd in ("帮助", "help"):
             await self._send(src, HELP)
         # 其他以 / 开头的消息不理会，避免和别的机器人抢指令

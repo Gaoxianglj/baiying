@@ -413,18 +413,31 @@ _LOCKED_FEATURES = (
 )
 
 
+def _mcp_server_names() -> list[str]:
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    return list(config.get("mcp_servers") or {})
+
+
+def _can_switch_off(name: str) -> bool:
+    return name.replace("_", "").replace("-", "").isalnum()  # 别的字符写不进 -c 的点号路径
+
+
 def lockdown_overrides() -> dict[str, str]:
     """关掉用户 Codex 配置里的 MCP 服务器和各种能碰到本机的工具（只读配置里的名字）。"""
     out = {f"features.{name}": "false" for name in _LOCKED_FEATURES}
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    try:
-        servers = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return out
-    for name in servers.get("mcp_servers") or {}:
-        if name.replace("_", "").replace("-", "").isalnum():
+    for name in _mcp_server_names():
+        if _can_switch_off(name):
             out[f"mcp_servers.{name}.enabled"] = "false"
     return out
+
+
+def stuck_mcp_servers() -> list[str]:
+    """lockdown_overrides 关不掉的 MCP 服务器：名字特殊，会留在 Codex 进程里。"""
+    return [name for name in _mcp_server_names() if not _can_switch_off(name)]
 
 
 # 只负责“说话”的进程（聊天、画画、自主活动）不需要的工具。

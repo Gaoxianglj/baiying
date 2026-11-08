@@ -316,6 +316,31 @@ class AgentSkillConfig(_Section):
         return value
 
 
+class GroupAgentConfig(_Section):
+    """群聊里的沙箱助手：独立的 Codex 进程，只能读写这个群的文件夹，连不了网。
+
+    群里的人能让她做任何事，所以限制由沙箱和程序保证：越权一律拒绝，不转给主人；
+    只用 GPT 订阅额度，不用 DeepSeek 兜底。实测依据见 docs/project-plan.md 决策记录。
+    """
+
+    enabled: bool = False
+    limit_per_group: int = 3  # 每个群在一个窗口里最多做几个任务
+    limit_all_groups: int = 10  # 所有群加起来
+    window_hours: float = 24.0
+    task_timeout_minutes: float = 10.0
+    effort: str = "low"
+    # 沙箱里能用的程序（只读）；不存在的跳过。配成整个盘、用户文件夹或项目文件夹会被忽略
+    tool_paths: list[str] = ["C:/Python314", "C:/Program Files/nodejs"]
+    extra_deny: list[str] = []  # 另外不许读的路径（权限设得很松的软件目录，审计时发现了就加）
+
+    @field_validator("tool_paths", "extra_deny", mode="before")
+    @classmethod
+    def _split(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return value
+
+
 class FilesSkillConfig(_Section):
     """文件。每个聊天有自己的文件夹（工作文件夹的 chats/聊天/）：能存新文件、能读、能发。
 
@@ -377,6 +402,7 @@ class SkillsConfig(_Section):
     search: SearchSkillConfig = SearchSkillConfig()
     image: ImageSkillConfig = ImageSkillConfig()
     agent: AgentSkillConfig = AgentSkillConfig()
+    group_agent: GroupAgentConfig = GroupAgentConfig()
     files: FilesSkillConfig = FilesSkillConfig()
     history: HistorySkillConfig = HistorySkillConfig()
     reminders: RemindersSkillConfig = RemindersSkillConfig()

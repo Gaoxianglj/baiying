@@ -5,6 +5,7 @@
   主动开口只能是主人私聊；
 - 只读动作（get_ / fetch_ / ocr_）里不能有已知会顺手发消息的（get_ai_record）；
 - 补离线消息只读不发；不在允许名单里的群，什么都不发。
+- 群助手的结果和产出只回到派任务的群；越权请求不会发给主人。
 """
 
 import asyncio
@@ -20,7 +21,9 @@ from companion.bodies.qq.bot import QQBot
 from companion.config import QQConfig, load_config
 from companion.core.companion import Companion
 from companion.memory import MemoryLayout, init_memory
+from companion.skills import group_agent
 from tests.fakes import FakeEmbedder, scripted_gateway
+from tests.test_agent import FakeProc, approval, done
 from tests.test_qq import FakeClient
 
 BOT, OWNER, FRIEND, GROUP, OTHER_GROUP = "1000", "2000", "3000", "4000", "5000"
@@ -212,3 +215,86 @@ def test_proactive_greeting_goes_only_to_owner(bot):
     assert_nothing_forbidden(bot)
     assert not any(a in ("send_poke", "set_msg_emoji_like") for a, _ in bot.client.sent)
     assert owner
+
+
+# ---------- 群助手 ----------
+
+
+class WritingProc(FakeProc):
+    """假的 Codex 进程：开始干活时在群文件夹里写一个文件。"""
+
+    def __init__(self, script, folder):
+        super().__init__(script)
+        self.folder = folder
+
+    def _request(self, method, params):
+        if method == "turn/start":
+            self.folder.mkdir(parents=True, exist_ok=True)
+            (self.folder / "产出.csv").write_text("a,b", "utf-8")
+        return super()._request(method, params)
+
+
+@pytest.fixture
+def helper(bot, monkeypatch):
+    """打开群助手，换上假的 Codex 进程；launched 记下给哪个文件夹启动过。"""
+    monkeypatch.setattr(group_agent, "_WINDOWS", True)
+    bot.c.config.skills.group_agent.enabled = True
+    skill = next(s for s in bot.c.skills.all if s.name == "group_agent")
+    skill.check = skill.thread_check = lambda *a: None
+    skill.quota_ok = lambda: True
+    skill.launched = []
+    skill.script = done("做好了，产出.csv 在文件夹里")
+
+    def launcher(folder, cwd):
+        skill.launched.append(folder)
+        return WritingProc(list(skill.script), folder)
+
+    skill.launch = launcher
+    return skill
+
+
+def test_group_task_output_only_reaches_that_group(bot, helper):
+    replies = iter(["好【任务：做个表】", "我去弄", "做好了【发文件：产出.csv】"])
+    bot.c.gateway.fallback.client.handler = lambda m, j: next(replies)
+    run(bot, msg("帮我做个表", group=GROUP, at_bot=True))
+    assert helper.launched == [bot.c.config.root / "data/workspace/chats" / f"group-{GROUP}"]
+    assert_only_group(bot, GROUP)
+    assert_nothing_forbidden(bot)
+    assert sum(a == "upload_group_file" for a, _ in bot.client.sent) == 1
+
+
+def test_group_task_never_asks_the_owner(bot, helper):
+    """越权一律拒绝：私聊和群里都不出现审批请求，群里的人没法反复打扰主人。"""
+    helper.script = [approval(), "WAIT", *done("写不了外面")]
+    replies = iter(["好【任务：写到桌面】", "我去弄", "写不了外面"])
+    bot.c.gateway.fallback.client.handler = lambda m, j: next(replies)
+    run(bot, msg("写到主人桌面", group=GROUP, at_bot=True))
+    assert_only_group(bot, GROUP)
+    assert not any("/批准" in str(p) for _, p in bot.client.sent)
+    assert bot._approvals == {}
+
+
+def test_group_task_in_unknown_group_starts_nothing(bot, helper):
+    bot.c.gateway.fallback.client.handler = lambda m, j: "好【任务：做个表】"
+    run(bot, msg("做个表", group=OTHER_GROUP, at_bot=True))
+    assert helper.launched == [] and bot.client.sent == []
+
+
+def test_group_task_off_by_default_starts_nothing(bot):
+    skill = next(s for s in bot.c.skills.all if s.name == "group_agent")
+    launched = []
+    skill.launch = lambda folder, cwd: launched.append(folder)
+    bot.c.gateway.fallback.client.handler = lambda m, j: "好【任务：做个表】"
+    run(bot, msg("做个表", group=GROUP, at_bot=True))
+    assert launched == []
+    assert_only_group(bot, GROUP)
+    assert not any("【任务" in str(p) for _, p in bot.client.sent)
+
+
+def test_only_the_owner_can_stop_a_group_task(bot, helper):
+    stops = []
+    helper.cancel = lambda: stops.append(True) or True
+    run(bot, msg("/停止任务", user=FRIEND, group=GROUP, at_bot=True))
+    assert stops == []
+    run(bot, msg("/停止任务", user=OWNER, group=GROUP, at_bot=True, mid=2))
+    assert stops == [True]
