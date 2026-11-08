@@ -23,7 +23,14 @@ from companion.memory import MemoryLayout, init_memory
 from companion.models.codex_app_server import lockdown_overrides
 from companion.models.usage import UsageLedger
 from companion.skills import SkillContext, SkillError
-from companion.skills.agent import AgentRun, CodexAgent, default_deny, permission_overrides
+from companion.skills import agent as module
+from companion.skills.agent import (
+    AgentRun,
+    CodexAgent,
+    default_deny,
+    move_aside_unmanageable,
+    permission_overrides,
+)
 from tests.fakes import FakeEmbedder, scripted_gateway
 
 BOT, OWNER, FRIEND = "1000", "2000", "3000"
@@ -233,6 +240,7 @@ def make_agent(tmp_path, procs, *, quota=True, key=True):
         tmp_path,
         SubscriptionConfig(),
         fb,
+        tmp_path / "run",
         quota_ok=lambda: quota,
         ledger=UsageLedger(tmp_path / "usage.jsonl"),
         launcher=launcher,
@@ -286,6 +294,7 @@ def test_deepseek_launch_keeps_key_off_command_line(tmp_path, monkeypatch):
         tmp_path,
         SubscriptionConfig(),
         FallbackConfig(api_key=SecretStr("sk-secret")),
+        tmp_path / "run",
         quota_ok=lambda: False,
     )
     agent._launch("deepseek")
@@ -293,6 +302,116 @@ def test_deepseek_launch_keeps_key_off_command_line(tmp_path, monkeypatch):
     assert captured["env"]["COMPANION_DEEPSEEK_KEY"] == "sk-secret"
     assert captured["overrides"]["model_provider"] == '"companion_deepseek"'
     assert captured["overrides"]["model"] == '"deepseek-flash"'
+
+
+# ---------- 工作目录：不能让留在工作文件夹里的配置在沙箱外运行 ----------
+
+
+def test_thread_and_process_run_outside_the_workspace(tmp_path, monkeypatch):
+    proc = FakeProc(done())
+    agent, _ = make_agent(tmp_path, [proc])
+    assert agent.run("任务", "x", OWNER_CTX).later().ok
+    thread = next(m for m in proc.sent if m.get("method") == "thread/start")["params"]
+    assert thread["cwd"] == str(tmp_path / "run" / "agent-cwd")
+    turn = next(m for m in proc.sent if m.get("method") == "turn/start")["params"]
+    text = turn["input"][0]["text"]
+    assert str(agent.workspace) in text and "workdir" in text and "绝对路径" in text
+
+    captured = {}
+
+    def fake_from_codex(cmd, workdir, *, overrides, **kw):
+        captured.update(workdir=workdir, overrides=overrides)
+        return FakeProc([])
+
+    monkeypatch.setattr("companion.skills.agent.CodexAppServerBackend.from_codex", fake_from_codex)
+    agent._launch("subscription")
+    assert captured["workdir"] == tmp_path / "run" / "agent-cwd"
+    fs = captured["overrides"]["permissions.companion_agent.filesystem"]
+    assert f'"{module.toml_path(agent.workspace)}" = "write"' in fs
+    assert fs.count('"write"') == 1  # 工作目录只读：沙箱不能往里写配置
+
+
+def test_cwd_is_emptied_before_each_task(tmp_path):
+    agent, _ = make_agent(tmp_path, [FakeProc(done())])
+    planted = agent.cwd / ".codex" / "config.toml"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("planted", "utf-8")
+    assert agent.run("任务", "x", OWNER_CTX).later().ok
+    assert list(agent.cwd.iterdir()) == []
+
+
+def test_task_fails_when_cwd_cannot_be_emptied(tmp_path, monkeypatch):
+    agent, launched = make_agent(tmp_path, [])
+    (agent.cwd).mkdir(parents=True)
+    (agent.cwd / "AGENTS.md").write_text("planted", "utf-8")
+    monkeypatch.setattr("shutil.rmtree", lambda *a, **k: None)
+    result = agent.run("任务", "x", OWNER_CTX).later()
+    assert not result.ok and launched == []
+    assert not agent._busy  # 出错也要能接下一个任务
+
+
+@pytest.mark.parametrize("workspace", [".", "data"])
+def test_refuses_workspace_that_contains_the_cwd(tmp_path, workspace):
+    """工作目录的上级也在 Codex 找配置的范围内：沙箱能写 data/.codex 就又能逃出去。"""
+    fb = FallbackConfig()
+    launched = []
+    agent = CodexAgent(
+        AgentSkillConfig(workspace=Path(workspace)),
+        tmp_path,
+        SubscriptionConfig(),
+        fb,
+        tmp_path / "data" / "run",
+        quota_ok=lambda: True,
+        launcher=lambda backend: launched.append(backend),
+    )
+    with pytest.raises(SkillError, match="设得太大"):
+        agent.run("任务", "x", OWNER_CTX)
+    assert launched == [] and not agent._busy
+
+
+def test_moves_aside_only_what_codex_cannot_manage(tmp_path, monkeypatch):
+    for name in (".codex", ".git", ".agents", "sub/.git"):
+        (tmp_path / name).mkdir(parents=True)
+    (tmp_path / ".git" / "config").write_text("留着看", "utf-8")
+    monkeypatch.setattr(module, "_can_edit_acl", lambda path: path.name != ".git")
+    moved = move_aside_unmanageable(tmp_path)
+    assert len(moved) == 1 and moved[0].startswith(".git-留下的-")
+    assert (tmp_path / moved[0] / "config").read_text("utf-8") == "留着看"  # 只改名不删
+    assert not (tmp_path / ".git").exists()
+    assert (tmp_path / ".codex").is_dir() and (tmp_path / ".agents").is_dir()
+    assert (tmp_path / "sub" / ".git").is_dir()
+    assert move_aside_unmanageable(tmp_path) == []
+
+
+def test_move_aside_tolerates_failure(tmp_path, monkeypatch):
+    (tmp_path / ".codex").mkdir()
+    monkeypatch.setattr(module, "_can_edit_acl", lambda path: False)
+
+    def refuse(self, target):
+        raise PermissionError
+
+    monkeypatch.setattr(Path, "rename", refuse)
+    assert move_aside_unmanageable(tmp_path) == []
+    assert (tmp_path / ".codex").is_dir()
+
+
+def test_own_folders_are_left_alone(tmp_path):
+    """自己建的目录改得了 ACL，不用挪；不存在的路径当作改不了。"""
+    (tmp_path / ".git").mkdir()
+    assert move_aside_unmanageable(tmp_path) == []
+    assert (tmp_path / ".git").is_dir()
+    if module._WINDOWS:
+        assert not module._can_edit_acl(tmp_path / "missing")
+
+
+def test_owner_is_told_when_something_was_moved_aside(tmp_path, monkeypatch):
+    agent, _ = make_agent(tmp_path, [FakeProc(done())])
+    (agent.workspace / ".codex").mkdir(parents=True)
+    monkeypatch.setattr(module, "_can_edit_acl", lambda path: False)
+    out = agent.run("任务", "x", OWNER_CTX).later()
+    assert out.ok and ".codex-留下的-" in out.text and "告诉主人" in out.text
+    plain, _ = make_agent(tmp_path, [FakeProc(done())])
+    assert "留下的" not in plain.run("任务", "x", OWNER_CTX).later().text
 
 
 # ---------- QQ 全流程 ----------

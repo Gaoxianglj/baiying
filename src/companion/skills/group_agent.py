@@ -25,7 +25,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import threading
 import time
@@ -39,7 +38,7 @@ from companion.config import GroupAgentConfig, SubscriptionConfig
 from companion.models.codex_app_server import CodexAppServerBackend, stuck_mcp_servers
 from companion.models.openai_compat import ModelError
 from companion.skills.access import FileAccess
-from companion.skills.agent import AgentRun, toml_path, toml_table
+from companion.skills.agent import AgentRun, empty_dir, toml_path, toml_table
 from companion.skills.base import Skill, SkillContext, SkillError, SkillResult
 
 log = logging.getLogger(__name__)
@@ -505,12 +504,7 @@ class GroupAgent(Skill):
 
     def _fresh_cwd(self) -> Path:
         """线程的工作目录：沙箱只能读、主人的助手碰不到（data/run 在黑名单里），每次都是空的。"""
-        cwd = self.run_dir / "sandbox-cwd"
-        shutil.rmtree(cwd, ignore_errors=True)
-        cwd.mkdir(parents=True, exist_ok=True)
-        if any(cwd.iterdir()):
-            raise OSError(f"清不空工作目录：{cwd}")
-        return cwd
+        return empty_dir(self.run_dir / "sandbox-cwd")
 
     def _tools(self) -> list[Path]:
         """沙箱里能用的程序（只读）。配错了也不能放开整个盘、记忆、密钥或项目文件夹。"""

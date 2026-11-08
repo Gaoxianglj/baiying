@@ -172,7 +172,7 @@ FIELDS: list[SettingField] = [
     SettingField("skills.agent.enabled", "帮主人干活（Agent）", "bool", "技能·帮主人干活",
                  "只限主人私聊或本地命令行。独立的 Codex 进程：工作文件夹内可读写，其余只读，黑名单禁止访问；越权操作会发给你审批"),
     SettingField("skills.agent.workspace", "工作文件夹", "text", "技能·帮主人干活",
-                 "助手只能在这里新建和修改文件；相对路径从项目根目录算"),
+                 "助手只能在这里新建和修改文件；相对路径从项目根目录算；不能把 data 文件夹包进去"),
     SettingField("skills.agent.extra_deny", "额外的黑名单", "list", "技能·帮主人干活",
                  "逗号分隔的路径，连读都不允许。默认已包含 .env、记忆文件夹、Codex 登录信息、浏览器与密码管理器数据、NapCat"),
     SettingField("skills.agent.web_search", "允许联网搜索", "bool", "技能·帮主人干活",

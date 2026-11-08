@@ -143,7 +143,7 @@ def test_only_in_groups(env, ctx, ok):
 def test_group_gets_the_sandbox_and_owner_private_gets_the_full_agent(env, tmp_path):
     full = CodexAgent(
         AgentSkillConfig(workspace=env.ws), tmp_path, SubscriptionConfig(), FallbackConfig(),
-        quota_ok=lambda: True,
+        tmp_path / "run", quota_ok=lambda: True,
     )  # fmt: skip
     skills = Skills([full, env.agent], SkillsConfig())
     assert skills.find("【任务：x】", OWNER_PRIVATE)[1] is full
@@ -279,7 +279,7 @@ def test_cwd_is_emptied_every_time(env):
 def test_refuses_when_cwd_cannot_be_emptied(env, monkeypatch):
     cwd = env.agent._fresh_cwd()
     (cwd / "AGENTS.md").write_text("planted", "utf-8")
-    monkeypatch.setattr(module.shutil, "rmtree", lambda *a, **k: None)
+    monkeypatch.setattr("shutil.rmtree", lambda *a, **k: None)
     result = env.agent.run("任务", "x", IN_GROUP).later()
     assert not result.ok and env.launched == []
 

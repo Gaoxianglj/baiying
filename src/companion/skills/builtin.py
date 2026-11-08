@@ -74,6 +74,7 @@ def build_skills(
             config.root,
             sub,
             config.models.fallback,
+            config.data_dir / "run",
             quota_ok=lambda: gateway.subscription is not None and gateway.subscription_available(),
             ledger=gateway.ledger,
         ),

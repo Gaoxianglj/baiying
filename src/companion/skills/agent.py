@@ -5,6 +5,10 @@
 - 每个任务启动一个新的 `codex app-server`，用专属权限配置：
   工作文件夹（默认 data/workspace）可读写；其余位置只读；黑名单路径连读都不行。
   实测 Windows 沙箱会真正拦下黑名单读取和工作文件夹外的写入（2026-10-24）。
+- 进程和线程的工作目录不能是工作文件夹：app-server 本身不在沙箱里，会加载工作目录及其上级里的
+  .codex/config.toml，上一个任务留下的 MCP 配置能在沙箱外运行程序（tests/test_agent_sandbox_real.py）。
+  所以工作目录放在 data/run 下沙箱写不到的地方，每次清空。那里在黑名单里，沙箱连进都进不去，
+  命令必须把 workdir 设成工作文件夹，apply_patch 的相对路径也不再指向工作文件夹，这些都写在提示词里。
 - 越权操作（如写工作文件夹外）Codex 会请求审批，转给主人：回复 /批准 或 /拒绝，超时算拒绝。
 - 联网：沙箱里的命令在 Windows 上做不了 HTTPS（受限令牌拿不到 TLS 凭据），所以用 Codex 自带的联网搜索。
 - 订阅额度到阈值时，改用 DeepSeek 驱动 Codex（key 通过环境变量传给子进程，不出现在命令行里），
@@ -13,9 +17,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
+import shutil
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -33,11 +40,17 @@ log = logging.getLogger(__name__)
 
 TASK_PREAMBLE = """你是“白璎”的助手，替她的主人在这台 Windows 电脑上完成一个任务。
 - 工作文件夹：{workspace}。新建或修改的文件都放在这里；其他位置只读，部分位置禁止访问，不要尝试绕过。
+- 每条命令都把 workdir 设成工作文件夹（不设的话命令启动不了），apply_patch 一律写绝对路径。
+- 工作文件夹的根目录不要建 .git、.codex、.agents（之后的命令会全部启动失败）；要用 git 就放进子文件夹。
 - 需要查资料就用联网搜索；命令行里的网络下载在沙箱里用不了。
 - 不要删除工作文件夹外的任何东西，不要碰密码、密钥、浏览器数据。
 - 做完后用中文简要汇报：做了什么、结果如何、产出的文件路径。做不到就说明卡在哪里。
 
 任务：{task}"""
+
+_WINDOWS = sys.platform == "win32"
+# Codex 的 elevated 后端每次进沙箱前，都要给写入根下的这些目录加 deny ACE
+_PROTECTED_DIRS = (".codex", ".git", ".agents")
 
 
 def default_deny(root: Path) -> list[Path]:
@@ -104,6 +117,57 @@ def toml_path(path: Path) -> str:
 
 def toml_table(entries: dict[str, str]) -> str:
     return "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in entries.items()) + "}"
+
+
+def empty_dir(path: Path) -> Path:
+    """清空并返回这个目录，给 Codex 当工作目录。"""
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    if any(path.iterdir()):
+        raise OSError(f"清不空工作目录：{path}")
+    return path
+
+
+def _can_edit_acl(path: Path) -> bool:
+    """这个进程能不能改 path 的 ACL。沙箱建的目录属主是沙箱用户，主人的进程改不了。"""
+    if not _WINDOWS:
+        return True
+    read_control, write_dac, share_all, open_existing, backup_semantics = (
+        0x00020000, 0x00040000, 7, 3, 0x02000000,
+    )  # fmt: skip
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.CreateFileW(
+        str(path), read_control | write_dac, share_all, None, open_existing, backup_semantics, None
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        return False
+    kernel32.CloseHandle(handle)
+    return True
+
+
+def move_aside_unmanageable(workspace: Path) -> list[str]:
+    """把工作文件夹根目录下 Codex 改不了 ACL 的 .codex、.git、.agents 改名挪开，返回新名字。
+
+    沙箱自己建的这些目录，elevated 后端加 deny ACE 时会失败，之后所有沙箱操作都起不来，连线程都开不了
+    （实测 2026-11-08，Codex 0.164）。不挪开的话，一个任务就能让之后的任务全部失败。
+    只改名不删，主人可以看里面是什么。主人自己建的（不影响运行）和子文件夹里的不碰。
+    """
+    moved = []
+    for name in _PROTECTED_DIRS:
+        path = workspace / name
+        if not path.exists() or _can_edit_acl(path):
+            continue
+        target = workspace / f"{name}-留下的-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            path.rename(target)
+        except OSError:
+            log.warning("挪不开工作文件夹里的 %s", name, exc_info=True)
+            continue
+        log.warning("工作文件夹根目录有沙箱建的 %s，改名为 %s", name, target.name)
+        moved.append(target.name)
+    return moved
 
 
 @dataclass
@@ -271,6 +335,7 @@ class CodexAgent(Skill):
         root: Path,
         subscription: SubscriptionConfig,
         fallback: FallbackConfig,
+        run_dir: Path,
         *,
         quota_ok: Callable[[], bool],
         ledger: UsageLedger | None = None,
@@ -280,6 +345,7 @@ class CodexAgent(Skill):
         self.root = root
         self.sub = subscription
         self.fb = fallback
+        self.run_dir = run_dir  # data/run：沙箱写不到
         self.quota_ok = quota_ok
         self.ledger = ledger
         self.launch = launcher or self._launch
@@ -291,6 +357,11 @@ class CodexAgent(Skill):
     def workspace(self) -> Path:
         ws = self.cfg.workspace
         return ws if ws.is_absolute() else self.root / ws
+
+    @property
+    def cwd(self) -> Path:
+        """Codex 进程和线程的工作目录。"""
+        return self.run_dir / "agent-cwd"
 
     # ---- 可用性 ----
 
@@ -327,6 +398,11 @@ class CodexAgent(Skill):
             raise SkillError("没说要做什么")
         if not self.allowed(ctx):
             raise SkillError("只有主人私聊时才能用")
+        # 工作目录的上级也在 Codex 找配置的范围内，沙箱能写到它们就又能逃出去
+        if self.cwd.resolve().is_relative_to(self.workspace.resolve()):
+            raise SkillError(
+                "工作文件夹设得太大了，把程序的 data 文件夹也包进去了，不安全，让主人改小"
+            )
         backend = self._choose_backend()
         with self._lock:
             if self._busy:
@@ -340,13 +416,16 @@ class CodexAgent(Skill):
         )
 
     def _work(self, task: str, backend: str, ctx: SkillContext) -> SkillResult:
-        self.workspace.mkdir(parents=True, exist_ok=True)
         proc: CodexAppServerBackend | None = None
         try:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            moved = move_aside_unmanageable(self.workspace)
+            cwd = empty_dir(self.cwd)  # 也让 _launch 的黑名单加得上 data/run（不存在的路径不加）
             proc = self.launch(backend)
             agent_run = AgentRun(
                 proc,
                 workspace=self.workspace,
+                cwd=cwd,
                 effort=self.cfg.effort,
                 ask=ctx.ask,
                 progress=ctx.notify,
@@ -361,7 +440,13 @@ class CodexAgent(Skill):
             log.info("任务结束（%s，%.0f 秒，%s）：%s", backend, outcome.seconds,
                      "完成" if outcome.ok else "未完成", outcome.text[:100])  # fmt: skip
             via = "（这次是 DeepSeek 驱动的）" if backend == "deepseek" else ""
-            return SkillResult(f"任务：{task}\n助手的汇报{via}：\n{outcome.text}",
+            note = (
+                f"开始前发现工作文件夹根目录有以前的任务建的目录，已改名挪开：{'、'.join(moved)}。"
+                "这类目录有可能是诱导内容留下的，告诉主人去看一眼。\n"
+                if moved
+                else ""
+            )
+            return SkillResult(f"任务：{task}\n{note}助手的汇报{via}：\n{outcome.text}",
                                ok=outcome.ok, report=True)  # fmt: skip
         except ModelError as e:
             log.warning("任务失败：%s", e)
@@ -411,7 +496,7 @@ class CodexAgent(Skill):
             overrides["model"] = json.dumps(model)
         return CodexAppServerBackend.from_codex(
             self.sub.codex_command,
-            self.workspace,
+            self.cwd,  # 进程本身也不在工作文件夹里启动
             overrides=overrides,
             timeout=600.0,  # 一条长命令可能好几分钟没有消息
             name="agent",
