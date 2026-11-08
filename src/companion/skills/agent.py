@@ -10,6 +10,7 @@
   所以工作目录放在 data/run 下沙箱写不到的地方，每次清空。那里在黑名单里，沙箱连进都进不去，
   命令必须把 workdir 设成工作文件夹，apply_patch 的相对路径也不再指向工作文件夹，这些都写在提示词里。
 - 越权操作（如写工作文件夹外）Codex 会请求审批，转给主人：回复 /批准 或 /拒绝，超时算拒绝。
+  写文件的审批要列出路径和内容（批准一次就可能写进上级的 .codex/config.toml，见 file_change_question）。
 - 联网：沙箱里的命令在 Windows 上做不了 HTTPS（受限令牌拿不到 TLS 凭据），所以用 Codex 自带的联网搜索。
 - 订阅额度到阈值时，改用 DeepSeek 驱动 Codex（key 通过环境变量传给子进程，不出现在命令行里），
   token 用量按兜底 API 的价格记账。
@@ -51,6 +52,18 @@ TASK_PREAMBLE = """你是“白璎”的助手，替她的主人在这台 Window
 _WINDOWS = sys.platform == "win32"
 # Codex 的 elevated 后端每次进沙箱前，都要给写入根下的这些目录加 deny ACE
 _PROTECTED_DIRS = (".codex", ".git", ".agents")
+# 写进去就可能让程序在沙箱外运行，或改掉助手听的指令
+_CODEX_FILES = (*_PROTECTED_DIRS, "agents.md", "agents.override.md")
+_OUTSIDE = "工作文件夹外"
+_CODEX_FILE = "Codex 配置"
+_KINDS = {"add": "新建", "update": "修改", "delete": "删除"}
+# 审批问题的长度：QQ 一条消息不宜太长，模型也不能靠长度把要紧的东西挤掉
+_ASK_FILES = 5  # 最多列几个文件
+_ASK_FILES_CHARS = 1000  # 文件列表最多占多少字
+_ASK_PATH_CHARS = 200
+_ASK_PREVIEW_CHARS = 200
+_ASK_PREVIEW_LINES = 6
+_ASK_REASON_CHARS = 200
 
 
 def default_deny(root: Path) -> list[Path]:
@@ -170,6 +183,105 @@ def move_aside_unmanageable(workspace: Path) -> list[str]:
     return moved
 
 
+def _visible(text: str) -> str:
+    """不可见字符（换行、方向控制符等）换成问号：这些字是模型写的，不能让它伪造问题的格式。"""
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
+def _short_path(path: str) -> str:
+    """太长的路径去掉中间，开头和结尾最要紧。"""
+    text = _visible(path) or "（没给路径）"
+    if len(text) <= _ASK_PATH_CHARS:
+        return text
+    half = _ASK_PATH_CHARS // 2
+    return f"{text[:half]}…{text[-half:]}"
+
+
+def _quoted(diff: str) -> list[str]:
+    """内容开头。每行前面加 >：模型写的内容再怎么排版，也冒充不了问题本身。"""
+    text = diff.strip()
+    lines = [line for line in text[:_ASK_PREVIEW_CHARS].splitlines() if line.strip()]
+    quoted = [f"> {_visible(line.replace(chr(9), '  '))}" for line in lines[:_ASK_PREVIEW_LINES]]
+    if len(text) > _ASK_PREVIEW_CHARS or len(lines) > _ASK_PREVIEW_LINES:
+        quoted.append(f"（内容共 {len(text)} 字，只显示开头）")
+    return quoted
+
+
+def _path_warnings(path: str, workspace: Path, cwd: Path) -> list[str]:
+    """这个路径要主人留意什么。按实际会写到的位置判断：.. 和链接都算上，.CODEX、.codex. 也是 .codex。"""
+    try:
+        real = (cwd / path).resolve()  # 相对路径按线程的工作目录算，和 Codex 一样
+        inside = real.is_relative_to(workspace.resolve())
+    except (OSError, ValueError, RuntimeError):
+        real, inside = None, False
+    parts = [*Path(path).parts, *(real.parts if real else ())]
+    names = {part.split(":")[0].rstrip(" .").lower() for part in parts}
+    warnings = [] if inside else [_OUTSIDE]
+    if names.intersection(_CODEX_FILES):
+        warnings.append(_CODEX_FILE)
+    return warnings
+
+
+def _reason_line(params: dict[str, Any]) -> str:
+    reason = params.get("reason")
+    if not reason:
+        return ""
+    text = _visible(str(reason))[:_ASK_REASON_CHARS]
+    return f"\n助手自己说的原因（不一定可信，以上面的内容为准）：{text}"
+
+
+def file_change_question(
+    changes: list[dict[str, Any]] | None, params: dict[str, Any], workspace: Path, cwd: Path
+) -> str:
+    """把写文件的申请写成给主人看的问题。
+
+    路径、内容、原因都是模型写的，任务又可能来自带诱导的文件，所以要防它骗人：
+    警告放在最前面，有警告的文件排在前面，一堆无害的文件挤不掉它们；原因放最后，不当依据。
+    """
+    blocks: list[tuple[list[str], list[str]]] = []
+    for change in changes or []:
+        path = str(change.get("path") or "")
+        kind = change.get("kind") or {}
+        target = str(kind.get("move_path") or "")
+        warnings = _path_warnings(path, workspace, cwd)
+        head = f"{_KINDS.get(str(kind.get('type')), '改动')} {_short_path(path)}"
+        if target:  # 改名也算写：可以把无害的文件移到 .codex/config.toml
+            warnings += [w for w in _path_warnings(target, workspace, cwd) if w not in warnings]
+            head = f"移动 {_short_path(path)} → {_short_path(target)}"
+        if warnings:
+            head += f"（{'、'.join(warnings)}）"
+        blocks.append((warnings, [head, *_quoted(str(change.get("diff") or ""))]))
+
+    if blocks:
+        lines = [f"助手申请写 {len(blocks)} 个文件，批准前看清楚："]
+    else:
+        lines = ["助手申请修改文件，但这边看不到要改什么（哪个文件、什么内容都不知道），建议拒绝。"]
+    outside = sum(_OUTSIDE in warnings for warnings, _ in blocks)
+    codex = sum(_CODEX_FILE in warnings for warnings, _ in blocks)
+    if outside:
+        lines.append(f"注意：{outside} 个在工作文件夹外，不确定就拒绝。")
+    if codex:
+        lines.append(
+            f"注意：{codex} 个是 .codex、.git、AGENTS.md 这类文件，"
+            "写进去可能让程序在沙箱外运行，或改掉助手听的指令。"
+        )
+    if params.get("grantRoot"):
+        root = _short_path(str(params["grantRoot"]))
+        lines.append(f"注意：它还想让这次任务之后都能随便写这个文件夹：{root}")
+
+    shown = used = 0
+    for _, block in sorted(blocks, key=lambda item: not item[0]):
+        size = sum(len(line) for line in block)
+        if shown and (shown >= _ASK_FILES or used + size > _ASK_FILES_CHARS):
+            break
+        shown += 1
+        used += size
+        lines += [f"{shown}. {block[0]}", *block[1:]]
+    if shown < len(blocks):
+        lines.append(f"还有 {len(blocks) - shown} 个文件没显示。")
+    return "\n".join(lines) + _reason_line(params)
+
+
 @dataclass
 class AgentOutcome:
     text: str
@@ -211,6 +323,7 @@ class AgentRun:
         self.on_thread = on_thread  # 拿到线程实际生效的配置后、开始干活前，可以在这里拦下
         self.cancelled = threading.Event()
         self.tokens = (0, 0)  # 输入、输出 token
+        self._file_changes: dict[str, list[dict[str, Any]]] = {}  # 正在进行的写文件，审批时要用
 
     def run(self, task: str) -> AgentOutcome:
         b = self.backend
@@ -252,13 +365,20 @@ class AgentRun:
             if "id" in msg:
                 self._answer(msg)
                 continue
-            if method == "item/completed":
+            if method == "item/started":
+                item = params.get("item") or {}
+                if item.get("type") == "fileChange":
+                    self._file_changes[str(item.get("id"))] = item.get("changes") or []
+            elif method == "item/fileChange/patchUpdated":
+                self._file_changes[str(params.get("itemId"))] = params.get("changes") or []
+            elif method == "item/completed":
                 item = params.get("item") or {}
                 kind = item.get("type")
                 if kind == "commandExecution":
                     commands += 1
                 elif kind == "fileChange":
                     files += len(item.get("changes") or [])
+                    self._file_changes.pop(str(item.get("id")), None)
                 elif kind == "agentMessage":
                     final = str(item.get("text") or "")
                     if item.get("phase") != "final_answer":
@@ -295,17 +415,19 @@ class AgentRun:
         params = msg.get("params") or {}
         b = self.backend
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-            what = params.get("command") or "修改文件"
-            question = f"助手想做一件需要你批准的事：\n{str(what)[:300]}"
-            if params.get("reason"):
-                question += f"\n原因：{str(params['reason'])[:200]}"
+            if method == "item/fileChange/requestApproval":
+                # 请求本身只有 itemId，路径和内容在之前的消息里
+                changes = self._file_changes.get(str(params.get("itemId")))
+                question = file_change_question(changes, params, self.workspace, self.cwd)
+            else:
+                what = params.get("command") or "（看不到要跑什么命令，建议拒绝）"
+                question = f"助手想做一件需要你批准的事：\n{str(what)[:300]}" + _reason_line(params)
             ok = self._ask(question)
             b._send({"id": msg["id"], "result": {"decision": "accept" if ok else "decline"}})
         elif method == "item/permissions/requestApproval":
             asked = params.get("permissions") or {}
             question = "助手想要更多权限：\n" + json.dumps(asked, ensure_ascii=False)[:300]
-            if params.get("reason"):
-                question += f"\n原因：{str(params['reason'])[:200]}"
+            question += _reason_line(params)
             granted = asked if self._ask(question) else {}
             b._send({"id": msg["id"], "result": {"permissions": granted}})
         else:

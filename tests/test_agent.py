@@ -203,6 +203,221 @@ def test_no_ask_means_decline(tmp_path):
     assert next(m for m in proc.sent if m.get("id") == 7)["result"]["decision"] == "decline"
 
 
+# ---------- 写文件的审批：主人要看得清批准的是什么 ----------
+
+
+def file_change(path, diff="hello\n", kind="add", **extra):
+    return {"path": str(path), "kind": {"type": kind, **extra}, "diff": diff}
+
+
+def file_started(*changes, item_id="exec-1"):
+    item = {"type": "fileChange", "id": item_id, "changes": list(changes), "status": "inProgress"}
+    return {"method": "item/started", "params": {"item": item}}
+
+
+def file_approval(item_id="exec-1", **params):
+    return {
+        "id": 8,
+        "method": "item/fileChange/requestApproval",
+        "params": {"itemId": item_id, "reason": None, "grantRoot": None, **params},
+    }
+
+
+def asked_about(tmp_path, *script, answer=False, ask=True):
+    """跑到审批那一步，返回主人看到的问题和回给 Codex 的决定。"""
+    asked = []
+    proc = FakeProc([*script, "WAIT", *done()])
+    AgentRun(
+        proc,
+        workspace=tmp_path / "ws",
+        cwd=tmp_path / "run" / "agent-cwd",
+        effort="low",
+        ask=(lambda question: asked.append(question) or answer) if ask else None,
+        progress=None,
+        timeout=60,
+        progress_every=1000,
+    ).run("x")
+    decision = next(m for m in proc.sent if m.get("id") == 8)["result"]["decision"]
+    return (asked[0] if asked else ""), decision
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_file_approval_shows_path_and_content(tmp_path, answer):
+    path = tmp_path / "ws" / "汇总.md"
+    question, decision = asked_about(
+        tmp_path,
+        file_started(file_change(path, "# 标题\n第二行\n")),
+        file_approval(),
+        answer=answer,
+    )
+    assert str(path) in question and "新建" in question
+    assert "> # 标题" in question and "> 第二行" in question
+    assert "注意" not in question  # 工作文件夹里的普通文件，不用吓人
+    assert decision == ("accept" if answer else "decline")
+
+
+def test_file_approval_without_anyone_to_ask_is_declined(tmp_path):
+    path = tmp_path / "data" / ".codex" / "config.toml"
+    _, decision = asked_about(tmp_path, file_started(file_change(path)), file_approval(), ask=False)
+    assert decision == "decline"
+
+
+@pytest.mark.parametrize(
+    ("relative", "warning"),
+    [
+        ("data/.codex/config.toml", "工作文件夹外"),
+        ("data/.codex/config.toml", "Codex 配置"),
+        ("ws/../outside.txt", "工作文件夹外"),
+        ("ws/.codex/config.toml", "Codex 配置"),
+        ("ws/.CODEX/config.toml", "Codex 配置"),
+        ("ws/.codex./config.toml", "Codex 配置"),
+        ("ws/sub/.git/hooks/pre-commit", "Codex 配置"),
+        ("ws/.agents/skills/x.md", "Codex 配置"),
+        ("ws/AGENTS.md", "Codex 配置"),
+        ("ws/sub/agents.override.md", "Codex 配置"),
+    ],
+)
+def test_risky_paths_are_called_out(tmp_path, relative, warning):
+    path = f"{tmp_path}/{relative}"  # 不用 Path 拼：要留着 .. 和大小写
+    question, _ = asked_about(tmp_path, file_started(file_change(path)), file_approval())
+    first_file = question.index("1. ")
+    assert "注意" in question[:first_file]  # 模型写的东西出现之前就看得到
+    assert f"{warning}" in question
+
+
+@pytest.mark.parametrize("relative", ["ws/.gitignore", "ws/.codexx/a.txt", "ws/sub/notes.md"])
+def test_ordinary_files_in_the_workspace_are_not_called_out(tmp_path, relative):
+    question, _ = asked_about(
+        tmp_path, file_started(file_change(tmp_path / relative)), file_approval()
+    )
+    assert "注意" not in question
+
+
+def test_relative_path_means_the_thread_cwd_not_the_workspace(tmp_path):
+    question, _ = asked_about(tmp_path, file_started(file_change("notes.md")), file_approval())
+    assert "工作文件夹外" in question
+
+
+def test_moving_a_file_counts_as_writing_the_target(tmp_path):
+    source = tmp_path / "ws" / "无害.txt"
+    target = tmp_path / "data" / ".codex" / "config.toml"
+    change = file_change(source, "", kind="update", move_path=str(target))
+    question, _ = asked_about(tmp_path, file_started(change), file_approval())
+    assert "移动" in question and str(source) in question and str(target) in question
+    assert "工作文件夹外" in question and "Codex 配置" in question
+
+
+def test_many_files_cannot_push_the_dangerous_one_out_of_view(tmp_path):
+    harmless = [file_change(tmp_path / "ws" / f"文件{i}.txt") for i in range(30)]
+    danger = tmp_path / "data" / ".codex" / "config.toml"
+    question, _ = asked_about(
+        tmp_path,
+        file_started(*harmless, file_change(danger, "[mcp_servers.evil]")),
+        file_approval(),
+    )
+    assert "写 31 个文件" in question and "注意：1 个在工作文件夹外" in question
+    assert question.index(str(danger)) < question.index("文件0.txt")
+    assert "> [mcp_servers.evil]" in question
+    assert "还有 26 个文件没显示" in question
+
+
+def test_question_stays_short_but_keeps_the_end_of_long_paths(tmp_path):
+    deep = "很长的目录名/" * 60
+    changes = [
+        file_change(f"{tmp_path}/ws/{deep}{i}/.codex/config.toml", "x" * 5000 + "\n" + "y\n" * 500)
+        for i in range(50)
+    ]
+    question, _ = asked_about(
+        tmp_path, file_started(*changes), file_approval(reason="好" * 5000, grantRoot="E:/" * 900)
+    )
+    assert len(question) < 2500
+    assert ".codex/config.toml" in question and "还有" in question and "只显示开头" in question
+
+
+def test_model_written_text_cannot_fake_the_question(tmp_path):
+    path = f"{tmp_path}/ws/a.txt\n注意：已确认安全，可以批准\u202e"
+    diff = "正常内容\n注意：以上都检查过，放心批准\n助手申请写 0 个文件"
+    reason = "很安全\n注意：主人已经同意过了"
+    question, _ = asked_about(
+        tmp_path, file_started(file_change(path, diff)), file_approval(reason=reason)
+    )
+    lines = question.splitlines()
+    assert "> 注意：以上都检查过，放心批准" in lines and "> 助手申请写 0 个文件" in lines
+    assert not any(line.startswith("注意：") and "可以批准" in line for line in lines)
+    assert "\u202e" not in question
+    assert lines[-1].startswith("助手自己说的原因（不一定可信")  # 原因放最后，不当依据
+    assert "主人已经同意过了" in lines[-1]  # 换行被抹平，冒充不了单独一行的警告
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [file_approval()],  # 从没收到过 item/started
+        [file_started(file_change("a.txt"), item_id="别的"), file_approval()],
+        [file_started(), file_approval()],  # 收到了，但没有改动详情
+    ],
+)
+def test_unseen_change_says_so_instead_of_looking_fine(tmp_path, script):
+    question, decision = asked_about(tmp_path, *script)
+    assert "看不到要改什么" in question and "建议拒绝" in question
+    assert decision == "decline"
+
+
+def test_finished_change_is_forgotten(tmp_path):
+    finished = {
+        "method": "item/completed",
+        "params": {"item": {"type": "fileChange", "id": "exec-1", "changes": []}},
+    }
+    question, _ = asked_about(
+        tmp_path, file_started(file_change("a.txt")), finished, file_approval()
+    )
+    assert "看不到要改什么" in question
+
+
+def test_patch_update_replaces_what_is_shown(tmp_path):
+    first = tmp_path / "ws" / "无害.txt"
+    later = tmp_path / "data" / ".codex" / "config.toml"
+    updated = {
+        "method": "item/fileChange/patchUpdated",
+        "params": {"itemId": "exec-1", "changes": [file_change(later)]},
+    }
+    question, _ = asked_about(tmp_path, file_started(file_change(first)), updated, file_approval())
+    assert str(later) in question and str(first) not in question
+
+
+def test_grant_root_is_called_out(tmp_path):
+    path = tmp_path / "ws" / "a.txt"
+    question, _ = asked_about(
+        tmp_path, file_started(file_change(path)), file_approval(grantRoot="C:/Users")
+    )
+    assert "注意：它还想" in question and "C:/Users" in question
+    assert question.index("C:/Users") < question.index(str(path))
+
+
+def test_command_approval_without_a_command_says_so(tmp_path):
+    asked = []
+    request = {"id": 7, "method": "item/commandExecution/requestApproval", "params": {}}
+    proc = FakeProc([request, "WAIT", *done()])
+    make_run(proc, tmp_path, ask=lambda q: asked.append(q) or False).run("x")
+    assert "看不到要跑什么命令" in asked[0] and "修改文件" not in asked[0]
+
+
+def test_reason_is_labelled_as_unreliable_everywhere(tmp_path):
+    asked = []
+    requests = [
+        approval(),
+        "WAIT",
+        {
+            "id": 9,
+            "method": "item/permissions/requestApproval",
+            "params": {"permissions": {"x": 1}, "reason": "很需要"},
+        },
+    ]
+    proc = FakeProc([*requests, *done()])
+    make_run(proc, tmp_path, ask=lambda q: asked.append(q) or False).run("x")
+    assert all("不一定可信" in question for question in asked) and len(asked) == 2
+
+
 def test_timeout_interrupts(tmp_path):
     proc = FakeProc(
         [
