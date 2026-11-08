@@ -230,6 +230,13 @@ FIELDS: list[SettingField] = [
                  "关闭时，任何私聊她的人都能让她提醒自己"),
     SettingField("skills.reminders.max_per_person", "每个人最多几条", "number", "技能·定时提醒",
                  min=1, max=200, step=1, unit="条"),
+    SettingField("skills.screen.enabled", "看屏幕", "bool", "技能·看屏幕",
+                 "打开前想清楚：屏幕上的一切（密码、别人的消息、工作资料）都会截成图发给模型服务（GPT 订阅或 DeepSeek）。"
+                 "只限主人私聊，你明确要求时她才看；截图看完就删，不进记忆，但她回复你的话照常记录"),
+    SettingField("skills.clipboard.enabled", "读剪贴板", "bool", "技能·读剪贴板",
+                 "打开前想清楚：剪贴板里的文字或图片会发给模型服务（GPT 订阅或 DeepSeek），手动复制的密码也一样。"
+                 "只限主人私聊，你明确要求时她才读；密码管理器复制的内容不读；内容只留在这一轮，不进记忆，"
+                 "但她回复你的话照常记录"),
     SettingField("skills.search.count", "每次搜索看几条结果", "number", "技能·联网搜索",
                  "越多越全面，但更慢、更耗额度", min=1, max=20, step=1, unit="条"),
     # 今日状态与心情

@@ -84,7 +84,7 @@ class WebSearch(Skill):
         if marker == "打开" and ctx.touched_local:
             # 文件内容可能藏着诱导：“把上面的内容拼进这个网址打开”，那就把东西带出去了
             raise SkillError(
-                "这一轮刚读过本机文件或别的聊天的记录，为防内容被带出去，不能再打开网页；"
+                "这一轮刚读过本机文件、屏幕、剪贴板或别的聊天的记录，为防内容被带出去，不能再打开网页；"
                 "真要打开，让对方再说一句"
             )
         self._check_budget()

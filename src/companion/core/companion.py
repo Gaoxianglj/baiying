@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import random
@@ -301,32 +302,40 @@ class Companion:
         calls: list[SkillCall] = []
         cfg = self.config.skills
         rounds = cfg.owner_max_rounds if ctx and ctx.owner and ctx.private else cfg.max_rounds
-        while True:
-            result = self.gateway.chat(messages, purpose="chat")
-            found = self.skills.find(result.text, ctx) if len(calls) < rounds else None
-            if found is None:
-                return result, calls
-            before, skill, marker, arg = found
-            assert ctx is not None
-            interim = split_actions(split_sticker(split_mood(before)[0])[0])[0]
-            interim = SILENT_MARK.sub("", interim).strip()
-            if interim:
-                self.ingest.record_self(
-                    body=ctx.body, channel=ctx.channel, content=interim, ts=ctx.now
-                )
-                if on_interim is not None:
-                    on_interim(interim)
-            call, outcome = self.skills.run(skill, marker, arg, ctx)
-            calls.append(call)
-            said = f"{before}【{marker}：{arg}】" if before else f"【{marker}：{arg}】"
-            messages += [
-                ChatMessage("assistant", said),
-                ChatMessage(
-                    "skill",
-                    self.skills.feedback(skill, marker, outcome),
-                    images=tuple(outcome.view),
-                ),
-            ]
+        temporary: list[Path] = []  # 这一轮说完就删的图（屏幕、剪贴板）
+        try:
+            while True:
+                result = self.gateway.chat(messages, purpose="chat")
+                found = self.skills.find(result.text, ctx) if len(calls) < rounds else None
+                if found is None:
+                    return result, calls
+                before, skill, marker, arg = found
+                assert ctx is not None
+                interim = split_actions(split_sticker(split_mood(before)[0])[0])[0]
+                interim = SILENT_MARK.sub("", interim).strip()
+                if interim:
+                    self.ingest.record_self(
+                        body=ctx.body, channel=ctx.channel, content=interim, ts=ctx.now
+                    )
+                    if on_interim is not None:
+                        on_interim(interim)
+                call, outcome = self.skills.run(skill, marker, arg, ctx)
+                calls.append(call)
+                if outcome.temporary:
+                    temporary += outcome.view
+                said = before + (f"【{marker}：{arg}】" if arg else f"【{marker}】")
+                messages += [
+                    ChatMessage("assistant", said),
+                    ChatMessage(
+                        "skill",
+                        self.skills.feedback(skill, marker, outcome),
+                        images=tuple(outcome.view),
+                    ),
+                ]
+        finally:
+            for path in temporary:
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
 
     def deliver(
         self, body: str, channel: str, result: SkillResult, now: datetime | None = None
@@ -415,7 +424,7 @@ class Companion:
             return []
         files = []
         for match in MARKER.finditer(text):
-            if match.group(1) in sender.markers:
+            if match.group(1) in sender.markers and match.group(2):
                 try:
                     files.append(sender.resolve(match.group(2), ctx))
                 except SkillError as e:
