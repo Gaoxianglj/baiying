@@ -1106,7 +1106,7 @@ class QQBot:
             await self._call(self.c.index.set_meta, updated_key, stamp)
 
     async def _send_sticker(self, src: Source, digest: str) -> None:
-        await self._send_image(src, self.c.stickers.image_path(digest), sticker=True)
+        await self._send_image(src, self.c.stickers.best_path(digest), sticker=True)
 
     async def _send_image(self, src: Source, path: Path, *, sticker: bool = False) -> None:
         if not path.exists():
