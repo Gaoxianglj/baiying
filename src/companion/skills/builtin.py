@@ -12,6 +12,7 @@ from companion.models.gateway import ModelGateway
 from companion.skills.access import FileAccess
 from companion.skills.agent import CodexAgent, default_deny
 from companion.skills.base import Skill
+from companion.skills.desktop import ReadClipboard, ViewScreen
 from companion.skills.files import SendFile, WriteFile
 from companion.skills.history import ChatHistory, ChatImages, ChatScope
 from companion.skills.image import ImageGen, ImagePainter
@@ -57,6 +58,7 @@ def build_skills(
         keep_originals=False,
     )
     images = ChatImages(log, store, views, access, scope)
+    desktop = config.data_dir / "run" / "desktop"  # 屏幕、剪贴板的图：这一轮说完就删
 
     return [
         WebSearch(config.skills.search, config.models.fallback, gateway.ledger),
@@ -83,4 +85,6 @@ def build_skills(
         FindFile(files, access),
         ChatHistory(config.skills.history, log, scope),
         ImageTools(config.skills.history, files, images, access),
+        ViewScreen(config.skills.screen, desktop),
+        ReadClipboard(config.skills.clipboard, access, desktop),
     ]

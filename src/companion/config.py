@@ -367,6 +367,18 @@ class RemindersSkillConfig(_Section):
     max_per_person: int = 20  # 每个人最多同时有几条
 
 
+class ScreenSkillConfig(_Section):
+    """看屏幕：只限主人私聊、主人明确要求时。截图会发给模型服务，所以默认关。"""
+
+    enabled: bool = False
+
+
+class ClipboardSkillConfig(_Section):
+    """读剪贴板：只限主人私聊、主人明确要求时。内容会发给模型服务，所以默认关。"""
+
+    enabled: bool = False
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
@@ -380,6 +392,8 @@ class SkillsConfig(_Section):
     files: FilesSkillConfig = FilesSkillConfig()
     history: HistorySkillConfig = HistorySkillConfig()
     reminders: RemindersSkillConfig = RemindersSkillConfig()
+    screen: ScreenSkillConfig = ScreenSkillConfig()
+    clipboard: ClipboardSkillConfig = ClipboardSkillConfig()
 
 
 class Config(_Section):

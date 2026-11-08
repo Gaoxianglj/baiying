@@ -20,8 +20,9 @@ from companion.config import SkillsConfig
 
 log = logging.getLogger(__name__)
 
-# 【标记：参数】或 [标记:参数]；“表情”“心情”留给表情包和心情
-MARKER = re.compile(r"[【\[]\s*([^\s【】\[\]：:]{1,6})\s*[：:]\s*(.+?)\s*[】\]]", re.DOTALL)
+# 【标记：参数】或 [标记:参数]；只写【标记】时参数是 None，只有 bare 的技能才算数。
+# “表情”“心情”留给表情包和心情
+MARKER = re.compile(r"[【\[]\s*([^\s【】\[\]：:]{1,6})\s*(?:[：:]\s*(.*?)\s*)?[】\]]", re.DOTALL)
 RESERVED = {"表情", "心情", "回应", "语音"}
 # 【写文件：路径】后面跟着 <<<内容>>>（内容里可以有任何括号，所以不能放在标记里）
 BLOCK = re.compile(r"\s*<<<[ \t]*\n?(.*)\n?[ \t]*>>>", re.DOTALL)
@@ -47,7 +48,8 @@ class SkillContext:
     )
     # 向 QQ 要一条消息里的图片（她回头看当时没看的图）；None = 这个身体做不到
     fetch_images: Callable[[str], list[bytes]] | None = None
-    touched_local: bool = False  # 这一轮读过本机文件：不能再打开网页，防止内容被带出去
+    # 这一轮读过本机文件、屏幕或剪贴板：不能再打开网页，防止内容被带出去
+    touched_local: bool = False
 
 
 @dataclass
@@ -61,6 +63,7 @@ class SkillResult:
     report: bool = False  # 后台做完后让她用自己的话把结果告诉对方（而不是直接发图）
     max_chars: int | None = None  # 交回给她时最多多少字（默认按 skills.max_result_chars）
     view: list[Path] = field(default_factory=list)  # 放进这一轮给她看的图片（JPEG）
+    temporary: bool = False  # view 里的图这一轮说完就删（屏幕、剪贴板）
     note: str = ""  # 后台做完记成消息时附带的说明（如存在哪）
 
 
@@ -83,6 +86,7 @@ class Skill:
     label = ""  # 显示名，如 联网搜索
     markers: ClassVar[dict[str, str]] = {}  # 标记 → 给她看的用法说明
     takes_block = False  # 标记后面可以跟 <<<内容>>>，内容接在参数后面（用 ｜ 隔开）
+    bare = False  # 不用参数：只写【标记】也算
 
     def enabled(self) -> bool:
         return True
@@ -149,8 +153,8 @@ class Skills:
         by_marker = {m: s for s in self.available(ctx) for m in s.markers}
         for match in MARKER.finditer(text):
             skill = by_marker.get(match.group(1))
-            if skill is not None:
-                arg = match.group(2).strip()
+            if skill is not None and (match.group(2) is not None or skill.bare):
+                arg = (match.group(2) or "").strip()
                 if skill.takes_block and (block := BLOCK.match(text, match.end())):
                     arg = f"{arg}｜{block.group(1).rstrip()}"
                 return text[: match.start()].strip(), skill, match.group(1), arg
@@ -159,13 +163,17 @@ class Skills:
     def strip_markers(self, text: str) -> str:
         """去掉没被执行的技能标记（不认识的、不可用的、超过次数的）。"""
         known = {m for s in self.all for m in s.markers}
+        bare = {m for s in self.all if s.bare for m in s.markers}
         for marker in (m for s in self.all if s.takes_block for m in s.markers):
             text = re.sub(rf"[【\[]\s*{marker}\s*[：:][^】\]]*[】\]]{BLOCK.pattern}", "", text,
                           flags=re.DOTALL)  # fmt: skip
-        return MARKER.sub(
-            lambda m: "" if m.group(1) in known and m.group(1) not in RESERVED else m.group(0),
-            text,
-        ).strip()
+
+        def is_marker(m: re.Match[str]) -> bool:
+            if m.group(1) not in known or m.group(1) in RESERVED:
+                return False
+            return m.group(2) is not None or m.group(1) in bare
+
+        return MARKER.sub(lambda m: "" if is_marker(m) else m.group(0), text).strip()
 
     def run(
         self, skill: Skill, marker: str, arg: str, ctx: SkillContext
