@@ -6,7 +6,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from companion.models.codex_app_server import CodexAppServerBackend, parse_rate_limits
+from companion.models.codex_app_server import (
+    CodexAppServerBackend,
+    parse_rate_limits,
+    talk_only_overrides,
+)
 from companion.models.gateway import ModelGateway, PricedBackend
 from companion.models.openai_compat import ChatMessage, ModelError, OpenAICompatClient
 from companion.models.usage import UsageLedger
@@ -72,6 +76,21 @@ def test_codex_usage_limit_is_retryable(tmp_path, monkeypatch):
 def test_missing_codex_binary():
     with pytest.raises(ModelError, match="Codex CLI"):
         CodexAppServerBackend.from_codex("definitely-not-codex-xyz", Path("."))
+
+
+def test_talk_only_processes_cannot_touch_the_computer(tmp_path, monkeypatch):
+    """聊天进程不能自己看本机图片（2026-11-08 实测：不关时一句话就能让它看任意路径的图）。"""
+    monkeypatch.setattr("companion.models.codex_app_server.shutil.which", lambda c: "codex.exe")
+    chat = CodexAppServerBackend.from_codex("codex", tmp_path)
+    for flag in ("features.view_image=false", "features.shell_tool=false",
+                 "features.unified_exec=false", "features.image_generation=false",
+                 'web_search="disabled"'):  # fmt: skip
+        assert flag in chat._command, flag
+    painter = talk_only_overrides(image=True)
+    assert painter["features.image_generation"] == "true"
+    assert painter["features.view_image"] == "false" and painter["web_search"] == '"disabled"'
+    life = talk_only_overrides(image=True, web=True)
+    assert life["web_search"] == '"live"' and life["features.view_image"] == "false"
 
 
 def test_parse_rate_limits_multi_bucket():

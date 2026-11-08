@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from companion.config import Config
-from companion.models.codex_app_server import CodexAppServerBackend
+from companion.models.codex_app_server import CodexAppServerBackend, talk_only_overrides
 from companion.models.gateway import ModelGateway
 from companion.skills.agent import CodexAgent, default_deny
 from companion.skills.base import Skill
@@ -25,6 +25,7 @@ def build_skills(config: Config, gateway: ModelGateway, reminders: ReminderBook)
             return CodexAppServerBackend.from_codex(
                 sub.codex_command,
                 config.data_dir / "codex-image",
+                overrides=talk_only_overrides(image=True),
                 model=sub.model,
                 effort="low",
                 timeout=config.skills.image.timeout_seconds,

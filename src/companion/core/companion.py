@@ -30,7 +30,7 @@ from companion.life.core import LIFE_CHANNEL
 from companion.memory.events import Event
 from companion.memory.index import Fact, MemoryIndex, MemoryKind
 from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
-from companion.models.codex_app_server import CodexAppServerBackend
+from companion.models.codex_app_server import CodexAppServerBackend, talk_only_overrides
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
@@ -644,7 +644,7 @@ class Companion:
             return CodexAppServerBackend.from_codex(
                 sub.codex_command,
                 workdir,
-                overrides={"features.shell_tool": "false", "web_search": '"live"'},
+                overrides=talk_only_overrides(image=True, web=True),
                 model=sub.model,
                 effort="low",
                 timeout=timeout,

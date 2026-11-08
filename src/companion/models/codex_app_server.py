@@ -1,10 +1,10 @@
 """GPT 订阅后端：通过本地 `codex app-server`（JSON-RPC over stdio）调用 ChatGPT 账号下的模型。
 
 做法：
-- 启动时用 `-c` 覆盖配置：用中性的对话代理指令替换内置的编程助手指令，关掉执行命令与联网搜索，
-  不保存会话历史；每轮回复都开一个新线程、沙箱只读、从不请求审批。
+- 启动时用 `-c` 覆盖配置：用中性的对话代理指令替换内置的编程助手指令，关掉执行命令、看本机图片
+  与联网搜索，不保存会话历史；每轮回复都开一个新线程、沙箱只读、从不请求审批。
 - 一律关掉用户 Codex 配置里的 MCP 服务器、插件、电脑操控与浏览器工具：她在群聊里收到的话可能
-  带有诱导，不能让模型借这些工具碰到本机。
+  带有诱导，不能让模型借这些工具碰到本机。她要碰文件只能走技能，技能里才有权限检查。
 - 角色设定、记忆、对话记录全部放进本轮输入，所以和兜底 API 用的是同一份提示词。
 - `account/rateLimits/read` 读额度窗口，供网关判断要不要提前切到兜底 API。
 
@@ -155,11 +155,7 @@ class CodexAppServerBackend:
         workdir.mkdir(parents=True, exist_ok=True)
         # 指令通过 thread/start 的 baseInstructions 传入；这里关掉用不到的工具
         settings = {"personality": '"none"', **lockdown_overrides()}
-        settings |= (
-            overrides
-            if overrides is not None
-            else {"features.shell_tool": "false", "web_search": '"disabled"'}
-        )
+        settings |= overrides if overrides is not None else talk_only_overrides()
         command = [str(_native_codex(Path(exe))), "app-server"]
         for key, value in settings.items():
             command += ["-c", f"{key}={value}"]
@@ -423,6 +419,30 @@ def lockdown_overrides() -> dict[str, str]:
     for name in servers.get("mcp_servers") or {}:
         if name.replace("_", "").replace("-", "").isalnum():
             out[f"mcp_servers.{name}.enabled"] = "false"
+    return out
+
+
+# 只负责“说话”的进程（聊天、画画、自主活动）不需要的工具。
+# view_image 的实测（2026-11-08）：不关时，模型能直接看这台电脑上任意路径的图片，
+# 绕过技能的所有权限检查；沙箱也拦不住它，因为它不是在沙箱里跑的命令。
+_LOCAL_TOOLS = (
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+    "goals",
+    "hooks",
+    "sleep_tool",
+    "skill_search",
+    "tool_suggest",
+    "workspace_dependencies",
+)
+
+
+def talk_only_overrides(*, image: bool = False, web: bool = False) -> dict[str, str]:
+    """不碰本机的进程配置：image = 能生图（参考图由程序查过权限后附上）；web = 能用自带的搜索。"""
+    out = {f"features.{name}": "false" for name in _LOCAL_TOOLS}
+    out["features.image_generation"] = "true" if image else "false"
+    out["web_search"] = '"live"' if web else '"disabled"'
     return out
 
 
