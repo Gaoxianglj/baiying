@@ -3,7 +3,9 @@
 - 收藏：她看到群友发的表情包（遵循看图规则）时，主模型同时给出描述、情绪词和“适不适合日常聊天里发”，
   适合的才收进来；同一张图按内容哈希去重，只累加“见过几次”。
 - 使用：回复末尾写【表情：情绪词】表示想配一张；按情绪词挑最合适的（同情绪里见得多、用得少的优先）。
-- 存储：`stickers/index.json`（文字信息，进 git）+ `stickers/<哈希>.jpg`（图片，不进 git）。
+- 存储：`stickers/index.json`（文字信息，进 git）+ `stickers/<哈希>.jpg`（图片，不进 git）；
+  动图再留一份原图 `stickers/<哈希>.orig.gif`（也不进 git），发出去才会动。
+  以前收藏的只有 JPEG，照常能发；有人再发这张时把原图补上。
 - 库满时淘汰见得少、很久没见过的。
 """
 
@@ -19,8 +21,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 STICKER_MARK = re.compile(r"\s*[【\[]表情[:：]\s*([^】\]\n]{1,12})[】\]]\s*")
+
+# 这些格式的多帧才是动画；手机拍的 JPEG（MPO）也有多帧，但不是动图
+_ANIMATED_FORMATS = {"GIF", "WEBP", "PNG"}
 
 
 @dataclass
@@ -44,6 +50,14 @@ def split_sticker(text: str) -> tuple[str, str | None]:
     return cleaned, (emotions[0] if emotions else None)
 
 
+def is_animated(path: Path) -> bool:
+    try:
+        with Image.open(path) as img:
+            return img.format in _ANIMATED_FORMATS and bool(getattr(img, "is_animated", False))
+    except (OSError, EOFError):
+        return False
+
+
 class StickerBook:
     def __init__(self, root: Path, *, capacity: int = 300) -> None:
         self.root = root
@@ -58,6 +72,15 @@ class StickerBook:
 
     def image_path(self, digest: str) -> Path:
         return self.root / f"{digest}.jpg"
+
+    def original_path(self, digest: str) -> Path | None:
+        """动图原图；静态图和以前收藏的没有，就是 None。"""
+        paths = sorted(self.root.glob(f"{digest}.orig.*"))
+        return next((p for p in paths if p.suffix != ".tmp"), None)
+
+    def best_path(self, digest: str) -> Path:
+        """发出去和预览用这个：有动图原图就用原图（才会动），否则用 JPEG。"""
+        return self.original_path(digest) or self.image_path(digest)
 
     def __len__(self) -> int:
         return len(self._items)
@@ -85,12 +108,16 @@ class StickerBook:
         emotion: str,
         person_id: str | None,
         now: datetime | None = None,
+        *,
+        original: Path | None = None,
     ) -> Sticker:
+        """`image` 是 JPEG；`original` 是原图，只有动图才留下（静态图有 JPEG 就够了）。"""
         now_s = (now or datetime.now(UTC)).isoformat(timespec="seconds")
         with self._lock:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._keep_original(digest, original)  # 以前收藏的没有原图，再见到时补上
             sticker = self._items.get(digest)
             if sticker is None:
-                self.root.mkdir(parents=True, exist_ok=True)
                 if not self.image_path(digest).exists():
                     shutil.copyfile(image, self.image_path(digest))
                 sticker = Sticker(digest, description, emotion.strip()[:12] or "其他", now_s, now_s)
@@ -108,7 +135,7 @@ class StickerBook:
         with self._lock:
             if self._items.pop(digest, None) is None:
                 return False
-            self.image_path(digest).unlink(missing_ok=True)
+            self._delete_files(digest)
             self._save()
             return True
 
@@ -152,11 +179,24 @@ class StickerBook:
 
     # ---- 内部 ----
 
+    def _keep_original(self, digest: str, original: Path | None) -> None:
+        if original is None or self.original_path(digest) is not None or not is_animated(original):
+            return
+        target = self.root / f"{digest}.orig{original.suffix.lower()}"
+        tmp = target.with_suffix(".tmp")
+        shutil.copyfile(original, tmp)
+        tmp.replace(target)
+
+    def _delete_files(self, digest: str) -> None:
+        self.image_path(digest).unlink(missing_ok=True)
+        for path in self.root.glob(f"{digest}.orig.*"):
+            path.unlink(missing_ok=True)
+
     def _evict(self) -> None:
         while len(self._items) > self.capacity:
             worst = min(self._items.values(), key=lambda s: (s.seen + 2 * s.used, s.last_seen))
             self._items.pop(worst.digest)
-            self.image_path(worst.digest).unlink(missing_ok=True)
+            self._delete_files(worst.digest)
 
     def _load(self) -> None:
         if not self.index_path.exists():

@@ -33,7 +33,7 @@ _GITIGNORE = (
     "# 派生层可随时重建，不做版本记录\nindex.sqlite\nindex.sqlite-*\ncache/\n"
     "# 原始事件只追加、不需要版本记录；不进 git 也保证“忘掉这件事”能真正删除\nevents/*.jsonl\n"
     "# 图片体积大、也要能被真正删除\nmedia/\n"
-    "# 表情包只记文字信息（index.json），图片本身不进 git\nstickers/*.jpg\n"
+    "# 表情包只记文字信息（index.json），图片本身不进 git\nstickers/*.jpg\nstickers/*.orig.*\n"
 )
 _SELF_TEMPLATES = ("seed.md", "identity.md", "style.md")
 
@@ -109,6 +109,7 @@ def init_memory(layout: MemoryLayout, persona_name: str, *, git: bool = True) ->
     for name in _SELF_TEMPLATES:
         write_new(layout.self_dir / name, render_template(name, name=persona_name))
     write_new(layout.root / ".gitignore", _GITIGNORE)
+    ensure_gitignore(layout)
     write_new(layout.root / ".gitattributes", "* text=auto eol=lf\n")
     for d in (layout.events_dir, layout.journal_dir, layout.people_dir, layout.archive_dir):
         write_new(d / ".gitkeep", "")
@@ -116,6 +117,21 @@ def init_memory(layout: MemoryLayout, persona_name: str, *, git: bool = True) ->
     if git:
         _git_init_and_commit(layout.root, persona_name)
     return created
+
+
+def ensure_gitignore(layout: MemoryLayout) -> bool:
+    """已有记忆文件夹的 .gitignore 不会重新生成：补上后来才有的规则，用户自己加的不动。"""
+    path = layout.root / ".gitignore"
+    text = path.read_text("utf-8") if path.exists() else ""
+    have = set(text.splitlines())
+    rules = [line for line in _GITIGNORE.splitlines() if line and not line.startswith("#")]
+    missing = [line for line in rules if line not in have]
+    if not missing:
+        return False
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text + "\n".join(missing) + "\n", encoding="utf-8", newline="\n")
+    return True
 
 
 def load_manifest(layout: MemoryLayout) -> dict[str, Any]:

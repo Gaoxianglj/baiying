@@ -36,6 +36,8 @@ log = logging.getLogger(__name__)
 
 COOKIE = "companion_console"
 
+_IMAGE_TYPES = {".gif": "image/gif", ".webp": "image/webp", ".png": "image/png"}
+
 Response = tuple[int, dict[str, str], bytes]
 
 
@@ -95,10 +97,11 @@ class ConsoleApp:
             if not digest.isalnum():
                 return _json({"error": "不合法"}, HTTPStatus.BAD_REQUEST)
             with self._lock:
-                path = self.companion.stickers.image_path(digest)
+                path = self.companion.stickers.best_path(digest)
             if not path.exists():
                 return _json({"error": "没有这张表情"}, HTTPStatus.NOT_FOUND)
-            return HTTPStatus.OK, {"Content-Type": "image/jpeg"}, path.read_bytes()
+            content_type = _IMAGE_TYPES.get(path.suffix.lower(), "image/jpeg")
+            return HTTPStatus.OK, {"Content-Type": content_type}, path.read_bytes()
         if method == "POST" and headers.get("content-type", "").split(";")[0] != "application/json":
             return _json({"error": "只接受 JSON"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
 

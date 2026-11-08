@@ -29,7 +29,7 @@ from companion.life.activities import (
 from companion.life.core import LIFE_CHANNEL
 from companion.memory.events import Event
 from companion.memory.index import Fact, MemoryIndex, MemoryKind
-from companion.memory.layout import MemoryLayout, commit_memory, update_manifest
+from companion.memory.layout import MemoryLayout, commit_memory, ensure_gitignore, update_manifest
 from companion.models.codex_app_server import CodexAppServerBackend, talk_only_overrides
 from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
@@ -123,6 +123,7 @@ class Companion:
         self.name = config.persona.name
         self.layout = MemoryLayout(config.memory_dir)
         self.ingest = Ingest(self.layout)
+        ensure_gitignore(self.layout)
         self.people = self.ingest.people
         self.log = self.ingest.log
         self.index = MemoryIndex(self.layout)
@@ -806,16 +807,24 @@ class Companion:
         """
         stored = self.media.save(data)
         if sticker and self.config.stickers.enabled:
+            original = self.media.original_for(stored.digest)
             known = self.stickers.get(stored.digest)
             if known is not None:  # 收藏过的表情不用再看一遍
                 self.stickers.add(
-                    stored.path, stored.digest, known.description, known.emotion, person_id
+                    stored.path,
+                    stored.digest,
+                    known.description,
+                    known.emotion,
+                    person_id,
+                    original=original,
                 )
                 return known.description, stored.digest
             description, emotion, usable = media.describe_sticker(self.gateway, stored.path)
             log.info("看表情包（%s，%s）：%s", emotion, "收藏" if usable else "不收藏", description)
             if usable:
-                self.stickers.add(stored.path, stored.digest, description, emotion, person_id)
+                self.stickers.add(
+                    stored.path, stored.digest, description, emotion, person_id, original=original
+                )
             return description, stored.digest
         description, backend = media.describe(self.gateway, stored.path)
         log.info("看图（%s）：%s", backend, description)
