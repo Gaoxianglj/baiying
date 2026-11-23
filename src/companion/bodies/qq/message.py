@@ -53,6 +53,7 @@ class FileRef:
     file_id: str | None
     size: int | None
     url: str | None
+    busid: int | None = None
 
 
 def file_marker(i: int) -> str:
@@ -168,7 +169,13 @@ def _parse(message: Any, self_id: str, names: dict[str, str], depth: int) -> Inc
             except (TypeError, ValueError):
                 size = None
             out.files.append(
-                FileRef(name, str(data.get("file_id") or "") or None, size, data.get("url") or None)
+                FileRef(
+                    name,
+                    str(data.get("file_id") or data.get("id") or "") or None,
+                    size,
+                    data.get("url") or None,
+                    data.get("busid"),
+                )
             )
             parts.append(file_marker(len(out.files) - 1))
         elif kind == "forward":

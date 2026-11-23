@@ -347,6 +347,8 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 3H6a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h8l7-7V6a3 3 0 0 0-3-3h-4z"/><path d="M14 21v-4a3 3 0 0 1 3-3h4"/><circle cx="9" cy="10" r="1"/><circle cx="14" cy="10" r="1"/><path d="M8.5 14c1.5 1.3 3.5 1.3 5 0"/></svg>表情包</button>
       <button data-page="skills">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l2.4 5.2 5.6.6-4.2 3.8 1.2 5.6L12 15.4 7 18.2l1.2-5.6L4 8.8l5.6-.6z"/></svg>技能</button>
+      <button data-page="trpg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="8" cy="8" r="1"/><circle cx="16" cy="16" r="1"/><circle cx="12" cy="12" r="1"/></svg>跑团</button>
       <button data-page="journal">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3h11a2 2 0 0 1 2 2v16l-3-2-3 2-3-2-3 2V5a2 2 0 0 1 2-2z"/><path d="M9 8h7M9 12h7"/></svg>日记</button>
     </nav>
@@ -844,6 +846,70 @@ function renderSkills() {
 }
 
 // ---------- 日记 ----------
+pages.trpg = async () => {
+  const d = await api("trpg");
+  const selected = d.campaigns.find(c => c.id === state.trpgId) || d.campaigns[0];
+  state.trpgId = selected?.id;
+  let current = null;
+  if (selected) current = await api("trpg", {campaign:selected.id, as_kp:!!state.trpgKP, operation:"状态"});
+  const v = current?.data || {}, full = v.state || {}, cards = full.characters || v.characters || {};
+  const status = {draft:"准备",active:"进行中",paused:"暂停",closed:"结束"};
+  const metric = d.metrics.find(m=>m.day===d.today) || {};
+  const opt = (value,label) => `<option value="${esc(value)}">${esc(label)}</option>`;
+  main.innerHTML = `<div class="page-head"><div><h2>跑团</h2><p class="muted">角色和进度由程序保存；只在需要描写时调用模型。控制台操作不会自动向QQ发消息。</p></div></div>
+    <div class="panel"><div class="actions"><select id="trpgSelect">${d.campaigns.map(c=>`<option value="${esc(c.id)}" ${c.id===selected?.id?"selected":""}>${esc(c.name)} · ${esc(status[c.status]||c.status)}</option>`).join("")}</select>
+      <label><input id="trpgKP" type="checkbox" ${state.trpgKP?"checked":""}> 以本团KP身份管理（可见秘密）</label><button class="btn" id="trpgRefresh">刷新</button></div>
+      <details><summary>建立新团</summary><input id="newTrpgName" placeholder="团名"><select id="newTrpgChannel">${d.channels.map(g=>opt("group:"+g,"群 "+g)).join("")}</select><button class="btn" id="newTrpg">建立</button></details>
+    </div>
+    ${selected?`<div class="stats"><div class="stat"><div class="label">状态</div><strong>${esc(status[selected.status])} · v${selected.version}</strong></div><div class="stat"><div class="label">叙事时间</div><strong>第${esc(full.day||v.day)}日 · ${esc(full.minutes??v.minutes)}分钟</strong></div><div class="stat"><div class="label">今日模型请求</div><strong>${metric.calls??0}</strong></div><div class="stat"><div class="label">今日送入字符</div><strong>${metric.input_chars??0}</strong></div></div>
+    <div class="panel"><h3>进度</h3><p>${esc(full.scenes?.[full.scene]?.public||v.description||"尚无公开场景")}</p>
+      <div class="actions">${["开团","暂停","续团","结束","确认恢复"].map(op=>`<button class="btn" data-trpg-op="${op}">${op}</button>`).join("")}<button class="btn" id="trpgReport">下载当前可见战报</button><button class="btn" id="trpgCardExport">下载卡与状态</button></div>
+      <div class="muted">输入token ${metric.input_tokens??"未报告"} · 输出token ${metric.output_tokens??"未报告"} · 缓存token ${metric.cached_tokens??"未报告"}。服务端未报告时不会写成0；订阅额度不等于固定轮数。</div>
+      ${full.needs_confirmation?'<p>这是恢复草案；核对角色、所在位置、物品与疑点后再确认，确认本身不会自动续团。</p>':""}
+    </div>
+    <div class="panel"><h3>白璎主持</h3><p>${(full.ai_kp?.enabled||v.ai_host)?"本团已启用独立AI主持。玩家直接说：继续跑团 → 确认继续；随后描述行动，按提示说确认投骰、闪避或反击。":"本团尚未启用AI主持，仍按管理员准备的团务流程运行。"}</p>
+      ${state.trpgKP?`<p class="muted">专用主持只读取已授权的本团来源；公开叙事看不到KP原文。授权撤销后不再发起私有模型调用；修改准备资料后须重新授权。</p><label><input id="trpgPrivateConsent" type="checkbox"> 我允许当前订阅模型在本团专用主持上下文中读取已登记来源和当前审核模组</label><button class="btn" id="trpgEnableHost">授权并启用</button><button class="btn" id="trpgDisableHost">撤销AI主持</button>`:""}</div>
+    <div class="panel"><h3>人物卡</h3>${Object.entries(cards).map(([id,c])=>`<div class="field"><div>${esc(c.name)} ${c.npc?"（NPC）":""}</div><div>${c.HP!==undefined?`HP ${c.HP}/${c.HP_MAX} · SAN ${c.SAN}`:""} ${esc((c.conditions||[]).join("、"))}<small class="muted"> ${esc(id)}</small></div></div>`).join("")||"尚未录入人物"}</div>
+    ${state.trpgKP?`<div class="panel"><h3>KP管理</h3><details><summary>成员登记</summary><input id="trpgMember" placeholder="QQ号"><select id="trpgRole">${opt("player","玩家")+opt("kp","KP")+opt("observer","旁观者")}</select><button class="btn" id="trpgAddMember">保存成员</button></details>
+      <details><summary>录入或修改角色卡</summary><input id="trpgPerson" placeholder="固定人物ID（成员登记后可在下方状态查看）"><input id="trpgCardName" placeholder="角色名"><label><input type="checkbox" id="trpgNPC"> NPC</label>
+      <p class="muted">新卡可导入属性、技能和物品；修改现有卡需暂停并填写原因。程序会核验数值，不覆盖骰点。</p><textarea id="trpgCard" rows="7" style="width:100%" placeholder='{"CON":55,"DEX":50,"HP_MAX":10,"HP":5,"SAN":64,"skills":{"侦查":60},"items":{"绷带":1}}'></textarea><input id="trpgCardReason" placeholder="修改理由"><select id="trpgCardMode">${opt("建卡","新建")+opt("改卡","修改")}</select><button class="btn" id="trpgSaveCard">保存角色</button></details>
+      <details><summary>配置场景与行动</summary><input id="trpgSceneId" placeholder="场景编号"><input id="trpgSceneTitle" placeholder="标题"><textarea id="trpgScenePublic" rows="3" style="width:100%" placeholder="玩家可观察到的环境"></textarea><textarea id="trpgSceneActions" rows="6" style="width:100%" placeholder='行动模板列表；用法见项目 docs/trpg-system.md'></textarea><button class="btn" id="trpgSaveScene">保存场景</button>
+      <p class="muted">自由探索使用场景行动和线索条件，不按房间编号强制前进。尚无模板的行动会提出澄清，不擅自改状态。</p></details>
+      <details><summary>宣告正式检定</summary><input id="trpgCheckActor" placeholder="玩家固定人物ID"><input id="trpgCheckSkill" placeholder="技能，如侦查/斗殴/SAN"><select id="trpgCheckKind">${["skill","sanity","combat","opposed","heal","growth","dying"].map((x,i)=>opt(x,["技能","理智","战斗","对抗","治疗","成长","濒死"][i])).join("")}</select><input id="trpgGoal" placeholder="要达成的目标"><input id="trpgRisk" placeholder="失败风险（投骰前公开）"><textarea id="trpgCheckExtra" rows="4" style="width:100%" placeholder='高级选项，如 {"difficulty":"困难","bonus":1}；战斗需先设定参战者及对手'></textarea><button class="btn" id="trpgRequest">宣告检定</button></details>
+      <details><summary>资料入库和按页检索</summary><input id="trpgDocPath" placeholder="本机PDF/MD路径"><select id="trpgVisibility">${opt("kp","仅KP")+opt("public","公开规则")+opt("party","参团者私聊可见")}</select><button class="btn" id="trpgImport">入库</button><input id="trpgQuery" placeholder="关键词"><button class="btn" id="trpgSearch">检索当前权限资料</button></details>
+      <p class="muted">本地模组导入：高级操作选“模组草案”，粘贴 scenes / facts / notes 对象；审查完整状态里的 module_draft 后执行“采纳模组”。KP资料不会发给公开叙事模型。</p><details><summary>高级操作与完整状态</summary><select id="trpgAdvancedOp">${["状态","转场","事实","物品","战斗","结束战斗","下一位","状态裁定","模组草案","采纳模组","下一日","推进时间","房规","裁定","回滚"].map(x=>opt(x,x)).join("")}</select><textarea id="trpgAdvancedArgs" rows="10" style="width:100%" placeholder="操作参数对象"></textarea><button class="btn" id="trpgAdvanced">执行</button><pre style="white-space:pre-wrap;max-height:420px;overflow:auto">${esc(JSON.stringify(v,null,2))}</pre></details>
+    </div>`:""}
+    <div class="panel"><h3>场景关系</h3><div id="trpgGraph"></div></div>`:"<div class='panel'>还没有团。可由主人在QQ里发 /团 创建 团名，或在上方建立。</div>"}
+    <div class="panel"><h3>操作结果</h3><pre id="trpgResult" style="white-space:pre-wrap;max-height:420px;overflow:auto"></pre></div>`;
+  const invoke = async (operation,args={}) => {
+    try { const r=await api("trpg",{campaign:state.trpgId,as_kp:!!state.trpgKP,operation,args,request_id:crypto.randomUUID()}); $("#trpgResult").textContent=r.text; toast("已处理"); return r; }
+    catch(e){ $("#trpgResult").textContent=e.message; toast(e.message,true); }
+  };
+  const obj = id => JSON.parse($(id).value.trim()||"{}");
+  const bind = (id,fn) => { const e=$(id); if(e) e.onclick=async()=>{try{await fn();}catch(x){toast(x.message,true);}}; };
+  $("#trpgSelect").onchange = async e=>{state.trpgId=e.target.value;await pages.trpg();};
+  $("#trpgKP").onchange = async e=>{state.trpgKP=e.target.checked;await pages.trpg();};
+  bind("#trpgRefresh",()=>pages.trpg());
+  bind("#newTrpg",async()=>{const r=await api("trpg",{operation:"创建",channel:$("#newTrpgChannel").value,args:{name:$("#newTrpgName").value}});state.trpgId=r.campaign;state.trpgKP=true;await pages.trpg();});
+  main.querySelectorAll("[data-trpg-op]").forEach(b=>b.onclick=()=>invoke(b.dataset.trpgOp));
+  bind("#trpgAddMember",()=>invoke("成员",{person:$("#trpgMember").value,role:$("#trpgRole").value}));
+  bind("#trpgSaveCard",()=>invoke($("#trpgNPC").checked?"NPC":$("#trpgCardMode").value,{person:$("#trpgPerson").value,name:$("#trpgCardName").value,reason:$("#trpgCardReason").value,card:obj("#trpgCard")}));
+  bind("#trpgSaveScene",()=>invoke("场景",{scene:{id:$("#trpgSceneId").value,title:$("#trpgSceneTitle").value,public:$("#trpgScenePublic").value,actions:JSON.parse($("#trpgSceneActions").value||"[]")}}));
+  bind("#trpgRequest",()=>invoke("检定",{...obj("#trpgCheckExtra"),actor:$("#trpgCheckActor").value,skill:$("#trpgCheckSkill").value,kind:$("#trpgCheckKind").value,reason:$("#trpgGoal").value,risk:$("#trpgRisk").value}));
+  bind("#trpgImport",()=>invoke("导入资料",{path:$("#trpgDocPath").value,visibility:$("#trpgVisibility").value}));
+  bind("#trpgSearch",()=>invoke("检索",{query:$("#trpgQuery").value,private:true}));
+  bind("#trpgDisableHost",()=>invoke("主持授权",{enabled:false}));
+  bind("#trpgEnableHost",()=>{if(!$("#trpgPrivateConsent").checked){toast("请先明确勾选本团私有资料授权",true);return;}const sources=full.ai_kp?.sources||[];if(!sources.length){toast("请先完成来源锁定的模组准备和登记",true);return;}return invoke("主持授权",{enabled:true,allow_private_model:true,sources,consent:"本机控制台勾选同意当前订阅模型读取本团已登记KP来源及审核模组"});});
+  bind("#trpgAdvanced",()=>invoke($("#trpgAdvancedOp").value,obj("#trpgAdvancedArgs")));
+  const download=(name,value)=>{const u=URL.createObjectURL(new Blob([JSON.stringify(value,null,2)],{type:"application/json"}));const a=document.createElement("a");a.href=u;a.download=name;a.click();URL.revokeObjectURL(u);};
+  bind("#trpgCardExport",()=>download("团状态-"+state.trpgId+".json",v));
+  bind("#trpgReport",async()=>{const r=await invoke("战报",{private:!!state.trpgKP});if(r)download("战报-"+state.trpgId+".json",r.data);});
+  const scenes = full.scenes || (v.scene?{[v.scene]:{title:v.scene,actions:[]}}:{});
+  const ids=Object.keys(scenes).slice(0,40), nodes=ids.map((id,i)=>({id,x:90+(i%4)*180,y:35+Math.floor(i/4)*85}));
+  const edges=[];nodes.forEach(n=>(scenes[n.id].actions||[]).forEach(a=>(a.success||[]).filter(e=>e.type==="scene").forEach(e=>{const t=nodes.find(x=>x.id===e.name);if(t)edges.push(`<line x1="${n.x}" y1="${n.y}" x2="${t.x}" y2="${t.y}" stroke="#c4abfc"/>`);}))); 
+  if($("#trpgGraph"))$("#trpgGraph").innerHTML=`<svg viewBox="0 0 760 ${Math.max(100,Math.ceil(nodes.length/4)*85)}" role="img" aria-label="当前权限可见的场景关系">${edges.join("")}${nodes.map(n=>`<rect x="${n.x-70}" y="${n.y-18}" width="140" height="36" rx="9" fill="${n.id===(full.scene||v.scene)?"#ede5ff":"#f6f2ff"}"/><text x="${n.x}" y="${n.y+5}" text-anchor="middle" font-size="12">${esc(scenes[n.id].title||n.id)}</text>`).join("")}</svg>`;
+};
+
 pages.journal = async () => {
   const d = await api("journal");
   if (!d.entries.length) {

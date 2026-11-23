@@ -2,10 +2,10 @@
 
 做法：
 - 启动时用 `-c` 覆盖配置：用中性的对话代理指令替换内置的编程助手指令，关掉执行命令、看本机图片
-  与联网搜索，不保存会话历史；每轮回复都开一个新线程、沙箱只读、从不请求审批。
+  与联网搜索；普通聊天按频道保存线程，辅助调用使用临时线程，沙箱只读、从不请求审批。
 - 一律关掉用户 Codex 配置里的 MCP 服务器、插件、电脑操控与浏览器工具：她在群聊里收到的话可能
   带有诱导，不能让模型借这些工具碰到本机。她要碰文件只能走技能，技能里才有权限检查。
-- 角色设定、记忆、对话记录全部放进本轮输入，所以和兜底 API 用的是同一份提示词。
+- 角色设定与检索记忆每轮刷新，事件按编号增量投递；兜底 API 仍用原来的完整提示词。
 - `account/rateLimits/read` 读额度窗口，供网关判断要不要提前切到兜底 API。
 
 协议依据：https://developers.openai.com/codex/app-server （JSON-RPC 2.0，线上省略 "jsonrpc" 字段）。
@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,8 @@ from typing import Any
 
 from companion import __version__
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
+from companion.models.runtime import Observer, RunControl, ToolSet
+from companion.models.sessions import ChatSessions
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +128,9 @@ class CodexAppServerBackend:
         name: str = "subscription",
         env: dict[str, str] | None = None,
         instructions: str = INSTRUCTIONS,
+        sessions: ChatSessions | None = None,
+        persistent_chats: bool = True,
+        recover_pending: bool = False,
     ) -> None:
         self.name = name
         self.instructions = instructions  # 每个线程的基础指令（替换内置的编程助手指令）
@@ -140,6 +146,22 @@ class CodexAppServerBackend:
         self._reader: threading.Thread | None = None
         self._lock = threading.Lock()  # 同一时刻只跑一轮
         self.last_rate_limits: RateLimits | None = None
+        self.sessions = sessions
+        self.persistent_chats = persistent_chats
+        self.recover_pending = recover_pending
+        self._loaded: set[str] = set()
+        self._tools: ToolSet | None = None
+        self._observer: Observer | None = None
+        self._active_thread: str | None = None
+        self._active_turn: str | None = None
+        self.native_tools_supported = True
+        self._experimental_api = True
+        self._control: RunControl | None = None
+        self._control_requests: dict[int, str] = {}
+        self._control_sent: set[str] = set()
+        self._control_counter = -1000
+        self._interrupt_sent = False
+        self._send_lock = threading.Lock()
 
     @classmethod
     def from_codex(
@@ -148,6 +170,8 @@ class CodexAppServerBackend:
         workdir: Path,
         *,
         overrides: dict[str, str] | None = None,
+        codex_home: Path | None = None,
+        env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> CodexAppServerBackend:
         """overrides：额外的 `-c` 配置（值是 TOML）；默认是聊天用的“无工具”配置。"""
@@ -155,19 +179,26 @@ class CodexAppServerBackend:
         if exe is None:
             raise ModelError(f"找不到 {codex_command}：请先安装 Codex CLI 并登录 ChatGPT")
         workdir.mkdir(parents=True, exist_ok=True)
+        if codex_home is not None:
+            if not codex_home.is_dir():
+                raise ModelError(f"白璎的 Codex 目录不存在：{codex_home}")
+            env = dict(os.environ if env is None else env)
+            env["CODEX_HOME"] = str(codex_home)
+            env["CODEX_SQLITE_HOME"] = str(codex_home)
         # 指令通过 thread/start 的 baseInstructions 传入；这里关掉用不到的工具
-        settings = {"personality": '"none"', **lockdown_overrides()}
+        settings = {"personality": '"none"', **lockdown_overrides(codex_home)}
         settings |= overrides if overrides is not None else talk_only_overrides()
         command = [str(_native_codex(Path(exe))), "app-server"]
         for key, value in settings.items():
             command += ["-c", f"{key}={value}"]
-        return cls(command=command, workdir=workdir, **kwargs)
+        return cls(command=command, workdir=workdir, env=env, **kwargs)
 
     # ---- 生命周期 ----
 
     def start(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
+        self._loaded.clear()
         try:
             self._proc = subprocess.Popen(
                 self._command,
@@ -179,19 +210,33 @@ class CodexAppServerBackend:
                 encoding="utf-8",
                 bufsize=1,
                 env=self._env,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except OSError as e:
             raise ModelError(f"无法启动 codex app-server：{e}", retryable=True) from e
         self._inbox = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, args=(self._proc,), daemon=True)
         self._reader.start()
-        self._request(
-            "initialize",
-            {"clientInfo": {"name": "companion", "title": "白璎", "version": __version__}},
-        )
+        init = {"clientInfo": {"name": "companion", "title": "白璎", "version": __version__}}
+        if self._experimental_api:
+            init["capabilities"] = {"experimentalApi": True}
+        try:
+            self._request("initialize", init)
+        except ModelError as e:
+            if not self._experimental_api or not any(w in str(e).lower() for w in (
+                "experimental", "capabilities", "unknown field", "unsupported",
+            )):
+                raise
+            self._experimental_api = False
+            self.native_tools_supported = False
+            self.close()
+            self.start()
+            return
         self._send({"method": "initialized"})
 
     def close(self) -> None:
+        self._loaded.clear()
+        self._active_thread, self._active_turn, self._control = None, None, None
         proc, self._proc = self._proc, None
         if proc is None:
             return
@@ -212,45 +257,169 @@ class CodexAppServerBackend:
         *,
         json_schema: dict[str, Any] | None = None,
         max_tokens: int | None = None,
+        session_key: str | None = None,
+        session_messages: list[ChatMessage] | None = None,
+        session_bootstrap: list[ChatMessage] | None = None,
+        tools: ToolSet | None = None,
+        observer: Observer | None = None,
+        control: RunControl | None = None,
     ) -> ChatResult:
         with self._lock:
             self.start()
+            if not self.native_tools_supported:
+                tools = None
+            instructions = self.instructions
+            if tools and tools.specs:
+                instructions = instructions.replace(
+                    "不要执行命令，不要读写文件。",
+                    "不要执行命令，也不要自行访问本机。文件操作仅能调用本应用提供的 baiying_ "
+                    "原生工具，由程序检查权限。",
+                )
             started = time.perf_counter()
+            # 辅助调用没有 key，始终隔离；只有显式的日常聊天才持久化。
+            key = (session_key if self.sessions is not None and self.persistent_chats
+                   and json_schema is None else None)
+            policy = hashlib.sha256(
+                (f"{self.model}\n{instructions}\n{self._workdir}\n{self._command}\n"
+                 + json.dumps(tools.specs if tools else [], sort_keys=True)).encode()
+            ).hexdigest()
+            row = self.sessions.get(key) if key and self.sessions else None
+            if row and (row[1] != policy or (row[2] and not self.recover_pending)):
+                # 上次生成结果未知时，不盲目重放那次工具链；用原始对话重新引导。
+                self.sessions.retire("policy-change" if row[1] != policy else "uncertain-turn", key)
+                row = None
             thread_params: dict[str, Any] = {
                 "cwd": str(self._workdir),
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
-                "baseInstructions": self.instructions,
-                "ephemeral": True,  # 不把聊天存进 Codex 的历史
+                "baseInstructions": instructions,
+                "ephemeral": key is None,
             }
             if self.model:
                 thread_params["model"] = self.model
-            thread = self._request("thread/start", thread_params)
-            thread_id = (thread.get("thread") or {}).get("id")
+            if tools and tools.specs:
+                thread_params["dynamicTools"] = tools.specs
+            thread_id = row[0] if row else None
+            if thread_id and thread_id not in self._loaded:
+                try:
+                    self._request("thread/resume", {
+                        "threadId": thread_id,
+                        **{k: v for k, v in thread_params.items()
+                           if k not in {"ephemeral", "dynamicTools"}},
+                    })
+                except ModelError as e:
+                    # 只在已知历史不存在时重建；认证/网络错误交给原网关兜底。
+                    if not any(s in str(e).lower() for s in (
+                        "not found", "no rollout", "does not exist", "unknown thread",
+                    )):
+                        raise
+                    assert self.sessions is not None and key is not None
+                    self.sessions.retire("missing-thread", key)
+                    thread_id = None
+                    row = None
+            if thread_id is None:
+                try:
+                    thread = self._request("thread/start", thread_params)
+                except ModelError as e:
+                    if not tools or not any(w in str(e).lower() for w in (
+                        "dynamictools", "dynamic_tools", "experimental", "unknown field",
+                    )):
+                        raise
+                    self.native_tools_supported = False
+                    tools = None
+                    thread_params.pop("dynamicTools", None)
+                    log.warning("当前 Codex 不支持动态工具，改用原技能标记执行链")
+                    thread = self._request("thread/start", thread_params)
+                thread_id = (thread.get("thread") or {}).get("id")
+                if key and thread_id:
+                    assert self.sessions is not None
+                    self.sessions.put(key, thread_id, policy)
             if not thread_id:
                 raise ModelError(f"thread/start 返回异常：{str(thread)[:200]}")
+            if key:
+                self._loaded.add(thread_id)
+            selected = messages
+            if key:
+                assert self.sessions is not None
+                source = session_messages if row else session_bootstrap
+                selected = [m for m in (source if source is not None else messages)
+                            if m.event_id is None or self.sessions.unseen(key, m.event_id)]
 
             turn_params: dict[str, Any] = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": render_prompt(messages, json_schema)}]
+                "input": [{"type": "text", "text": render_prompt(selected, json_schema)}]
                 + [
                     {"type": "localImage", "path": str(path.resolve())}
-                    for m in messages
+                    for m in selected
                     for path in m.images
                 ],
             }
             if self.effort:
                 turn_params["effort"] = self.effort
+            if tools and tools.specs:
+                turn_params["input"][0]["text"] += (
+                    "\n\n当前已提供对应的原生工具。需要技能时优先调用原生工具，不要把调用写成"
+                    "文本标记；arg 是参数或路径，写文件正文放 content，其他 content 填空。"
+                    "屏幕、剪贴板仍按原标记使用。工具返回前不要声称操作完成。"
+                )
             if json_schema is not None:
                 turn_params["outputSchema"] = json_schema
-            self._request("turn/start", turn_params)
-            text, _ = self._collect_turn(thread_id)
+            if key:
+                assert self.sessions is not None
+                self.sessions.pending(key)
+            try:
+                turn = self._request("turn/start", turn_params)
+                self._tools, self._observer = tools, observer
+                self._active_thread = thread_id
+                self._active_turn = (turn.get("turn") or {}).get("id")
+                self._control = control
+                self._control_sent.clear()
+                self._control_requests.clear()
+                self._interrupt_sent = False
+                self._observe("turn/started", {"threadId": thread_id,
+                                               "turn": turn.get("turn") or {}})
+                text, _ = self._collect_turn(thread_id, turn_id=(turn.get("turn") or {}).get("id"))
+            except ModelError:
+                # 避免仍在生成的旧 turn 与下一条消息竞争；索引 pending 留作恢复依据。
+                if key:
+                    self.close()
+                raise
+            finally:
+                self._tools, self._observer = None, None
+                self._active_thread, self._active_turn = None, None
+                self._control = None
+            if key:
+                assert self.sessions is not None
+                self.sessions.complete(key, thread_id, [m.event_id for m in selected if m.event_id])
             return ChatResult(
                 text=text,
                 backend=self.name,
                 model=self.model or "codex-default",
                 seconds=time.perf_counter() - started,
+                raw={"session_key": key, "thread_id": thread_id} if key else {},
             )
+
+    def note_response(self, result: ChatResult, event_id: str) -> None:
+        """模型回复经 QQ 标记清理后落事件日志，不在下一轮重复输入给原线程。"""
+        key, tid = result.raw.get("session_key"), result.raw.get("thread_id")
+        if self.sessions and key and tid:
+            self.sessions.complete(key, tid, [event_id])
+
+    def rotate_sessions(self, reason: str) -> int:
+        with self._lock:
+            if self.sessions is None:
+                return 0
+            ids = self.sessions.retire(reason)
+            if self._proc is not None and self._proc.poll() is None:
+                for tid in ids:
+                    if tid in self._loaded:
+                        try:
+                            self._request("thread/unsubscribe", {"threadId": tid})
+                        except ModelError as e:
+                            log.warning("旧聊天线程已失效，取消订阅暂时失败：%s", e)
+            self._loaded.difference_update(ids)
+            # 只切换本项目索引，不删除用户 Codex 原始会话；失败也可从事件日志重建。
+            return len(ids)
 
     def generate_image(self, prompt: str, references: Sequence[Path] = ()) -> tuple[Path, str]:
         """用 Codex 内置的生图工具画一张图，返回（图片路径，模型改写后的画面描述）。
@@ -298,8 +467,9 @@ class CodexAppServerBackend:
     def _send(self, message: dict[str, Any]) -> None:
         assert self._proc is not None and self._proc.stdin is not None
         try:
-            self._proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-            self._proc.stdin.flush()
+            with self._send_lock:
+                self._proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+                self._proc.stdin.flush()
         except OSError as e:
             raise ModelError(f"codex app-server 已退出：{e}", retryable=True) from e
 
@@ -318,7 +488,7 @@ class CodexAppServerBackend:
             self._handle_side_message(msg)
 
     def _collect_turn(
-        self, thread_id: str, *, allow_empty: bool = False
+        self, thread_id: str, *, allow_empty: bool = False, turn_id: str | None = None
     ) -> tuple[str, list[dict[str, Any]]]:
         """读完一轮的消息，返回（最终回复，生成的图片 item）。"""
         deltas: list[str] = []
@@ -335,6 +505,13 @@ class CodexAppServerBackend:
                 continue
             if params.get("threadId") not in (None, thread_id):
                 continue
+            incoming_turn = params.get("turnId") or (params.get("turn") or {}).get("id")
+            if turn_id and incoming_turn and incoming_turn != turn_id:
+                continue
+            self._observe(str(method), params)
+            if (method == "item/completed"
+                    and (params.get("item") or {}).get("type") == "contextCompaction"):
+                log.info("Codex 聊天线程完成上下文压缩：%s", thread_id)
             if method == "item/agentMessage/delta":
                 deltas.append(str(params.get("delta", "")))
             elif method == "item/completed":
@@ -366,6 +543,23 @@ class CodexAppServerBackend:
 
     def _handle_side_message(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")
+        if method == "item/tool/call" and "id" in msg:
+            p = msg.get("params") or {}
+            valid = (self._tools is not None and p.get("threadId") == self._active_thread
+                     and p.get("turnId") == self._active_turn and not p.get("namespace")
+                     and isinstance(p.get("callId"), str) and bool(p["callId"]))
+            if valid:
+                try:
+                    result = self._tools.call(p.get("tool", ""), p.get("arguments"), p["callId"])
+                except Exception:
+                    log.exception("原生技能回调失败")
+                    result = {"success": False, "contentItems": [
+                        {"type": "inputText", "text": "工具调用失败，请核对实际状态。"}]}
+            else:
+                result = {"success": False, "contentItems": [
+                    {"type": "inputText", "text": "工具请求不属于当前聊天或当前轮，拒绝执行。"}]}
+            self._send({"id": msg["id"], "result": result})
+            return
         if method == "account/rateLimits/updated":
             self.last_rate_limits = parse_rate_limits(msg.get("params") or {})
         elif method is not None and "id" in msg:
@@ -373,9 +567,73 @@ class CodexAppServerBackend:
                 {"id": msg["id"], "error": {"code": -32601, "message": "本客户端不支持该请求"}}
             )
 
+    def _observe(self, method: str, params: dict[str, Any]) -> None:
+        if self._observer is not None:
+            self._observer(method, params)
+
+    def interrupt_current(self) -> None:
+        if self._active_thread and self._active_turn and not self._interrupt_sent:
+            self._interrupt_sent = True
+            self._send({"id": -999, "method": "turn/interrupt", "params": {
+                "threadId": self._active_thread, "turnId": self._active_turn,
+            }})
+
+    def _pump_control(self) -> None:
+        control = self._control
+        if control is None or not self._active_turn:
+            return
+        if control.stopped.is_set() or (control.deadline and time.monotonic() > control.deadline):
+            self.interrupt_current()
+            return
+        for item in control.pending():
+            if item["id"] in self._control_sent:
+                continue
+            self._control_counter -= 1
+            rid = self._control_counter
+            self._control_sent.add(item["id"])
+            self._control_requests[rid] = item["id"]
+            self._send({"id": rid, "method": "turn/steer", "params": {
+                "threadId": self._active_thread, "expectedTurnId": self._active_turn,
+                "input": [{"type": "text", "text": "原任务的追加要求：" + item["text"]}],
+            }})
+
+    def compact_session(self, session_key: str, observer: Observer | None = None) -> bool:
+        with self._lock:
+            row = self.sessions.get(session_key) if self.sessions else None
+            if row is None:
+                return False
+            self.start()
+            self._request("thread/resume", {"threadId": row[0], "approvalPolicy": "never",
+                                            "sandbox": "read-only", "cwd": str(self._workdir)})
+            self._observer = observer
+            try:
+                self._request("thread/compact/start", {"threadId": row[0]})
+                self._collect_turn(row[0], allow_empty=True)
+            finally:
+                self._observer = None
+            return True
+
     def _receive(self) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout
         try:
-            msg = self._inbox.get(timeout=self.timeout)
+            while True:
+                self._pump_control()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                try:
+                    msg = self._inbox.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+                rid = msg.get("id") if isinstance(msg, dict) else None
+                if rid in self._control_requests and isinstance(msg, dict) and "method" not in msg:
+                    item_id = self._control_requests.pop(rid)
+                    if self._control:
+                        self._control.receipt(item_id, "error" not in msg,
+                                              "运行中的原任务已接收" if "error" not in msg
+                                              else "本轮未接收，将在下一步或恢复时重投")
+                    continue
+                break
         except queue.Empty as e:
             self.close()
             raise ModelError(
@@ -413,8 +671,8 @@ _LOCKED_FEATURES = (
 )
 
 
-def _mcp_server_names() -> list[str]:
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+def _mcp_server_names(home: Path | None = None) -> list[str]:
+    home = home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     try:
         config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
@@ -426,18 +684,21 @@ def _can_switch_off(name: str) -> bool:
     return name.replace("_", "").replace("-", "").isalnum()  # 别的字符写不进 -c 的点号路径
 
 
-def lockdown_overrides() -> dict[str, str]:
-    """关掉用户 Codex 配置里的 MCP 服务器和各种能碰到本机的工具（只读配置里的名字）。"""
+def lockdown_overrides(codex_home: Path | None = None) -> dict[str, str]:
+    """关掉 Codex 配置里的 MCP 服务器和能访问本机的工具（只读配置里的名字）。"""
     out = {f"features.{name}": "false" for name in _LOCKED_FEATURES}
-    for name in _mcp_server_names():
+    # 记忆由白璎自己的事件、档案与检索管理，不混入个人 Codex 的全局记忆。
+    out |= {"memories.generate_memories": "false", "memories.use_memories": "false",
+            "memories.dedicated_tools": "false"}
+    for name in _mcp_server_names(codex_home):
         if _can_switch_off(name):
             out[f"mcp_servers.{name}.enabled"] = "false"
     return out
 
 
-def stuck_mcp_servers() -> list[str]:
+def stuck_mcp_servers(codex_home: Path | None = None) -> list[str]:
     """lockdown_overrides 关不掉的 MCP 服务器：名字特殊，会留在 Codex 进程里。"""
-    return [name for name in _mcp_server_names() if not _can_switch_off(name)]
+    return [name for name in _mcp_server_names(codex_home) if not _can_switch_off(name)]
 
 
 # 只负责“说话”的进程（聊天、画画、自主活动）不需要的工具。

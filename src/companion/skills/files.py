@@ -1,6 +1,6 @@
 """收发文件，写新文件。
 
-- 收：别人发来的文件（不超过 max_mb）存进工作文件夹的 inbox/日期/，她看到文件名、大小和存放位置；
+- 收：别人发来的文件（不超过 max_mb）与产出统一存进 chats/聊天/，不按日期分层；
   小的文本文件把开头一段直接给她看。助手（Agent）在同一个工作文件夹里，可以接着处理。
 - 发：【发文件：路径】发给对方（不超过 max_mb）。能发什么看 skills/access.py：这个聊天的文件夹和
   这个聊天收到的文件谁都能发；主人私聊还能发这台电脑上的其他文件（黑名单除外）。
@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import codecs
 import re
-from datetime import UTC, datetime
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -71,24 +72,27 @@ class FileInbox:
         self.cfg = cfg
         self.workspace = workspace if workspace.is_absolute() else root / workspace
         self.folder = cfg.inbox if cfg.inbox.is_absolute() else root / cfg.inbox
+        self._save_lock = threading.Lock()
 
     @property
     def max_bytes(self) -> int:
         return int(self.cfg.max_mb * 1024 * 1024)
 
     def save(self, name: str, data: bytes, now: datetime | None, channel: str) -> Path:
-        """存进 inbox/日期/聊天/；重名的加序号，不覆盖。按聊天分开，读文件时才分得清是谁的。"""
-        day = (now or datetime.now(UTC)).astimezone()
-        folder = self.folder / f"{day:%Y-%m-%d}" / channel_folder(channel)
-        folder.mkdir(parents=True, exist_ok=True)
-        clean = safe_name(name)
-        path = folder / clean
-        n = 1
-        while path.exists():
-            path = folder / f"{Path(clean).stem}-{n}{Path(clean).suffix}"
-            n += 1
-        path.write_bytes(data)
-        return path
+        """收件与产出共用固定聊天文件夹；关闭聊天文件夹时，收件仍放在独立 inbox/聊天/。"""
+        from companion.skills.access import _write_exclusive
+
+        # Windows 对尚未创建的父目录 resolve 时，不能与另一收件线程同时创建该目录。
+        with self._save_lock:
+            base = self.workspace / "chats" if self.cfg.folder_enabled else self.folder
+            folder = base / channel_folder(channel)
+            if not folder.resolve().is_relative_to(base.resolve()):
+                raise SkillError("收件文件夹不能指向别的聊天或目录")
+            if self.cfg.folder_enabled and not base.resolve().is_relative_to(self.workspace.resolve()):
+                raise SkillError("聊天文件夹不能指向工作文件夹以外")
+            folder.mkdir(parents=True, exist_ok=True)
+            clean = safe_name(name)
+            return _write_exclusive(folder / clean, data)
 
     def describe(self, path: Path, name: str) -> str:
         """写进消息里给她看：文件名、大小、存在哪；文本文件附上开头一段。"""

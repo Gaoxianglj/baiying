@@ -366,7 +366,10 @@ def test_find_files_only_for_owner_in_private(env):
     (env.secret_dir / "季度报告2.pdf").write_bytes(b"x")
     skill = FindFile(env.cfg, env.access)
     assert skill.allowed(OWNER_PRIVATE)
-    assert not any(skill.allowed(c) for c in (IN_GROUP, OWNER_IN_GROUP, FRIEND_PRIVATE))
+    assert all(skill.allowed(c) for c in (IN_GROUP, OWNER_IN_GROUP, FRIEND_PRIVATE))
+    for ctx in (IN_GROUP, OWNER_IN_GROUP, FRIEND_PRIVATE):
+        with pytest.raises(SkillError):
+            skill.run("找文件", f"季度｜{env.root}", ctx)
     found = skill.run("找文件", f"季度 报告｜{env.root}", OWNER_PRIVATE).text
     assert "季度报告.pdf" in found and "季度报告2.pdf" not in found  # 黑名单里的不列
     assert "my_password" not in skill.run("找文件", f"password｜{env.root}", OWNER_PRIVATE).text
@@ -937,7 +940,7 @@ def test_prompt_shows_skills_and_image_numbers(bot):
     system = request[0].content
     for marker in ("【翻记录", "【看图", "【存图", "【发图", "【写文件", "【发文件", "【读文件"):
         assert marker in system, marker
-    assert "【找文件" not in system and "【任务" not in system  # 群里没有的技能不告诉她
+    assert "【找文件" in system and "【任务：" in system  # 群里可在自己的文件夹搜索
     assert "这台电脑" not in system
 
 
@@ -1085,7 +1088,7 @@ def test_owner_private_is_not_silently_dropped_by_rate_limit(bot):
     assert len(bot.client.texts("send_private_msg")) == 3
 
 
-def test_owner_gets_more_rounds_than_others(bot):
+def test_group_and_owner_both_have_unlimited_skill_rounds(bot):
     class Echo(Skill):
         name = "echo"
         label = "回声"
@@ -1097,9 +1100,10 @@ def test_owner_gets_more_rounds_than_others(bot):
     bot.c.skills.all.append(Echo())
     bot.c.config.skills.max_rounds = 2
     bot.c.config.skills.owner_max_rounds = 4
-    bot.replies["list"] = ["【回声：1】"]
+    bot.replies["list"] = ["【回声：1】"] * 12 + ["完成"]
     run(bot, msg("来", group=GROUP))
     rounds_in_group = len(bot.chat.requests)
+    bot.replies["list"] = ["【回声：1】"] * 12 + ["完成"]
     run(bot, msg("来", user=OWNER, mid=2))
-    assert rounds_in_group == 3  # 2 次技能 + 最后一次回复
-    assert len(bot.chat.requests) - rounds_in_group == 5
+    assert rounds_in_group == 13
+    assert len(bot.chat.requests) - rounds_in_group == 13

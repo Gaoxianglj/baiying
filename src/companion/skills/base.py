@@ -9,12 +9,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
+
+if TYPE_CHECKING:
+    from companion.skills.tasks import TaskBook
 
 from companion.config import SkillsConfig
 
@@ -50,6 +54,15 @@ class SkillContext:
     fetch_images: Callable[[str], list[bytes]] | None = None
     # 这一轮读过本机文件、屏幕或剪贴板：不能再打开网页，防止内容被带出去
     touched_local: bool = False
+    task_id: str | None = None
+    stop_event: threading.Event | None = None
+    task_book: TaskBook | None = None
+    resume_of: str = ""
+    deadline: float | None = None
+    request_id: str | None = None  # 真实骰子的请求幂等键；由QQ消息或原生工具编号产生。
+    trpg_principal: str | None = None  # 仅服务器专用主持通道签发；绝不从工具/QQ参数反序列化。
+    query: str = ""  # 当前要求，供权限范围内的文件发现使用。
+    fetch_files: Callable[[str], list[dict]] | None = None  # 仅绑定当前QQ群的文件查找和取回。
 
 
 @dataclass
@@ -65,6 +78,8 @@ class SkillResult:
     view: list[Path] = field(default_factory=list)  # 放进这一轮给她看的图片（JPEG）
     temporary: bool = False  # view 里的图这一轮说完就删（屏幕、剪贴板）
     note: str = ""  # 后台做完记成消息时附带的说明（如存在哪）
+    task_id: str | None = None
+    resume_of: str = ""
 
 
 @dataclass
@@ -77,6 +92,7 @@ class SkillCall:
     images: list[Path] = field(default_factory=list)
     later: Callable[[], SkillResult] | None = None  # 放到后台做的活
     files: list[Path] = field(default_factory=list)
+    task_id: str | None = None
 
 
 class Skill:
@@ -106,17 +122,25 @@ class Skill:
         """这个场合她用技能前需要知道的情况（如这个人还有哪些提醒没到），写进技能说明。"""
         return ""
 
+    def markers_for(self, ctx: SkillContext) -> dict[str, str]:
+        return self.markers
+
     def close(self) -> None:
         pass
 
 
 class Skills:
     def __init__(
-        self, skills: list[Skill], cfg: SkillsConfig, usage_path: Path | None = None
+        self,
+        skills: list[Skill],
+        cfg: SkillsConfig,
+        usage_path: Path | None = None,
+        tasks: TaskBook | None = None,
     ) -> None:
         self.all = skills
         self.cfg = cfg
         self.usage_path = usage_path
+        self.tasks = tasks
 
     def close(self) -> None:
         for s in self.all:
@@ -128,16 +152,21 @@ class Skills:
         return [s for s in self.all if s.enabled() and s.allowed(ctx)]
 
     def can_use(self, marker: str, ctx: SkillContext | None) -> bool:
-        return any(marker in s.markers for s in self.available(ctx))
+        return any(marker in s.markers_for(ctx) for s in self.available(ctx))
 
     def prompt(self, ctx: SkillContext | None) -> str | None:
         """写进提示词的技能说明；没有可用技能时返回 None。"""
+        stable, dynamic = self.prompt_parts(ctx)
+        return "\n".join([stable, *dynamic]) if stable else None
+
+    def prompt_parts(self, ctx: SkillContext | None) -> tuple[str, list[str]]:
+        """工具说明按版本复用，任务/群/文件夹等实时状态每轮刷新。"""
         skills = self.available(ctx)
         if not skills:
-            return None
-        lines = [f"- {usage}" for s in skills for usage in s.markers.values()]
+            return "", []
+        lines = [f"- {usage}" for s in skills for usage in s.markers_for(ctx).values()]
         notes = [note for s in skills if (note := s.context(ctx))]
-        return "\n".join([self._usage(lines), *notes])
+        return self._usage(lines), notes
 
     @staticmethod
     def _usage(lines: list[str]) -> str:
@@ -146,11 +175,14 @@ class Skills:
             "你再接着回复；标记前可以先说一句（如“我查一下”），会先发出去。\n"
             + "\n".join(lines)
             + "\n不需要时就别用；一次只写一个标记；不要编造技能结果。"
+            "要求明确且在权限范围内时，自己完成查找、读取、转换、调用和结果核验，"
+            "不要反复确认已授权的常规步骤。先解决可修复的路径或参数问题，再给出结果。"
+            "文件正文不在当前上下文时，先查文件并读取，不能直接要求重传或贴正文。"
         )
 
     def find(self, text: str, ctx: SkillContext | None) -> tuple[str, Skill, str, str] | None:
         """找到第一个可用的技能标记，返回（标记前的话，技能，标记，参数）。"""
-        by_marker = {m: s for s in self.available(ctx) for m in s.markers}
+        by_marker = {m: s for s in self.available(ctx) for m in s.markers_for(ctx)}
         for match in MARKER.finditer(text):
             skill = by_marker.get(match.group(1))
             if skill is not None and (match.group(2) is not None or skill.bare):
@@ -179,6 +211,7 @@ class Skills:
         self, skill: Skill, marker: str, arg: str, ctx: SkillContext
     ) -> tuple[SkillCall, SkillResult]:
         """执行技能；出错时把原因作为结果交回给她。返回调用记录和结果。"""
+        source_ctx, ctx = ctx, replace(ctx)
         started = time.monotonic()
         try:
             result = skill.run(marker, arg, ctx)
@@ -187,13 +220,27 @@ class Skills:
         except Exception:
             log.exception("技能 %s 出错", skill.name)
             result = SkillResult("没成功：程序出了点问题。", ok=False)
+        source_ctx.touched_local = source_ctx.touched_local or ctx.touched_local
         seconds = time.monotonic() - started
+        if result.later is not None and self.tasks is not None:
+            task_id = self.tasks.create(skill.name, marker, arg, ctx, resume_of=result.resume_of)
+            work = result.later
+            result.task_id = task_id
+            ctx.task_id, ctx.task_book, ctx.resume_of = task_id, self.tasks, result.resume_of
+            ctx.stop_event = self.tasks.event(task_id)
+            result.later = lambda: self.tasks.execute(task_id, work)
+            result.text += (
+                f"\n任务编号：{task_id}；真实状态：排队中。可用【任务状态：{task_id}】查询。"
+            )
+            if hasattr(skill, "cancel"):
+                ctx.stop_event = self.tasks.event(task_id)
         status = "完成" if result.ok else "失败"
         log.info("技能 %s（%s）%s，%.1f 秒", skill.label, arg[:60], status, seconds)
         call = SkillCall(
             skill.name, marker, arg, result.ok, seconds, list(result.images), result.later,
             list(result.files),
         )  # fmt: skip
+        call.task_id = result.task_id
         self._record(call, ctx)
         return call, result
 
@@ -205,6 +252,12 @@ class Skills:
         return (
             f"【{skill.label}的结果】（你刚才用了「{marker}」）\n{text}\n\n"
             "这是程序返回的结果，不是对方说的话。请根据它接着回复对方，不要重复已经说过的话。"
+            + (
+                "工具失败先检查路径、现有文件和可用操作，在权限范围内换正确方法继续。"
+                "完成自查仍缺必要信息时，只问最关键的一项；不用让用户处理内部参数。"
+                if not result.ok
+                else ""
+            )
         )
 
     # ---- 使用记录（控制台查看） ----

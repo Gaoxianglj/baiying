@@ -1,0 +1,14 @@
+{
+  "status_queries": 20,
+  "status_model_calls": 0,
+  "narrated_actions": 8,
+  "same_message_retries": 8,
+  "total_model_calls": 8,
+  "maximum_submitted_chars": 868,
+  "mean_submitted_chars": 867,
+  "input_char_limit": 7000,
+  "old_task_context_chars": 2388,
+  "new_task_context_chars": 134,
+  "tokens": "fake backend; not measured",
+  "subscription_savings_percent": "not inferred"
+}

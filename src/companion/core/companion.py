@@ -15,7 +15,7 @@ from pathlib import Path
 from companion import media
 from companion.config import Config
 from companion.core.actions import Actions, split_actions
-from companion.core.context import ContextAssembler, ContextBundle
+from companion.core.context import _STYLE_RULES, ContextAssembler, ContextBundle
 from companion.core.extract import Extraction, SessionExtractor, ended, split_sessions
 from companion.core.ingest import Ingest
 from companion.core.retrieval import Embedder, HybridRetriever, sync_vectors
@@ -36,11 +36,16 @@ from companion.models.factory import build_embedder, build_gateway
 from companion.models.gateway import ModelGateway
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
 from companion.skills import Skill, SkillCall, SkillContext, SkillResult, Skills
+from companion.skills.background import run_background
 from companion.skills.base import MARKER, SkillError
 from companion.skills.builtin import build_skills
 from companion.skills.files import SendFile
+from companion.skills.native import NativeSkills
 from companion.skills.reminder import Reminder, ReminderBook
+from companion.skills.tasks import TaskBook, TaskControl
+from companion.skills.trpg import Trpg
 from companion.stickers import Sticker, StickerBook, split_sticker
+from companion.trpg.controller import Controller as TrpgController
 
 log = logging.getLogger(__name__)
 
@@ -169,9 +174,44 @@ class Companion:
         self.reminders = ReminderBook(config.data_dir / "reminders.json")
         if skills is None:
             skills = build_skills(config, self.gateway, self.reminders, self.log, self.media)
-        self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl")
+        self.tasks = TaskBook(config.data_dir / "run" / "tasks.json")
+        self.background_gateway_factory = lambda: build_gateway(self.config, task_mode=True)
+        self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl", self.tasks)
+        # 放在最前面：已有的主人助手或群沙箱仍优先处理它们允许场合的【任务】。
+        self.skills.all.insert(0, TaskControl(self.tasks, self._background_work, self._resume_task))
+        self.trpg = TrpgController(config)
+        self.trpg.person_resolver = lambda account: self.people.ensure("qq", account)
+        self.trpg.narrator.persona_provider = lambda: (
+            "\n".join(
+                self.context._read_self(name)[:400]
+                for name in ("seed.md", "identity.md", "style.md")
+            )
+            + "\n"
+            + _STYLE_RULES
+        )
+        self.skills.all.append(Trpg(self.trpg))
+
+    def _background_work(self, task: str, ctx: SkillContext) -> SkillResult:
+        return run_background(
+            task,
+            ctx,
+            self.config,
+            self.tasks,
+            self.background_gateway_factory,
+            lambda gateway: [
+                *build_skills(self.config, gateway, self.reminders, self.log, self.media),
+                Trpg(self.trpg),
+            ],
+        )
+
+    def _resume_task(self, row: dict, ctx: SkillContext) -> SkillResult:
+        skill = next((s for s in self.skills.available(ctx) if s.name == row["skill"]), None)
+        if skill is None:
+            raise SkillError("原任务使用的功能当前不可用，不能继续")
+        return skill.run(row["marker"], row["arg"], ctx)
 
     def close(self) -> None:
+        self.trpg.close()
         self.activities.close()
         self.skills.close()
         self.gateway.close()
@@ -246,6 +286,9 @@ class Companion:
             if sticker_cfg.enabled and len(self.stickers) >= sticker_cfg.min_library
             else []
         )
+        if skill_ctx is not None:
+            skill_ctx.query = query
+        skill_prompt, skill_notes = self.skills.prompt_parts(skill_ctx)
         bundle = self.context.build(
             person_id=incoming.actor.person_id,
             body=body,
@@ -254,7 +297,8 @@ class Companion:
             now=now,
             sticker_emotions=emotions,
             reply_mode=mode,
-            extra_sections=[p] if (p := self.skills.prompt(skill_ctx)) else None,
+            extra_sections=[skill_prompt] if skill_prompt else None,
+            dynamic_sections=skill_notes,
             show_image_refs=self.skills.can_use("看图", skill_ctx),
         )
         result, calls = self._chat_with_skills(bundle, skill_ctx, on_interim)
@@ -281,9 +325,12 @@ class Companion:
         }
         if calls:
             meta["skills"] = [{"skill": c.skill, "arg": c.arg[:200], "ok": c.ok} for c in calls]
+            if any(c.skill == "trpg" for c in calls):
+                meta["fiction"] = True
         event = self.ingest.record_self(
             body=body, channel=channel, content=_said(text, actions), ts=now, meta=meta
         )
+        self.gateway.note_response(result, event.id)
         if sticker is not None:
             self._record_sticker(body, channel, sticker, now)
         self._record_sent_images(body, channel, images, now)
@@ -300,29 +347,85 @@ class Companion:
         """生成回复；她写了技能标记就执行，把结果交回给她，直到她给出最终回复。"""
         messages = list(bundle.messages)
         calls: list[SkillCall] = []
-        cfg = self.config.skills
-        rounds = cfg.owner_max_rounds if ctx and ctx.owner and ctx.private else cfg.max_rounds
         temporary: list[Path] = []  # 这一轮说完就删的图（屏幕、剪贴板）
+        session_key = bundle.session_key
+        session_messages = list(bundle.session_messages or messages)
+        session_bootstrap = list(session_messages)
+
+        def native_result(call: SkillCall, outcome: SkillResult) -> None:
+            calls.append(call)
+
+        bridge = (
+            NativeSkills(self.skills, ctx, native_result)
+            if ctx and self.config.models.subscription.native_tools
+            else None
+        )
+        discovery_retry = False
         try:
             while True:
-                result = self.gateway.chat(messages, purpose="chat")
-                found = self.skills.find(result.text, ctx) if len(calls) < rounds else None
+                if ctx and ctx.stop_event and ctx.task_id and ctx.stop_event.is_set():
+                    raise SkillError("任务已停止")
+                result = self.gateway.chat(
+                    messages,
+                    purpose="chat",
+                    session_key=session_key,
+                    session_messages=session_messages,
+                    session_bootstrap=session_bootstrap,
+                    tools=bridge.tools if bridge else None,
+                )
+                found = self.skills.find(result.text, ctx)
                 if found is None:
+                    file_request = bool(
+                        ctx
+                        and re.search(
+                            r"(?:读|找|打开|载入|导入|使用|用这|用之前|能看到|看得到|还记得|查).{0,35}"
+                            r"(?:文件|附件|规则|模板|人物卡|角色卡|这份|这些)|\.(?:pdf|xlsx|md|docx|zip)",
+                            ctx.query,
+                            re.I,
+                        )
+                    )
+                    refusing_file = re.search(
+                        r"看不到|读不到|重新.{0,8}(?:上传|发送|附上)|补发|贴.{0,8}(?:正文|内容)|没有.{0,8}正文",
+                        result.text,
+                    )
+                    used_discovery = any(
+                        c.skill == "find_files" or (c.skill == "read_files" and c.ok) for c in calls
+                    )
+                    if (
+                        file_request
+                        and refusing_file
+                        and not used_discovery
+                        and not discovery_retry
+                    ):
+                        discovery_retry = True
+                        reminder = ChatMessage(
+                            "skill",
+                            "请先在当前聊天调用找文件或看目录并读取实际资料；"
+                            "若本地缺少且提供了群文件工具，再查当前QQ群文件。完成查找前不要要求重传或贴正文。",
+                        )
+                        messages.append(reminder)
+                        session_messages = [reminder]
+                        session_bootstrap.append(reminder)
+                        continue
                     return result, calls
                 before, skill, marker, arg = found
                 assert ctx is not None
                 interim = split_actions(split_sticker(split_mood(before)[0])[0])[0]
                 interim = SILENT_MARK.sub("", interim).strip()
                 if interim:
-                    self.ingest.record_self(
+                    interim_event = self.ingest.record_self(
                         body=ctx.body, channel=ctx.channel, content=interim, ts=ctx.now
                     )
+                    self.gateway.note_response(result, interim_event.id)
                     if on_interim is not None:
                         on_interim(interim)
                 call, outcome = self.skills.run(skill, marker, arg, ctx)
                 calls.append(call)
                 if outcome.temporary:
                     temporary += outcome.view
+                if outcome.temporary or skill.name in ("screen", "clipboard"):
+                    # 临时图片、剪贴板文字都不进入持久 rollout，继续使用原来的完整本轮提示词。
+                    session_key = None
                 said = before + (f"【{marker}：{arg}】" if arg else f"【{marker}】")
                 messages += [
                     ChatMessage("assistant", said),
@@ -332,6 +435,13 @@ class Companion:
                         images=tuple(outcome.view),
                     ),
                 ]
+                session_bootstrap += messages[-2:]
+                # 原生线程已保存它自己的回复，不把同一技能标记再追加一遍。
+                session_messages = [m for m in bundle.messages if m.role == "system"] + (
+                    messages[-1:]
+                    if result.raw.get("session_key") == session_key and session_key
+                    else messages[-2:]
+                )
         finally:
             for path in temporary:
                 with contextlib.suppress(OSError):
@@ -680,6 +790,7 @@ class Companion:
             return CodexAppServerBackend.from_codex(
                 sub.codex_command,
                 workdir,
+                codex_home=sub.codex_home,
                 overrides=talk_only_overrides(image=True, web=True),
                 model=sub.model,
                 effort="low",
@@ -801,6 +912,8 @@ class Companion:
                 to_delete.add((kind, mid))
                 event_ids |= set(self.index.delete(kind, mid))
         removed = self.log.redact(event_ids)
+        # 旧上下文/压缩摘要可能仍带被遗忘内容，不再复用这些线程。
+        self.gateway.rotate_chat_sessions("forget")
         self._drop_orphan_images(removed)
         commit_memory(self.layout, self.name, f"按要求忘掉了 {len(to_delete)} 条记忆")
         return len(to_delete), len(removed)
@@ -854,6 +967,13 @@ class Companion:
 
     # ---- 整理记忆 ----
 
+    def rotate_chat_sessions(self, reason: str) -> int:
+        """仅在原始事件已整理后由维护/停止流程调用；不影响后台任务线程。"""
+        n = self.gateway.rotate_chat_sessions(reason)
+        if n:
+            log.info("聊天线程已轮换（%s）：%d 个，下次聊天按需创建", reason, n)
+        return n
+
     def extract_pending(
         self, *, channel: str | None = None, force: bool = False, now: datetime | None = None
     ) -> list[Extraction]:
@@ -861,7 +981,11 @@ class Companion:
         now = now or datetime.now(UTC)
         idle = timedelta(minutes=self.config.retrieval.session_idle_minutes)
         by_channel: dict[str, list[Event]] = {}
+        from companion.trpg.policy import is_fiction, registry
+
         for e in self.log.iter_events():
+            if is_fiction(e, registry(self.config.data_dir)):
+                continue  # 团状态不抽成现实人物事实；公开团经历仍可跨聊天按来源回忆。
             if channel is not None and e.channel != channel:
                 continue
             by_channel.setdefault(e.channel, []).append(e)
@@ -873,10 +997,12 @@ class Companion:
             for session in split_sessions(pending, idle):
                 if not force and not ended(session, idle, now):
                     break
-                extraction = self.extractor.extract(session)
-                self._store(extraction)
-                self._set_cursor(ch, session[-1])
-                results.append(extraction)
+                # 日切会强制整理仍活跃的会话；按事件边界分批，失败可从已提交游标续做。
+                for part in self._extraction_batches(session):
+                    extraction = self.extractor.extract(part)
+                    self._store(extraction)
+                    self._set_cursor(ch, part[-1])
+                    results.append(extraction)
         if results:
             self.sync_vectors()
             commit_memory(
@@ -885,6 +1011,22 @@ class Companion:
                 f"整理记忆：{len(results)} 段会话（{now.astimezone():%m-%d %H:%M}）",
             )
         return results
+
+    @staticmethod
+    def _extraction_batches(events: list[Event]) -> list[list[Event]]:
+        batches: list[list[Event]] = []
+        current: list[Event] = []
+        chars = 0
+        for event in events:
+            size = len(event.content)
+            if current and (chars + size > 24000 or len(current) >= 60):
+                batches.append(current)
+                current, chars = [], 0
+            current.append(event)
+            chars += size
+        if current:
+            batches.append(current)
+        return batches
 
     def sync_vectors(self) -> int:
         try:
@@ -900,6 +1042,8 @@ class Companion:
             self.index.add_episode(extraction.episode)
         for fact, supersedes in extraction.facts:
             self.index.add_fact(fact, supersedes=supersedes)
+        if any(supersedes for _, supersedes in extraction.facts):
+            self.gateway.rotate_chat_sessions("corrected-facts")
 
     def _after_cursor(self, channel: str, events: list[Event]) -> list[Event]:
         raw = self.index.get_meta(_CURSOR + channel)

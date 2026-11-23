@@ -87,7 +87,8 @@ class EventLog:
                     tmp.replace(path)
         return removed
 
-    def iter_events(self, since: datetime | None = None) -> Iterator[Event]:
+    def iter_events(self, since: datetime | None = None,
+                    *, include_private: bool = False) -> Iterator[Event]:
         """按文件（月份）顺序读出事件。损坏的行（如写到一半断电）记录警告后跳过。"""
         for path in sorted(self._dir.glob("*.jsonl")):
             if since is not None and path.stem < f"{since.astimezone(UTC):%Y-%m}":
@@ -100,6 +101,10 @@ class EventLog:
                         event = Event.model_validate_json(line)
                     except ValidationError:
                         log.warning("跳过损坏的事件行 %s:%d", path.name, lineno)
+                        continue
+                    from companion.trpg.policy import public_event
+                    policy = self._dir.parent.parent / "run/trpg-protected.json"
+                    if not include_private and not public_event(event, policy):
                         continue
                     if since is None or event.ts >= since:
                         yield event

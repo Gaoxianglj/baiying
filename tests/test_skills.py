@@ -138,14 +138,14 @@ def test_failure_is_reported_back(tmp_path):
         c.close()
 
 
-def test_round_limit_strips_leftover_marker(tmp_path):
-    brain = Brain("嗯【搜索：再来】")  # 每次都想再搜
+def test_skill_rounds_are_unlimited_even_with_legacy_config(tmp_path):
+    brain = Brain(*(["【搜索：再来】"] * 15), "完成")
     c = make(tmp_path, brain, [Echo()])
-    c.config.skills.owner_max_rounds = 2  # 命令行算主人私聊
+    c.config.skills.owner_max_rounds = 2  # 旧配置继续可解析，但不再生效
     try:
         r = c.reply(body="cli", channel="cli:x", account="x", text="查", now=T0)
-        assert len(r.skill_calls) == 2 and len(brain.requests) == 3
-        assert r.text == "嗯"
+        assert len(r.skill_calls) == 15 and len(brain.requests) == 16
+        assert r.text == "完成"
     finally:
         c.close()
 

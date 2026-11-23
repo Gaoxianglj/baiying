@@ -29,7 +29,7 @@ from companion.memory.layout import commit_memory
 from companion.memory.people import SELF_ID
 from companion.models.openai_compat import ModelError
 from companion.runtime import AlreadyRunning, InstanceLock, run_dir, setup_logging, stop_flag
-from companion.skills.base import recent_usage
+from companion.skills.base import SkillContext, SkillError, recent_usage
 from companion.web import settings
 
 log = logging.getLogger(__name__)
@@ -109,14 +109,69 @@ class ConsoleApp:
             data = json.loads(body or b"{}") if method == "POST" else {}
             with self._lock:
                 return _json(self._api(method, url.path, query, data))
-        except (settings.SettingsError, KeyError, ValueError) as e:
+        except (settings.SettingsError, KeyError, ValueError, SkillError) as e:
             return _json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         except ModelError as e:
             return _json({"error": f"模型服务不可用：{e}"}, HTTPStatus.SERVICE_UNAVAILABLE)
 
+    def trpg_command(self, data: dict) -> dict:
+        controller = self.companion.trpg
+        cid = data.get("campaign")
+        if cid:
+            with controller.store.connect() as conn:
+                row = conn.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
+                if row is None:
+                    raise SkillError("没有这个团")
+                campaign = controller.store.load(row)
+            if data.get("as_kp") is not True:
+                # 本地控制台默认只展示公开视图，不默默代入KP秘密上下文。
+                ctx = SkillContext(campaign["body"], campaign["channel"], "console-viewer",
+                                   False, False)
+                if data.get("operation", "状态") not in {"状态", "战报", "额度"}:
+                    raise SkillError("请显式选择以本团KP身份管理")
+            else:
+                kp = next((pid for pid, member in campaign["state"]["members"].items()
+                           if member["role"] == "kp"), None)
+                if not kp:
+                    raise SkillError("此团没有有效KP，先修复成员登记")
+                ctx = SkillContext(campaign["body"], "private:console", kp, True, True)
+        else:
+            account = next(iter(self.companion.config.qq.owner_accounts), None)
+            pid = self.companion.people.ensure("qq", account) if account else "console-owner"
+            ctx = SkillContext("qq", str(data.get("channel", "")), pid, False, True)
+            if not ctx.channel.startswith(("group:", "private:")):
+                raise SkillError("请指定群聊或私聊频道")
+        operation = str(data.get("operation", "状态"))
+        request_id = data.get("request_id")
+        if request_id is not None:
+            from dataclasses import replace
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 100:
+                raise SkillError("请求编号格式不对")
+            ctx = replace(ctx, request_id="web:" + request_id)
+        args = data.get("args", {})
+        if not isinstance(args, dict):
+            raise SkillError("操作参数必须是对象")
+        args = {**args, **({"campaign": cid} if cid else {})}
+        if cid and operation == "状态" and data.get("as_kp") is True:
+            args["private"] = True
+        result = controller.command(ctx, operation + " " + json.dumps(args, ensure_ascii=False),
+                    resolve_person=lambda who: self.companion.people.ensure("qq", who))
+        if result.get("outbox"):
+            with controller.store.connect(write=True) as conn:
+                conn.execute("UPDATE outbox SET state='shown_local' WHERE id=?", (result["outbox"],))
+        # 控制台操作不会主动给QQ群发消息；只有用户在QQ内的请求才回复原聊天。
+        return result
+
     def _api(self, method: str, path: str, query: dict[str, list[str]], data: dict) -> Any:
         parts = path.strip("/").split("/")[1:]
         route = (method, parts[0] if parts else "")
+        if route == ("GET", "trpg"):
+            return {"campaigns": self.companion.trpg.store.listing(),
+                    "metrics": self.companion.trpg.store.metrics(),
+                    "today": datetime.now().astimezone().date().isoformat(),
+                    "channels": self.companion.config.qq.groups}
+        if route == ("POST", "trpg"):
+            return self.trpg_command(data)
         if route == ("GET", "overview"):
             return self.overview(refresh="refresh" in query)
         if route == ("GET", "settings"):
@@ -328,6 +383,7 @@ class ConsoleApp:
                 for s in c.skills.all
             ],
             "recent": recent_usage(c.config.data_dir / "skills.jsonl"),
+            "tasks": list(c.tasks._load().values()),
         }
 
     def today(self) -> dict[str, Any]:

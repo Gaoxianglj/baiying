@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import random
 import re
@@ -47,9 +48,13 @@ from companion.memory.events import Event
 from companion.memory.index import MemoryKind
 from companion.memory.people import SELF_ID, PeopleError
 from companion.models.openai_compat import ModelError
-from companion.skills import SkillCall, SkillContext
+from companion.skills import SkillCall, SkillContext, SkillError
+from companion.skills.dice import HELP as DICE_HELP
+from companion.skills.dice import Dice
+from companion.skills.dice import command as dice_command
 from companion.skills.files import FileInbox
 from companion.skills.reminder import Reminder
+from companion.skills.tasks import LABELS, TaskControl
 from companion.stickers import Sticker
 
 log = logging.getLogger(__name__)
@@ -87,6 +92,13 @@ HELP = """可用指令：
 /记住 内容 —— 立刻记下，不会忘
 /忘掉 关键词 —— 列出相关记忆，再用 /确认忘掉 编号 删除
 /绑定 平台 账号 —— 比如 /绑定 minecraft Steve，需主人确认
+/任务 完整要求及路径 —— 在群里直接登记后台任务
+/任务状态 [编号] —— 查询真实进度，不填编号查最近任务
+/继续任务 编号 —— 继续已停止、失败或中断的任务
+/停止任务 [编号] —— 停止任务，保留产出文件
+/掷骰 2d6+6（或 .r 2d6+6）—— 真实骰子，不调用模型
+/检定 60｜困难｜奖1｜侦查 —— CoC七版检定；/骰记录 查当前聊天记录
+/骰子帮助 —— 骰子完整用法
 /说明 —— 我会怎样使用聊天记录"""
 
 FORGET_TTL = timedelta(minutes=10)
@@ -162,6 +174,11 @@ class QQBot:
         self.now = clock or (lambda: datetime.now(UTC))
         self.on_daily = on_daily
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="companion")
+        self._trpg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trpg")
+        self._trpg_busy: dict[str, bool] = {}
+        self._followups: dict[str, int] = {}
+        self._quote_authors: dict[str, str] = {}
+        self._trpg_questions: dict[tuple[str, str], tuple[datetime, str, int, str]] = {}
         self._sent_times: deque[datetime] = deque()
         self._sent_ids: deque[str] = deque(maxlen=500)
         self._last_unsolicited: dict[str, datetime] = {}
@@ -170,6 +187,7 @@ class QQBot:
         self._speakers: dict[str, dict[str, str]] = {}  # 群 → {最近说过话的名字: QQ 号}
         self._pending: dict[str, _Pending] = {}
         self._jobs: set[asyncio.Task[None]] = set()
+        self._task_reporting: set[str] = set()
         self._approvals: dict[str, list[Any]] = {}  # 审批码 → [threading.Event, 是否批准]
         self._bot_rounds: dict[str, int] = {}  # 频道 → 和别的机器人连着聊了几轮
         self._bot_paused_until: dict[str, datetime] = {}
@@ -189,7 +207,39 @@ class QQBot:
             self._maintenance(),
             self._life_loop(),
             self._reminder_loop(),
+            self._task_notification_loop(),
         )
+
+    async def _task_notification_loop(self, every: float = 15.0) -> None:
+        while True:
+            await asyncio.sleep(every)
+            try:
+                pending = self.c.tasks.pending_notifications()
+            except (OSError, ValueError, KeyError):
+                log.exception("任务状态暂时无法读取，稍后重试通知")
+                continue
+            for row in pending:
+                # 正在本次 _run_later 汇报的任务由它负责，避免双发。
+                if row["id"] in self._task_reporting:
+                    continue
+                kind, _, account = row["channel"].partition(":")
+                if kind not in {"private", "group"}:
+                    continue
+                src = Source(
+                    kind,
+                    account if kind == "private" else "",
+                    account if kind == "group" else "",
+                    "",
+                    None,
+                    Incoming(text=""),
+                )
+                text = (
+                    f"任务 {row['id']}：{LABELS[row['state']]}。\n"
+                    + (row["result"] or row["progress"])[:2000]
+                )
+                await self._send_task_result(
+                    src, row["id"], text, [Path(p) for p in row.get("files", [])]
+                )
 
     # ---- 定时提醒 ----
 
@@ -329,8 +379,9 @@ class QQBot:
                 if self.on_daily and local.hour >= self.c.config.sleep.hour:
                     today = f"{local:%Y-%m-%d}"
                     if today != last_daily:
-                        last_daily = today
-                        await self._call(self.on_daily)
+                        finished = await self._call(self.on_daily)
+                        if finished is not False:
+                            last_daily = today
                 await self._call(self.c.life.ensure_plan)  # 今天的安排（睡眠时没排成就补上）
             except Exception:
                 log.exception("后台整理出错")
@@ -340,7 +391,13 @@ class QQBot:
         return await loop.run_in_executor(self._executor, partial(fn, *args, **kwargs))
 
     def close(self) -> None:
+        self._trpg_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
+
+    async def _trpg_call(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        return await asyncio.get_running_loop().run_in_executor(
+            self._trpg_executor, partial(fn, *args, **kwargs)
+        )
 
     # ---- 事件 ----
 
@@ -365,16 +422,23 @@ class QQBot:
         if src.message_type == "group":
             await self._note_speaker(src, ev.get("sender") or {})
         text = src.incoming.text
+        if dice := dice_command(text):
+            await self._dice_command(src, *dice)
+            return
+        if src.incoming.reply_to and src.incoming.reply_to not in self._sent_ids:
+            quoted = await self._get_message(src.incoming.reply_to)
+            if quoted:
+                self._quote_authors[src.incoming.reply_to] = str(
+                    (quoted.get("sender") or {}).get("user_id") or ""
+                )
+        if await self._trpg_route(src):
+            return
+        text = src.incoming.text
         if text[:1] in ("/", "／"):
             await self._command(src, text[1:].strip())
             return
 
-        addressed = (
-            src.message_type == "private"
-            or src.incoming.mentioned_self
-            or (src.incoming.reply_to is not None and src.incoming.reply_to in self._sent_ids)
-            or any(alias in text for alias in self.cfg.aliases)
-        )
+        addressed = self._addressed(src)
         text, digests = await self._enrich(src, addressed)
         meta: dict[str, object] = {}
         if src.message_id:
@@ -400,7 +464,12 @@ class QQBot:
             kind = "required"
         else:
             kind = self._conversation_kind(src)
-            if kind is None and await self._should_chime_in(src.channel, text):
+            if (
+                kind is None
+                and not self._not_for_me(src)
+                and not self._chatter(text)
+                and await self._should_chime_in(src.channel, text)
+            ):
                 kind = "chime"
         if kind is None:
             return
@@ -415,15 +484,69 @@ class QQBot:
         """
         if src.message_type != "group":
             return None
+        if self._not_for_me(src) or self._chatter(src.incoming.text):
+            return None
+        if self._followups.get(src.channel, 0) >= self.cfg.conversation_followups:
+            return None
         last = self._last_spoke.get(src.channel)
         window = timedelta(seconds=self.cfg.conversation_seconds)
         if last is None or self.now() - last > window:
             return None
         partners = self._partners.get(src.channel, {})
         seen = partners.get(src.user_id)
+        text = src.incoming.text
         if seen is not None and self.now() - seen <= window:
-            return "partner"
-        return "other" if self.cfg.others_join_conversation else None
+            if re.search(
+                r"你|刚才|刚刚|这个|那个|这样|那样|然后|继续|为什么|怎么|还在|在吗|^嘿$", text
+            ):
+                return "partner"
+            return None
+        if self.cfg.others_join_conversation and re.search(
+            r"^(?:我也|也想|你们|你刚|那首|这首|刚刚|刚才)", text.strip()
+        ):
+            return "other"
+        return None
+
+    def _not_for_me(self, src: Source) -> bool:
+        inc = src.incoming
+        if src.message_type != "group" or inc.mentioned_self or self._named_call(inc.text):
+            return False
+        if inc.at and self.self_id not in inc.at:
+            return True
+        author = self._quote_authors.get(inc.reply_to or "")
+        return bool(author and author != self.self_id)
+
+    def _addressed(self, src: Source) -> bool:
+        inc = src.incoming
+        if (
+            src.message_type == "private"
+            or inc.mentioned_self
+            or inc.reply_to in self._sent_ids
+            or self._quote_authors.get(inc.reply_to or "") == self.self_id
+        ):
+            return True
+        if self._not_for_me(src):
+            return False
+        return self._named_call(inc.text)
+
+    def _named_call(self, text: str) -> bool:
+        names = "|".join(re.escape(name) for name in self.cfg.aliases)
+        return bool(
+            names
+            and re.search(
+                rf"(?:^|[，。！？,!?\s】\]])(?:{names})(?=$|[，。！？,!?：:\s]|你|在|帮|来|能|请|看|记|把|早|晚|中|今|好)",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _chatter(text: str) -> bool:
+        word = re.sub(r"[\s，。！？,.!?~～（）()]+", "", text)
+        return bool(
+            not word
+            or re.fullmatch(r"(?:哈+|呵+|嗯+|哦+|好+|笑死|确实|我去|收到|行|ok|OK|草)", word)
+            or not re.search(r"[\w\u4e00-\u9fff]", word)
+        )
 
     def _enqueue(self, src: Source, event: Event, kind: str) -> None:
         """先不急着回：等一小会儿，把接连发来的几条（文字、图片、表情）合成一轮再回。"""
@@ -492,6 +615,13 @@ class QQBot:
             fetch_images=lambda message_id: asyncio.run_coroutine_threadsafe(
                 self._message_images(message_id), loop
             ).result(timeout=90),
+            fetch_files=(
+                lambda query: asyncio.run_coroutine_threadsafe(
+                    self._group_files(src, query), loop
+                ).result(timeout=60)
+            )
+            if src.message_type == "group"
+            else None,
         )
         try:
             reply = await self._call(
@@ -533,28 +663,54 @@ class QQBot:
             await self._send_file(src, path)
         if reply.sticker is not None:
             await self._send_sticker(src, reply.sticker.digest)
+        self._followups[src.channel] = (
+            0 if pending.kind == "required" else self._followups.get(src.channel, 0) + 1
+        )
         partners = self._partners.setdefault(src.channel, {})
         for s in pending.sources:
-            partners[s.user_id] = self.now()
+            if self._addressed(s) or pending.kind == "partner":
+                partners[s.user_id] = self.now()
         if any(s.user_id in self.cfg.peer_bots for s in pending.sources):
             self._count_bot_round(src.channel)
 
     async def _run_later(self, src: Source, ctx: SkillContext, call: SkillCall) -> None:
         assert call.later is not None
-        result = await asyncio.to_thread(call.later)  # 不占用记忆核心的工作线程，聊天照常
-        if result.report:  # 让她用自己的话转述结果
-            text, files = await self._call(self.c.report, ctx, call.skill, result)
-            await self._send_reply(src, text)
-            for path in files:
-                await self._send_file(src, path)
-            return
-        if not result.ok:
-            log.warning("%s：后台技能没成功：%s", src.channel, result.text)
-            await self._send(src, "（" + result.text[:80] + "）")
-            return
-        paths = await self._call(self.c.deliver, "qq", src.channel, result, self.now())
-        for path in paths:
-            await self._send_image(src, path)
+        if call.task_id:
+            self._task_reporting.add(call.task_id)
+        try:
+            result = await asyncio.to_thread(call.later)  # 独立线程，普通聊天继续
+            if result.report:
+                try:
+                    text, files = await self._call(self.c.report, ctx, call.skill, result)
+                except Exception:
+                    log.exception("转述后台任务失败，发送原始执行结果")
+                    text, files = result.text, []
+                if call.task_id:
+                    row = self.c.tasks.get(call.task_id, ctx)
+                    text = f"任务 {call.task_id}：{LABELS[row['state']]}。\n{text}"
+                if call.task_id:
+                    await self._send_task_result(
+                        src, call.task_id, text, list(dict.fromkeys([*result.files, *files]))
+                    )
+                else:
+                    await self._send_reply(src, text)
+                    for path in dict.fromkeys([*result.files, *files]):
+                        await self._send_file(src, path)
+                return
+            if not result.ok:
+                log.warning("%s：后台技能没成功：%s", src.channel, result.text)
+                sent = await self._send(src, "（" + result.text[:80] + "）")
+                if call.task_id:
+                    self.c.tasks.update(call.task_id, notified=sent)
+                return
+            paths = await self._call(self.c.deliver, "qq", src.channel, result, self.now())
+            for path in paths:
+                await self._send_image(src, path)
+            if call.task_id:
+                self.c.tasks.update(call.task_id, notified=True)
+        finally:
+            if call.task_id:
+                self._task_reporting.discard(call.task_id)
 
     # ---- 防止和别的机器人无限对聊 ----
 
@@ -802,6 +958,30 @@ class QQBot:
 
     async def _notice(self, ev: dict[str, Any]) -> None:
         """别人戳了她：当成“（戳了戳你）”交给她，同一个聊天里隔一会儿才理一次。"""
+        if ev.get("notice_type") == "group_upload":
+            group = str(ev.get("group_id") or "")
+            item = ev.get("file") or {}
+            if group not in self.cfg.groups or not item.get("name"):
+                return
+            user = str(ev.get("user_id") or "")
+            src = Source("group", user, group, user, None, Incoming(text=""))
+            ref = FileRef(
+                str(item["name"]),
+                str(item.get("id") or item.get("file_id") or ""),
+                item.get("size"),
+                item.get("url"),
+                item.get("busid"),
+            )
+            description = await self._receive_file(ref, src, True)
+            await self._call(
+                self.c.observe,
+                body="qq",
+                channel=src.channel,
+                account=user,
+                text=description,
+                meta={"file_notice": True},
+            )
+            return
         if not (ev.get("notice_type") == "notify" and ev.get("sub_type") == "poke"):
             return
         user_id = str(ev.get("user_id") or "")
@@ -905,7 +1085,7 @@ class QQBot:
     # ---- 文件 ----
 
     async def _receive_file(self, ref: FileRef, src: Source, receive: bool) -> str:
-        """收一个文件：发给她的（私聊、@她、她刚说完话时）且不太大，就存进工作文件夹的 inbox。"""
+        """收一个文件：发给她的（私聊、@她、她刚说完话时）且不太大，就存进这个聊天的固定文件夹。"""
         inbox = self.inbox
         if not (inbox.cfg.enabled and receive):
             return inbox.skipped(ref.name, ref.size, "没收")
@@ -914,6 +1094,19 @@ class QQBot:
         try:
             data = await self._download_file(ref, src)
             path = await asyncio.to_thread(inbox.save, ref.name, data, self.now(), src.channel)
+            reader = next((s for s in self.c.skills.all if s.name == "read_files"), None)
+            if reader is not None:
+                ctx = SkillContext(
+                    "qq",
+                    src.channel,
+                    "",
+                    src.message_type == "private",
+                    src.user_id in self.cfg.owner_accounts,
+                )
+                try:
+                    await asyncio.to_thread(reader.access.check_read, path.resolve(), ctx)
+                except SkillError:
+                    return inbox.skipped(ref.name, ref.size, "已关联为受保护资料，请用对应团务接口")
             text = await asyncio.to_thread(inbox.describe, path, ref.name)
         except (MediaError, OneBotError, OSError, TimeoutError) as e:
             log.warning("收文件失败（%s）：%s", ref.name, e)
@@ -926,7 +1119,10 @@ class QQBot:
         url = ref.url
         if not url and ref.file_id:
             # 没有直链时向 NapCat 要：可能给本地路径，也可能给链接
-            data = await self.client.call("get_file", {"file_id": ref.file_id}) or {}
+            try:
+                data = await self.client.call("get_file", {"file": ref.file_id}) or {}
+            except (OneBotError, TimeoutError):
+                data = {}
             local = data.get("file")
             if local and Path(local).is_file():
                 if Path(local).stat().st_size > max_bytes:
@@ -935,12 +1131,130 @@ class QQBot:
             url = data.get("url")
             if not url and src.message_type == "group":
                 params = {"group_id": int(src.group_id), "file_id": ref.file_id}
+                if ref.busid is not None:
+                    params["busid"] = ref.busid
                 url = (await self.client.call("get_group_file_url", params) or {}).get("url")
+            elif not url and src.message_type == "private":
+                url = (
+                    await self.client.call(
+                        "get_private_file_url",
+                        {"user_id": int(src.user_id), "file_id": ref.file_id},
+                    )
+                    or {}
+                ).get("url")
         if not url:
             raise MediaError("拿不到文件地址")
         return await asyncio.to_thread(media.fetch, url, max_bytes=max_bytes)
 
-    async def _send_file(self, src: Source, path: Path) -> None:
+    async def _group_files(self, src: Source, query: str) -> list[dict]:
+        """只在这条消息所在的已接入群查找/取回文件，不接受模型传入群号或链接。"""
+        if src.message_type != "group" or src.group_id not in self.cfg.groups:
+            raise SkillError("只能查当前已接入QQ群的文件")
+        if not query.strip() or len(query) > 120:
+            raise SkillError("请用简短文件名关键词")
+        words = query.casefold().split()
+        queue, seen, matches = [None], set(), []
+        deadline = asyncio.get_running_loop().time() + 25
+        while queue and len(seen) < 16:
+            folder = queue.pop(0)
+            if folder in seen:
+                continue
+            seen.add(folder)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            action = "get_group_files_by_folder" if folder else "get_group_root_files"
+            params = {"group_id": int(src.group_id)}
+            if folder:
+                params["folder_id"] = folder
+            data = await self.client.call(action, params, timeout=min(remaining, 10)) or {}
+            for item in data.get("files", []):
+                name = str(item.get("file_name") or item.get("name") or "")
+                if all(word in name.casefold() for word in words):
+                    matches.append(item)
+            queue.extend(
+                str(item.get("folder_id"))
+                for item in data.get("folders", [])
+                if item.get("folder_id")
+            )
+        result = []
+        for item in matches[:3]:
+            name = str(item.get("file_name") or item.get("name") or "文件")
+            ref = FileRef(
+                name, str(item.get("file_id") or ""), item.get("file_size"), None, item.get("busid")
+            )
+            description = await self._receive_file(ref, src, True)
+            result.append({"name": name, "result": description})
+        if len(matches) > 3:
+            result.append(
+                {
+                    "more": [str(i.get("file_name") or i.get("name")) for i in matches[3:20]],
+                    "hint": "已取回前三份；更多文件请用更具体的关键词",
+                }
+            )
+        if not result:
+            result.append(
+                {
+                    "found": False,
+                    "complete": not queue,
+                    "hint": "当前已检查范围未匹配；可换更短的文件名关键词",
+                }
+            )
+        return result
+
+    async def _send_task_result(
+        self, src: Source, task_id: str, text: str, files: list[Path]
+    ) -> None:
+        connected = getattr(self.client, "connected", None)
+        if connected is not None and not connected.is_set():
+            return  # 确认尚未发送，连接恢复后重试。
+        if not self._can_send():
+            return
+        book = self.c.tasks
+        state = book.delivery_part(task_id, "text")
+        if state in {"unknown", "sending"}:
+            return
+        if state != "sent":
+            book.delivery_part(task_id, "text", "sending")
+            sent = await self._send_reply(src, text)
+            book.delivery_part(task_id, "text", "sent" if sent else "unknown")
+            if not sent:
+                return
+        row = book.get(
+            task_id, SkillContext("qq", src.channel, "", src.message_type == "private", False)
+        )
+        ctx = SkillContext(
+            "qq",
+            src.channel,
+            row["person_id"],
+            src.message_type == "private",
+            src.message_type == "private" and src.user_id in self.cfg.owner_accounts,
+        )
+        sender = self.c._file_sender(ctx)
+        complete = True
+        for path in files:
+            part = "file:" + hashlib.sha256(str(path).encode()).hexdigest()[:16]
+            state = book.delivery_part(task_id, part)
+            if state == "sent":
+                continue
+            if state in {"unknown", "sending", "blocked"}:
+                complete = False
+                continue
+            try:
+                if sender is None:
+                    raise SkillError("当前场合不能发送文件")
+                path = sender.resolve(str(path), ctx)
+            except (SkillError, OSError):
+                book.delivery_part(task_id, part, "blocked")
+                complete = False
+                continue
+            book.delivery_part(task_id, part, "sending")
+            sent = await self._send_file(src, path)
+            book.delivery_part(task_id, part, "sent" if sent else "unknown")
+            complete = complete and sent
+        book.update(task_id, notified=bool(complete))
+
+    async def _send_file(self, src: Source, path: Path) -> bool:
         """发文件（NapCat 和这里在同一台电脑上，直接给本地路径）。"""
         if src.message_type == "group":
             action = "upload_group_file"
@@ -954,8 +1268,9 @@ class QQBot:
         except (OneBotError, TimeoutError) as e:
             log.error("发文件失败（%s）：%s", path.name, e)
             await self._send(src, f"（文件 {path.name} 没发出去）")
-            return
+            return False
         self._last_spoke[src.channel] = self.now()
+        return True
 
     async def _look(self, ref: ImageRef, src: Source | None) -> tuple[str | None, str | None]:
         """看一张图；表情包顺便判断能否收藏，并记下是谁发的。"""
@@ -1155,6 +1470,316 @@ class QQBot:
 
     # ---- 指令 ----
 
+    async def _trpg_route(self, src: Source) -> bool:
+        text = src.incoming.text.strip()
+        direct_action = text.startswith(("/行动 ", "／行动 "))
+        direct = text == "/团" or text.startswith(("/团 ", "／团 ", "/行动 ", "／行动 "))
+        if (
+            not direct
+            and not self._addressed(src)
+            and re.search(r"\bgpt\b|\btoken\b|模型|后台|代码|程序|接口|额度", text, re.I)
+        ):
+            return False
+        if not direct and (
+            self._not_for_me(src) or (self._chatter(text) and not self.c.trpg.host.is_control(text))
+        ):
+            return False
+        if not direct and not self.c.trpg.store.path.exists():
+            return False
+        if text.startswith(("团外：", "团外:", "OOC:", "ooc:")):
+            src.incoming.text = text.split(":" if ":" in text[:5] else "：", 1)[1].strip()
+            return False
+        pid = await self._call(self.c.people.ensure, "qq", src.user_id, src.name)
+        ctx = SkillContext(
+            "qq",
+            src.channel,
+            pid,
+            src.message_type == "private",
+            src.user_id in self.cfg.owner_accounts,
+            now=self.now(),
+            request_id="qq:" + src.message_id if src.message_id else None,
+        )
+        # 已授权AI主持的自然语言控制也要在暂停时识别；不进入普通聊天模型猜权限。
+        if not direct or direct_action:
+            host_text = text.split(" ", 1)[1] if direct_action else text
+            try:
+                candidate = await self._trpg_call(self.c.trpg.service.campaign, ctx)
+            except SkillError:
+                candidate = None
+            if (
+                candidate
+                and candidate["status"] == "active"
+                and not self._addressed(src)
+                and not direct_action
+                and not self._roleplay_input(text, candidate, ctx)
+            ):
+                return False
+            if (
+                not self._addressed(src)
+                and self._chatter(text)
+                and candidate
+                and not candidate["state"].get("needs_confirmation")
+                and not self._trpg_followup(text, candidate, ctx)
+                and not await self._trpg_call(self.c.trpg.host.pending, candidate, ctx)
+            ):
+                return False
+            host_route = bool(
+                candidate
+                and self.c.trpg.host.enabled(candidate)
+                and (
+                    self.c.trpg.host.is_control(host_text)
+                    or (
+                        candidate["status"] == "active"
+                        and self.c.config.trpg.auto_route
+                        and candidate["state"]["members"].get(pid, {}).get("character")
+                    )
+                )
+            )
+            if host_route:
+                self._trpg_questions.pop((ctx.channel, ctx.person_id), None)
+                busy_key = candidate["id"]
+                quick = self.c.trpg.host.is_quick_control(host_text)
+                if busy_key in self._trpg_busy and not quick:
+                    # 推理中的闲聊留在普通记忆，不积压成下一轮玩家行动。
+                    await self._call(
+                        self.c.observe,
+                        body="qq",
+                        channel=src.channel,
+                        account=src.user_id,
+                        text=text,
+                        display_name=src.name,
+                        now=src.received_at or self.now(),
+                        meta={"message_id": src.message_id, "trpg_waiting": True, "fiction": True},
+                    )
+                    if (
+                        not self._trpg_busy[busy_key]
+                        and self._can_send()
+                        and (src.incoming.mentioned_self or src.message_type == "private")
+                    ):
+                        self._trpg_busy[busy_key] = True
+                        self._sent_times.append(self.now())
+                        await self._send(
+                            src,
+                            "正在判断上一条行动，请稍候；这条没有排队执行。"
+                            "“查看状态”和“暂停跑团”仍可用。",
+                            reply_to=src.message_id,
+                        )
+                    return True
+                # 程序控制不受普通聊天发言额度阻挡，尤其不能吞掉暂停。
+                if not quick and not self._can_send():
+                    return True
+                if not quick:
+                    self._sent_times.append(self.now())
+                    self._trpg_busy[busy_key] = False
+                try:
+                    result = await self._trpg_call(self.c.trpg.host.handle, ctx, host_text)
+                    return await self._trpg_deliver(src, ctx, result)
+                except (SkillError, ValueError) as error:
+                    return await self._trpg_deliver(
+                        src, ctx, self.c.trpg.host.notice(candidate["id"], str(error))
+                    )
+                finally:
+                    if not quick:
+                        self._trpg_busy.pop(busy_key, None)
+        campaign = await self._trpg_call(self.c.trpg.active, ctx)
+        role = self.c.trpg.service.role(campaign, ctx) if campaign else "observer"
+        if not direct:
+            if not campaign or not self.c.config.trpg.auto_route:
+                return False
+            if role == "observer":
+                addressed = (
+                    src.message_type == "private"
+                    or src.incoming.mentioned_self
+                    or any(name in text for name in self.cfg.aliases)
+                    or (src.incoming.reply_to and src.incoming.reply_to in self._sent_ids)
+                )
+                if addressed:
+                    return False
+                await self._call(
+                    self.c.observe,
+                    body="qq",
+                    channel=src.channel,
+                    account=src.user_id,
+                    text=text,
+                    display_name=src.name,
+                    now=src.received_at or self.now(),
+                    meta={"message_id": src.message_id, "trpg_observer": True},
+                )
+                return True  # 保留日常记忆，跑团时不为旁观闲聊额外触发模型。
+            if not campaign["state"]["members"][pid].get("character"):
+                return False  # 无角色的KP仍可按普通方式谈论团务。
+        if not self._can_send():
+            return True
+        self._sent_times.append(self.now())
+        try:
+            if text.startswith(("/行动 ", "／行动 ")) or not direct:
+                description = text.split(" ", 1)[1] if direct else text
+                result = await self._trpg_call(self.c.trpg.act, ctx, description)
+            else:
+                line = text.split(" ", 1)[1] if " " in text else "帮助"
+                result = await self._trpg_call(
+                    self.c.trpg.command,
+                    ctx,
+                    line,
+                    resolve_person=lambda who: self.c.people.ensure("qq", who),
+                )
+            return await self._trpg_deliver(src, ctx, result)
+        except (SkillError, ValueError) as error:
+            if campaign:
+                return await self._trpg_deliver(
+                    src, ctx, self.c.trpg.host.notice(campaign["id"], str(error))
+                )
+            await self._send(
+                src,
+                "我还没找到这里的团。先由管理员建立或恢复存档后，我再接着主持。",
+                reply_to=src.message_id,
+            )
+            return True
+
+    def _roleplay_input(self, text, campaign, ctx):
+        if self.c.trpg.host.is_control(text):
+            return True
+        if self._trpg_followup(text, campaign, ctx):
+            return True
+        word = text.strip().strip("，,.。!！?？")
+        member = campaign["state"]["members"].get(ctx.person_id, {})
+        card = campaign["state"]["characters"].get(member.get("character"), {})
+        if word in card.get("skills", {}) or word in card.get("items", {}):
+            return True
+        scene = campaign["state"]["scenes"].get(campaign["state"]["scene"], {})
+        if any(
+            word.startswith(alias)
+            for action in scene.get("actions", [])
+            for alias in action.get("aliases", [])
+            if alias
+        ):
+            return True
+        return bool(
+            re.search(
+                r"^(?:(?:我|她|他)(?:想|要|准备|打算|先|再|重新|接着|仔细|认真|慢慢|试着|尝试){0,3}"
+                r"(?:使用|用|对|向|把|拿|走|去|回|进|出|查看|看看|检查|观察|搜|翻|听|聆听|说|问|攻击|移动|跑|爬|等|蹲|趴|坐|站|躺)"
+                r"|对|向|使用|用|拿|走|去|回|进|出|查看|看看|检查|观察|搜|翻|打开|关上|攻击|砍|挥|开枪|射击|闪避|反击|躲|投|掷"
+                r"|换.*方式观察|从.+(?:拿出|取出))",
+                word,
+            )
+        )
+
+    def _trpg_followup(self, text, campaign, ctx):
+        question = self._trpg_questions.get((ctx.channel, ctx.person_id))
+        if not question or campaign["status"] != "active":
+            return False
+        stamp, cid, version, asked = question
+        if (
+            cid != campaign["id"]
+            or version != campaign["version"]
+            or self.now() - stamp > timedelta(seconds=180)
+        ):
+            return False
+        word = text.strip().strip("，,.。!！?？")
+        if word in {"好", "好的", "可以", "嗯", "对", "是", "是的", "那就这样", "就这个", "就它"}:
+            return bool(re.search(r"吗|是否|要不要|能不能|愿不愿|行不行|好不好|可不可以", asked))
+        scene = campaign["state"]["scenes"].get(campaign["state"]["scene"], {})
+        member = campaign["state"]["members"].get(ctx.person_id, {})
+        card = campaign["state"]["characters"].get(member.get("character"), {})
+        if 2 <= len(word) <= 20 and (
+            word in asked or word in scene.get("public", "") or word in card.get("items", {})
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(?:失败|风险|成功率|难度|检定|投骰|掷骰|奖励|惩罚|SAN|幸运).*[吗么？?]|^(?:为什么|怎么).*(?:失败|风险|检定|投骰)",
+                text,
+            )
+        )
+
+    async def _trpg_deliver(self, src, ctx, result):
+        if result.get("campaign") and result.get("visibility") != "kp":
+            result = await self._trpg_call(self.c.trpg.host.present, ctx, result, src.incoming.text)
+            await self._trpg_call(self.c.trpg.host._outbox, result)
+        allowed, saved_text = await self._trpg_call(
+            self.c.trpg.prepare_delivery, result.get("outbox")
+        )
+        if not allowed:
+            return True  # 已发/发送状态未知；查询战报即可，不盲目重发。
+        output = saved_text or result["text"]
+        # 群里只回已批准的程序摘要；完整KP原文的查询本身也要求私聊。
+        if result.get("visibility") == "kp" and not ctx.private:
+            output = "KP操作已保存，未公开准备材料；详细内容请私聊或到控制台查看。"
+        sent = await self._send_reply(src, output, reply_to=src.message_id)
+        await self._trpg_call(self.c.trpg.delivery, result.get("outbox"), sent)
+        question_key = (ctx.channel, ctx.person_id)
+        self._trpg_questions.pop(question_key, None)
+        if sent and result.get("campaign") and result.get("visibility") != "kp":
+            current = await self._trpg_call(self.c.trpg.service.campaign, ctx, result["campaign"])
+            questions = re.findall(r"[^。！？.!?\n]{1,400}[？?]", output)
+            if current["status"] == "active" and questions:
+                asked = questions[-1]
+                if not re.search(r"(?:做什么|怎么做|什么打算|准备做什么)", asked):
+                    self._trpg_questions[question_key] = (
+                        self.now(),
+                        current["id"],
+                        current["version"],
+                        asked,
+                    )
+        for path in result.get("files", []):
+            if sent:
+                await self._send_file(src, path)
+        if sent and result.get("visibility") == "public":
+            await self._call(
+                self.c.ingest.record_self,
+                body="qq",
+                channel=src.channel,
+                content="跑团公开记录（虚构）：" + output[:2400],
+                ts=self.now(),
+                meta={"fiction": True, "campaign": result.get("campaign"), "trpg_public": True},
+            )
+        return True
+
+    async def _dice_command(self, src: Source, marker: str, arg: str) -> None:
+        # 在抽样前执行原有发言频率限制；暂停时不暗中掷骰、不积攒待重投结果。
+        if not self._can_send():
+            return
+        self._sent_times.append(self.now())
+        if marker == "骰子帮助":
+            await self._send(src, DICE_HELP, reply_to=src.message_id)
+            return
+        if not self.c.config.skills.enabled or not self.c.config.skills.dice.enabled:
+            await self._send(src, "骰子功能或技能总开关已关闭。", reply_to=src.message_id)
+            return
+        dice = next(s for s in self.c.skills.all if isinstance(s, Dice))
+        pid = await self._call(self.c.people.ensure, "qq", src.user_id, src.name)
+        ctx = SkillContext(
+            "qq",
+            src.channel,
+            pid,
+            src.message_type == "private",
+            src.user_id in self.cfg.owner_accounts,
+            now=self.now(),
+            request_id="qq:" + src.message_id if src.message_id else None,
+        )
+        _, result = await self._call(self.c.skills.run, dice, marker, arg, ctx)
+        if result.note != "dice-replay":
+            # 真实结果同时进入原有事件流，下一轮KP可以接着判定；不在这里自动推进剧情。
+            await self._call(
+                self.c.observe,
+                body="qq",
+                channel=src.channel,
+                account=src.user_id,
+                text=src.incoming.text,
+                display_name=src.name,
+                now=src.received_at or ctx.now,
+                meta={"dice_command": True, "message_id": src.message_id},
+            )
+            await self._call(
+                self.c.ingest.record_self,
+                body="qq",
+                channel=src.channel,
+                content=result.text,
+                ts=self.now(),
+                meta={"dice_result": True},
+            )
+        await self._send(src, result.text, reply_to=src.message_id)
+
     async def _command(self, src: Source, line: str) -> None:
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
@@ -1213,10 +1838,26 @@ class QQBot:
             entry[1] = cmd == "批准"
             entry[0].set()
             await self._send(src, "好，批准了。" if cmd == "批准" else "好，拒绝了。")
-        elif cmd == "停止任务" and is_owner:
-            agents = [s for s in self.c.skills.all if s.name in ("agent", "group_agent")]
-            stopped = [agent.cancel() for agent in agents]  # type: ignore[attr-defined]
-            await self._send(src, "好，让助手停下了。" if any(stopped) else "现在没有在做的任务。")
+        elif cmd in {"任务", "任务状态", "继续任务", "停止任务", "追加任务", "压缩任务"}:
+            ctx = SkillContext("qq", src.channel, pid, src.message_type == "private", is_owner)
+            control = next(s for s in self.c.skills.all if isinstance(s, TaskControl))
+            try:
+                if cmd == "追加任务" and "｜" not in arg and "|" not in arg:
+                    task_number, _, addition = arg.partition(" ")
+                    arg = task_number + "｜" + addition
+                if cmd in {"任务", "继续任务"} and not self.c.config.skills.enabled:
+                    raise SkillError("技能总开关已关闭，不能启动或继续任务")
+                call, result = await self._call(
+                    self.c.skills.run, control, cmd, arg if cmd == "任务" else arg or "最近", ctx
+                )
+                if not result.ok:
+                    await self._send(src, result.text)
+                else:
+                    if call.later:
+                        self._spawn(self._run_later(src, ctx, call))
+                    await self._send(src, result.text)
+            except SkillError as e:
+                await self._send(src, str(e))
         elif cmd in ("帮助", "help"):
             await self._send(src, HELP)
         # 其他以 / 开头的消息不理会，避免和别的机器人抢指令

@@ -41,23 +41,31 @@ def run_qq(config: Config, log_file: Path | None = None) -> int:
         with Companion(config) as companion:
             sleeper = Sleeper(companion)
 
-            def daily() -> None:
+            def daily() -> bool:
                 if not sleeper.due():  # 今天已经睡过（比如重启过服务）
-                    return
+                    return True
                 report = sleeper.run()
                 log.info("睡眠完成：%s", report)
+                return not sleeper.due()
 
+            companion.tasks.interrupt_active()
+            companion.trpg.recover_delivery()
             bot = QQBot(companion, cfg, on_daily=daily)
             log.info("连接 NapCat：%s（按 Ctrl+C 或运行停止脚本退出）", cfg.ws_url)
+            planned_stop = False
             try:
                 asyncio.run(_run_until_stopped(bot, flag))
+                planned_stop = flag.exists()
             except KeyboardInterrupt:
+                planned_stop = True
                 log.info("正在退出……")
             finally:
                 bot.close()
                 try:
                     done = companion.extract_pending(force=True)
                     log.info("退出前整理了 %d 段会话", len(done))
+                    if planned_stop:
+                        companion.rotate_chat_sessions("stop")
                 except ModelError as e:
                     log.error("退出前整理失败（下次启动会重试）：%s", e)
     finally:
@@ -71,6 +79,7 @@ async def _run_until_stopped(bot: QQBot, flag: Path) -> None:
     while not task.done():
         if flag.exists():
             log.info("收到停止信号，正在退出……")
+            bot.c.tasks.interrupt_active()
             task.cancel()
             break
         await asyncio.sleep(1)

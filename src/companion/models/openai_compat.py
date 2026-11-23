@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import time
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ class ChatMessage:
     role: str  # system / user / assistant / skill（技能返回的结果，发给 API 时按 user 处理）
     content: str
     images: tuple[Path, ...] = ()  # 本地图片（已转成 JPEG），只在 user 消息里使用
+    event_id: str | None = None  # 稳定事件编号，仅用于本地持久会话去重，不发给 API
 
     def to_openai(self) -> dict[str, Any]:
         role = "user" if self.role == "skill" else self.role
@@ -66,8 +68,14 @@ class OpenAICompatClient:
         self.model = model
         self.extra_body = extra_body or {}
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        host = httpx.URL(base_url).host
+        try:
+            local = ip_address(host).is_loopback
+        except ValueError:
+            local = host.rstrip(".").lower() == "localhost"
         self._http = httpx.Client(
-            base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport
+            base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport,
+            trust_env=not local,  # 本地 Ollama 直连；远端 API 仍沿用用户代理与证书设置。
         )
 
     def close(self) -> None:

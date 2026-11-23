@@ -19,21 +19,24 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from companion.config import AgentSkillConfig, FallbackConfig, SubscriptionConfig
 from companion.models.codex_app_server import CodexAppServerBackend
 from companion.models.openai_compat import ModelError
+from companion.models.runtime import RunControl
 from companion.models.usage import UsageLedger, estimate_cost
 from companion.skills.base import Skill, SkillContext, SkillError, SkillResult
 
@@ -76,6 +79,8 @@ def default_deny(root: Path) -> list[Path]:
         root / "config.local.toml",
         root / "data" / "memory",
         root / "data" / "run",
+        root / "data" / "trpg",
+        root / "data" / "backups",
         root / "data" / "usage.jsonl",
         Path(os.environ.get("CODEX_HOME") or home / ".codex"),
         home / ".ssh",
@@ -104,6 +109,8 @@ def default_deny(root: Path) -> list[Path]:
     ]
     if os.environ.get("NAPCAT_DIR"):
         paths.append(Path(os.environ["NAPCAT_DIR"]))
+    from companion.trpg.policy import load
+    paths += [Path(p) for p in load(root / "data/run/trpg-protected.json")["paths"]]
     return paths
 
 
@@ -290,6 +297,7 @@ class AgentOutcome:
     files: int = 0
     seconds: float = 0.0
     backend: str = "subscription"
+    artifacts: list[Path] = field(default_factory=list)
 
 
 class AgentRun:
@@ -309,6 +317,8 @@ class AgentRun:
         approval_policy: str = "on-request",
         cwd: Path | None = None,
         on_thread: Callable[[dict[str, Any]], None] | None = None,
+        context: SkillContext | None = None,
+        structured_result: bool = False,
     ) -> None:
         self.backend = backend
         self.workspace = workspace
@@ -321,6 +331,8 @@ class AgentRun:
         self.approval_policy = approval_policy
         self.cwd = cwd or workspace  # 线程的工作目录；app-server 会加载这里的 .codex/config.toml
         self.on_thread = on_thread  # 拿到线程实际生效的配置后、开始干活前，可以在这里拦下
+        self.context = context
+        self.structured_result = structured_result and isinstance(backend, CodexAppServerBackend)
         self.cancelled = threading.Event()
         self.tokens = (0, 0)  # 输入、输出 token
         self._file_changes: dict[str, list[dict[str, Any]]] = {}  # 正在进行的写文件，审批时要用
@@ -329,21 +341,74 @@ class AgentRun:
         b = self.backend
         started = time.monotonic()
         b.start()
-        thread = b._request(
-            "thread/start",
-            {"cwd": str(self.cwd), "approvalPolicy": self.approval_policy, "ephemeral": True},
-        )
+        ctx = self.context
+        book = ctx.task_book if ctx else None
+        task_id = ctx.task_id if ctx else None
+        policy = hashlib.sha256(json.dumps(
+            [str(self.workspace.resolve()), str(self.cwd.resolve()), self.approval_policy,
+             self.preamble, getattr(b, "_command", [])], sort_keys=True,
+        ).encode()).hexdigest()
+        checkpoint = book.get(task_id, ctx).get("checkpoint", {}) if book and task_id else {}
+        native = checkpoint.get("native", {})
+        if native and native.get("policy") != policy:
+            raise ModelError("任务权限或模型配置已改变，不能复用旧权限线程；请重新下达任务")
+        params = {"cwd": str(self.cwd), "approvalPolicy": self.approval_policy}
+        rebuilt = False
+        if native.get("thread_id"):
+            try:
+                thread = b._request("thread/resume", {**params, "threadId": native["thread_id"]})
+            except ModelError as e:
+                if not any(w in str(e).lower() for w in (
+                    "not found", "no rollout", "does not exist", "unknown thread",
+                )):
+                    raise
+                rebuilt = True
+                thread = b._request("thread/start", {**params, "ephemeral": False})
+        else:
+            thread = b._request("thread/start", {**params, "ephemeral": not bool(book and task_id)})
         thread_id = (thread.get("thread") or {}).get("id")
         if not thread_id:
             raise ModelError(f"thread/start 返回异常：{str(thread)[:200]}")
         if self.on_thread is not None:
             self.on_thread(thread)
+        if book and task_id:
+            book.checkpoint(task_id, native={"thread_id": thread_id, "policy": policy,
+                                             "rebuilt_from_files": rebuilt},
+                            thread_id=thread_id, engine="native-agent")
         text = self.preamble.format(workspace=self.workspace, task=task)
+        if native:
+            text += ("\n这是恢复原任务，旧进度和产出可能已存在。先核对实际文件和工具结果，"
+                     "不重复已完成的操作；未完成或执行结果未知的部分如实说明，再继续。")
+        if rebuilt:
+            text += "\n原生会话历史已缺失，这是新线程，只能依据现有文件和任务要求核对续做，不能假装恢复了旧工具结果。"
+        if self.structured_result:
+            text += ("\n结束时按要求输出 JSON。completed 只有实际完成允许范围内的全部任务才为 true；"
+                     "命令启动失败、没有完成目标或需要用户补充时必须为 false。summary 如实说明；"
+                     "artifacts 只列工作文件夹内实际存在的产出文件，可用相对路径；"
+                     "经批准保存在工作文件夹外的文件仅在 summary 写明，不列入 artifacts。")
         params: dict[str, Any] = {"threadId": thread_id, "input": [{"type": "text", "text": text}]}
         if self.effort:
             params["effort"] = self.effort
+        if self.structured_result:
+            params["outputSchema"] = {
+                "type": "object", "properties": {
+                    "completed": {"type": "boolean"}, "summary": {"type": "string"},
+                    "artifacts": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["completed", "summary", "artifacts"], "additionalProperties": False,
+            }
         turn = b._request("turn/start", params)
         turn_id = (turn.get("turn") or {}).get("id")
+        if book and task_id:
+            book.runtime(task_id, "turn/started", {"threadId": thread_id, "turn": turn.get("turn", {})})
+            b._active_thread, b._active_turn = thread_id, turn_id
+            b._control_sent = set()
+            b._control_requests = {}
+            b._interrupt_sent = False
+            b._control = RunControl(
+                self.cancelled, lambda: book.pending_inputs(task_id),
+                lambda iid, ok, detail: book.input_receipt(task_id, iid, ok, detail),
+                deadline=started + self.timeout,
+            )
 
         commands = files = 0
         final = ""
@@ -360,6 +425,10 @@ class AgentRun:
             msg = b._receive()
             method = msg.get("method")
             params = msg.get("params") or {}
+            if params.get("threadId") not in (None, thread_id):
+                continue
+            if book and task_id and method:
+                book.runtime(task_id, method, params)
             if method is None:
                 continue
             if "id" in msg:
@@ -389,10 +458,44 @@ class AgentRun:
             elif method == "account/rateLimits/updated":
                 b._handle_side_message(msg)
             elif method == "turn/completed":
+                b._active_thread, b._active_turn, b._control = None, None, None
                 status = (params.get("turn") or {}).get("status")
                 seconds = time.monotonic() - started
                 if status == "completed":
-                    return AgentOutcome(final or "（没有汇报）", True, commands, files, seconds)
+                    if self.structured_result:
+                        try:
+                            data = json.loads(final)
+                            ok, summary, artifacts = data["completed"], data["summary"], data["artifacts"]
+                            if not isinstance(ok, bool) or not isinstance(summary, str) or not isinstance(artifacts, list):
+                                raise ValueError("结果格式不对")
+                            paths = []
+                            missing = False
+                            for raw in artifacts:
+                                if not isinstance(raw, str) or raw.startswith(("\\\\", "//")):
+                                    missing = True
+                                    continue
+                                path = Path(raw)
+                                path = path if path.is_absolute() else self.workspace / path
+                                if not path.is_relative_to(self.workspace):
+                                    missing = True
+                                    continue
+                                path = path.resolve()
+                                if not path.is_relative_to(self.workspace.resolve()) or not path.is_file():
+                                    missing = True
+                                else:
+                                    paths.append(path)
+                            if missing:
+                                ok = False
+                                summary += "\n部分声明的产出未通过位置或存在检查，请核对实际文件。"
+                            return AgentOutcome(summary, ok, commands, files, seconds, artifacts=paths)
+                        except (ValueError, KeyError, TypeError, OSError):
+                            return AgentOutcome("未得到可校验的完成结果，任务未确认完成。\n" + final[:2000],
+                                                False, commands, files, seconds)
+                    failed = bool(re.search(
+                        r"(?:未能|无法).{0,12}(?:创建|写入|完成|执行)|"
+                        r"(?:任务|本次).{0,8}(?:未完成|失败|没做成)|"
+                        r"(?:命令|执行环境).{0,10}(?:启动失败|不可用)", final))
+                    return AgentOutcome(final or "（没有汇报）", not failed, commands, files, seconds)
                 why = "被取消了" if self.cancelled.is_set() else (
                     "超时了" if interrupted else f"中断了（{status}）"
                 )  # fmt: skip
@@ -414,6 +517,10 @@ class AgentRun:
         method = str(msg.get("method"))
         params = msg.get("params") or {}
         b = self.backend
+        ctx = self.context
+        if ctx and ctx.task_book and ctx.task_id:
+            ctx.task_book.runtime(ctx.task_id, "request/approval" if "Approval" in method
+                                  else "request/input", params)
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
             if method == "item/fileChange/requestApproval":
                 # 请求本身只有 itemId，路径和内容在之前的消息里
@@ -540,6 +647,8 @@ class CodexAgent(Skill):
     def _work(self, task: str, backend: str, ctx: SkillContext) -> SkillResult:
         proc: CodexAppServerBackend | None = None
         try:
+            if ctx.stop_event and ctx.stop_event.is_set():
+                return SkillResult("任务已停止。", ok=False, report=True)
             self.workspace.mkdir(parents=True, exist_ok=True)
             moved = move_aside_unmanageable(self.workspace)
             cwd = empty_dir(self.cwd)  # 也让 _launch 的黑名单加得上 data/run（不存在的路径不加）
@@ -553,10 +662,24 @@ class CodexAgent(Skill):
                 progress=ctx.notify,
                 timeout=self.cfg.task_timeout_minutes * 60,
                 progress_every=self.cfg.progress_every_seconds,
+                context=ctx,
+                structured_result=backend == "subscription",
             )
+            if ctx.stop_event is not None:
+                agent_run.cancelled = ctx.stop_event
             with self._lock:
                 self._current = agent_run
+            if ctx.task_book and ctx.task_id:
+                ctx.task_book.on_cancel(ctx.task_id, getattr(proc, "interrupt_current", agent_run.cancelled.set))
             outcome = agent_run.run(task)
+            while outcome.ok and ctx.task_book and ctx.task_id:
+                pending = ctx.task_book.pending_inputs(ctx.task_id)
+                if not pending:
+                    break
+                extra = "\n".join(i["text"] for i in pending)
+                for item in pending:
+                    ctx.task_book.input_receipt(ctx.task_id, item["id"], True, "下一轮执行补充要求")
+                outcome = agent_run.run("在原任务和已有产出基础上完成这些追加要求：\n" + extra)
             outcome.backend = backend
             self._charge(backend, agent_run.tokens)
             log.info("任务结束（%s，%.0f 秒，%s）：%s", backend, outcome.seconds,
@@ -569,7 +692,7 @@ class CodexAgent(Skill):
                 else ""
             )
             return SkillResult(f"任务：{task}\n{note}助手的汇报{via}：\n{outcome.text}",
-                               ok=outcome.ok, report=True)  # fmt: skip
+                               ok=outcome.ok, report=True, files=outcome.artifacts)  # fmt: skip
         except ModelError as e:
             log.warning("任务失败：%s", e)
             return SkillResult(f"任务：{task}\n没做成：{e}", ok=False, report=True)
@@ -577,6 +700,8 @@ class CodexAgent(Skill):
             log.exception("任务出错")
             return SkillResult(f"任务：{task}\n没做成：程序出了点问题", ok=False, report=True)
         finally:
+            if ctx.task_book and ctx.task_id:
+                ctx.task_book.on_cancel(ctx.task_id, None)
             if proc is not None:
                 proc.close()
             with self._lock:
@@ -595,9 +720,15 @@ class CodexAgent(Skill):
     # ---- 启动 Codex ----
 
     def _launch(self, backend: str) -> CodexAppServerBackend:
+        from companion.trpg.policy import load
+
         deny = default_deny(self.root) + [
             Path(p) if Path(p).is_absolute() else self.root / p for p in self.cfg.extra_deny
+        ] + [self.run_dir.parent / "trpg", self.run_dir.parent / "backups"] + [
+            Path(p) for p in load(self.run_dir / "trpg-protected.json")["paths"]
         ]
+        if self.sub.codex_home is not None:
+            deny.append(self.sub.codex_home)
         overrides = permission_overrides(self.workspace, deny, web_search=self.cfg.web_search)
         env = None
         model = self.sub.model
@@ -619,6 +750,7 @@ class CodexAgent(Skill):
         return CodexAppServerBackend.from_codex(
             self.sub.codex_command,
             self.cwd,  # 进程本身也不在工作文件夹里启动
+            codex_home=self.sub.codex_home,
             overrides=overrides,
             timeout=600.0,  # 一条长命令可能好几分钟没有消息
             name="agent",

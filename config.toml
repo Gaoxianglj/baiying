@@ -12,6 +12,9 @@ name = "白璎"
 # GPT 订阅，经 Codex app-server 调用
 enabled = true
 codex_command = "codex"
+# codex_home 可在 config.local.toml 中设为独立 Codex 目录的绝对路径。
+persistent_chats = true
+native_tools = true
 
 [models.fallback]
 # 兜底 API（OpenAI 兼容接口），订阅的 5 小时额度耗尽后使用

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 from companion.config import Config
 from companion.models.codex_app_server import CodexAppServerBackend
 from companion.models.gateway import ModelGateway, PricedBackend
 from companion.models.openai_compat import ModelError, OpenAICompatClient
+from companion.models.sessions import ChatSessions
 from companion.models.usage import UsageLedger
 
 
-def build_gateway(config: Config) -> ModelGateway:
+def build_gateway(config: Config, *, task_mode: bool = False,
+                  session_store: Path | None = None) -> ModelGateway:
     sub_cfg = config.models.subscription
     subscription: CodexAppServerBackend | None = None
     subscription_error: str | None = None
@@ -20,11 +25,16 @@ def build_gateway(config: Config) -> ModelGateway:
             subscription = CodexAppServerBackend.from_codex(
                 sub_cfg.codex_command,
                 config.data_dir / "codex",
+                codex_home=sub_cfg.codex_home,
                 model=sub_cfg.model,
                 effort=sub_cfg.effort,
                 timeout=sub_cfg.timeout_seconds,
+                sessions=ChatSessions(session_store or config.data_dir / "run" / (
+                    "task-sessions.sqlite" if task_mode else "chat-sessions.sqlite")),
+                persistent_chats=sub_cfg.persistent_chats or task_mode,
+                recover_pending=task_mode,
             )
-        except ModelError as e:
+        except (ModelError, sqlite3.Error) as e:
             subscription_error = str(e)
 
     fb = config.models.fallback

@@ -21,7 +21,7 @@ from companion.bodies.qq.bot import QQBot
 from companion.config import QQConfig, load_config
 from companion.core.companion import Companion
 from companion.memory import MemoryLayout, init_memory
-from companion.skills import group_agent
+from companion.skills import SkillContext, group_agent
 from tests.fakes import FakeEmbedder, scripted_gateway
 from tests.test_agent import FakeProc, approval, done
 from tests.test_qq import FakeClient
@@ -280,21 +280,24 @@ def test_group_task_in_unknown_group_starts_nothing(bot, helper):
     assert helper.launched == [] and bot.client.sent == []
 
 
-def test_group_task_off_by_default_starts_nothing(bot):
+def test_disabled_shell_sandbox_uses_scoped_background_skills(bot):
     skill = next(s for s in bot.c.skills.all if s.name == "group_agent")
     launched = []
     skill.launch = lambda folder, cwd: launched.append(folder)
-    bot.c.gateway.fallback.client.handler = lambda m, j: "好【任务：做个表】"
+    replies = iter(["好【任务：做个表】", "任务已登记", "任务完成"])
+    bot.c.gateway.fallback.client.handler = lambda m, j: next(replies)
+    gateway, _ = scripted_gateway(lambda m, j: "【任务完成：完成】")
+    bot.c.background_gateway_factory = lambda: gateway
     run(bot, msg("做个表", group=GROUP, at_bot=True))
     assert launched == []
     assert_only_group(bot, GROUP)
-    assert not any("【任务" in str(p) for _, p in bot.client.sent)
+    assert len(bot.c.tasks.visible(SkillContext("qq", f"group:{GROUP}", "f", False, False))) == 1
 
 
 def test_only_the_owner_can_stop_a_group_task(bot, helper):
-    stops = []
-    helper.cancel = lambda: stops.append(True) or True
-    run(bot, msg("/停止任务", user=FRIEND, group=GROUP, at_bot=True))
-    assert stops == []
-    run(bot, msg("/停止任务", user=OWNER, group=GROUP, at_bot=True, mid=2))
-    assert stops == [True]
+    ctx = SkillContext("qq", f"group:{GROUP}", "f", False, False)
+    task_id = bot.c.tasks.create("group_agent", "任务", "群沙箱任务", ctx)
+    run(bot, msg(f"/停止任务 {task_id}", user=FRIEND, group=GROUP, at_bot=True))
+    assert bot.c.tasks.get(task_id, ctx)["state"] == "queued"
+    run(bot, msg(f"/停止任务 {task_id}", user=OWNER, group=GROUP, at_bot=True, mid=2))
+    assert bot.c.tasks.get(task_id, ctx)["state"] == "cancelling"

@@ -101,6 +101,10 @@ class HybridRetriever:
         text_set = set(text_ranked)
         out: list[Candidate] = []
         for key, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
+            record = (self.index.get_episode(key[1]) if key[0] == "episode"
+                      else self.index.get_fact(key[1]))
+            if record is None or not self.index.is_public(record):
+                continue
             cos = cosines.get(key)
             if key not in text_set and cos is not None and cos < self.min_cosine:
                 continue

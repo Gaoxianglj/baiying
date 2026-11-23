@@ -83,6 +83,7 @@ class SleepReport:
     identity_reflected: bool = False
     journal: str | None = None
     planned: bool = False  # 新一天的安排已经有了
+    threads_rotated: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -102,9 +103,12 @@ class Sleeper:
         last = self._last(LAST_SLEEP) or now - timedelta(days=1)
 
         try:
-            report.extracted = len(self.c.extract_pending(now=now))
+            report.extracted = len(self.c.extract_pending(force=True, now=now))
         except ModelError as e:
             report.errors.append(f"整理会话：{e}")
+            # 当前仍在聊的会话也必须先落入长期记忆，才能安全开启新一代线程。
+            # 不标记睡眠完成，维护循环会重试，已有抽取游标保证不重复保存。
+            return report
         report.faded, report.dormant = self._forget(now)
         report.merged = self._merge_duplicates(now)
 
@@ -145,6 +149,7 @@ class Sleeper:
                 report.errors.append(f"日记：{e}")
 
         report.planned = self.c.life.ensure_plan(now) is not None
+        report.threads_rotated = self.c.rotate_chat_sessions("sleep")
         self.c.index.set_meta(LAST_SLEEP, now.isoformat())
         commit_memory(self.c.layout, self.c.name, _summary(report, now))
         return report

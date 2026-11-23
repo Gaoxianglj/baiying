@@ -4,10 +4,13 @@ import asyncio
 import random
 import zipfile
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from pypdf import PdfWriter
+from pypdf.errors import DependencyError
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from companion.bodies.qq.bot import QQBot
 from companion.config import FilesSkillConfig, QQConfig, load_config
@@ -17,7 +20,7 @@ from companion.skills import SkillContext
 from companion.skills.access import FileAccess
 from companion.skills.base import SkillError
 from companion.skills.files import FileInbox
-from companion.skills.reader import ReadFile, decode_text, extract_text
+from companion.skills.reader import ExportText, ReadFile, decode_text, extract_text
 from tests.fakes import FakeEmbedder, scripted_gateway
 from tests.test_qq import FakeClient
 
@@ -176,7 +179,7 @@ def test_recent_files_listed_for_next_turn(setup):
     assert "最近读过" not in skill.context(OWNER_PRIVATE)
     skill.run("读文件", str(doc), OWNER_PRIVATE)
     assert str(doc) in skill.context(OWNER_PRIVATE)
-    assert skill.context(FRIEND_PRIVATE) == ""  # 别的聊天看不到
+    assert str(doc) not in skill.context(FRIEND_PRIVATE)  # 别的聊天看不到读过的文件
 
 
 def test_local_usage_only_told_to_owner_in_private(setup):
@@ -215,6 +218,49 @@ def test_docx():
         extract_text("a.docx", b"not a zip", 10**6)
 
 
+def pdf_bytes(*, algorithm: str | None = None, password: str = "") -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(200, 100)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+    })
+    content = DecodedStreamObject()
+    content.set_data(b"BT /F1 12 Tf 10 50 Td (PDF reading regression) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(content)
+    if algorithm is not None:
+        writer.encrypt(password, owner_password="owner-test", algorithm=algorithm)
+    buf = BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("algorithm", [None, "RC4-128", "AES-128", "AES-256"])
+def test_pdf_without_open_password_is_readable(algorithm):
+    data = pdf_bytes(algorithm=algorithm)
+    assert "PDF reading regression" in extract_text("readable.pdf", data, 10**6)
+
+
+@pytest.mark.parametrize("algorithm", ["AES-128", "AES-256"])
+def test_pdf_requiring_open_password_says_so(algorithm):
+    data = pdf_bytes(algorithm=algorithm, password="actual-open-password")
+    with pytest.raises(SkillError, match="有密码"):
+        extract_text("protected.pdf", data, 10**6)
+
+
+def test_pdf_missing_crypto_reports_dependency_instead_of_crashing(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise DependencyError("cryptography is required for AES algorithm")
+
+    monkeypatch.setattr("pypdf.PdfReader", unavailable)
+    with pytest.raises(SkillError, match="加密依赖"):
+        extract_text("aes.pdf", b"placeholder", 10**6)
+
+
 def test_pdf_without_text_says_so(tmp_path):
     writer = PdfWriter()
     writer.add_blank_page(100, 100)
@@ -225,6 +271,21 @@ def test_pdf_without_text_says_so(tmp_path):
         extract_text("scan.pdf", path.read_bytes(), 10**6)
     with pytest.raises(SkillError, match="PDF 读不了"):
         extract_text("bad.pdf", b"%PDF-1.4 garbage", 10**6)
+
+
+@pytest.mark.parametrize("context", [FRIEND_IN_GROUP, FRIEND_PRIVATE])
+def test_export_full_pdf_uses_chat_permissions_without_truncation(setup, context):
+    reader, inbox, _, cfg = setup
+    cfg.read_chars = 3
+    source = inbox.save("rules.pdf", pdf_bytes(algorithm="AES-256"), T0, context.channel)
+    exporter = ExportText(reader)
+    result = exporter.run("转存文件", rel(source, reader) + "｜全文.md", context)
+    assert result.files[0].read_text(encoding="utf-8") == "PDF reading regression"
+    repeated = exporter.run("转存文件", rel(source, reader) + "｜全文.md", context)
+    assert repeated.files[0] != result.files[0]
+    other = FRIEND_PRIVATE if context is FRIEND_IN_GROUP else FRIEND_IN_GROUP
+    with pytest.raises(SkillError):
+        exporter.run("转存文件", rel(source, reader) + "｜偷读.md", other)
 
 
 @pytest.mark.parametrize("name", ["a.xlsx", "a.doc", "a.exe"])
@@ -420,6 +481,19 @@ def test_group_file_can_be_read_in_that_group(bot):
     bot.replies["list"] = [f"【读文件：{path}】", "下周一开会"]
     run(bot, chat_event("读一下", user=FRIEND, group=GROUP, at_bot=True))
     assert "下周一开会" in bot.chat.requests[-1][-1].content
+
+
+@pytest.mark.parametrize("group", [None, GROUP])
+def test_encrypted_pdf_reaches_model_from_private_and_group(bot, group):
+    bot.replies["list"] = ["收到"]
+    run(bot, file_event(bot, "rules.pdf", pdf_bytes(algorithm="AES-256"),
+                        user=FRIEND, group=group, at_bot=group is not None))
+    path = saved_path(bot)
+    bot.replies["list"] = [f"【读文件：{path}】", "读到了"]
+    run(bot, chat_event("读一下", user=FRIEND, group=group, at_bot=group is not None))
+    assert "PDF reading regression" in bot.chat.requests[-1][-1].content
+    action = "send_group_msg" if group else "send_private_msg"
+    assert bot.client.texts(action)[-1] == "读到了"
 
 
 def test_group_cannot_read_owners_private_file(bot):

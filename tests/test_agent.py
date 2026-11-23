@@ -694,7 +694,8 @@ def test_qq_owner_task_with_approval(tmp_path):
         assert texts[:2] == ["好", "我去弄一下"]
         assert "New-Item C:/outside/x.txt" in texts[2]
         assert texts[3] == "好，批准了。"
-        assert texts[-1] == "弄好啦，汇总表在工作文件夹里"
+        assert texts[-1].endswith("弄好啦，汇总表在工作文件夹里")
+        assert "已完成" in texts[-1] and "任务 " in texts[-1]
         assert "汇总.xlsx" in chat.requests[-1][-1].content  # 结果交给她转述
         mine = [e.content for e in c.log.iter_events() if e.actor.person_id == "self"]
         assert mine[-1] == "弄好啦，汇总表在工作文件夹里"
@@ -724,7 +725,7 @@ def test_qq_friend_cannot_use_agent_or_approve(tmp_path):
 
     try:
         asyncio.run(go())
-        assert launched == [] and "【任务" not in chat.requests[0][0].content
+        assert launched == [] and "【任务：" not in chat.requests[0][0].content
         assert bot.client.texts() == ["不行哦"]  # /批准 对非主人无效，不回应
     finally:
         bot.close()

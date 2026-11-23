@@ -101,13 +101,12 @@ def test_safe_name_drops_paths():
 def test_private_text_file_saved_and_previewed(bot, tmp_path):
     napcat_has(bot, tmp_path, "第一行\n第二行".encode())
     run(bot, file_msg("note.txt"))
-    day = f"{T0.astimezone():%Y-%m-%d}"
-    saved = bot.workspace / "inbox" / day / f"private-{FRIEND}" / "note.txt"
+    saved = bot.workspace / "chats" / f"private-{FRIEND}" / "note.txt"
     assert saved.read_text("utf-8") == "第一行\n第二行"
     theirs = [e.content for e in bot.c.log.iter_events() if e.actor.person_id != "self"]
     assert theirs[0].startswith("[文件：note.txt（")
-    assert f"inbox/{day}/private-{FRIEND}/note.txt" in theirs[0] and "第二行" in theirs[0]
-    assert ("get_file", {"file_id": "fid-1"}) in bot.client.sent
+    assert f"chats/private-{FRIEND}/note.txt" in theirs[0] and "第二行" in theirs[0]
+    assert ("get_file", {"file": "fid-1"}) in bot.client.sent
 
 
 def test_same_name_is_not_overwritten(bot, tmp_path):
@@ -115,7 +114,7 @@ def test_same_name_is_not_overwritten(bot, tmp_path):
     run(bot, file_msg("a.bin"))
     napcat_has(bot, tmp_path, b"v2", name="a.bin")
     run(bot, file_msg("a.bin"))
-    folder = bot.workspace / "inbox" / f"{T0.astimezone():%Y-%m-%d}" / f"private-{FRIEND}"
+    folder = bot.workspace / "chats" / f"private-{FRIEND}"
     assert sorted(p.name for p in folder.iterdir()) == ["a-1.bin", "a.bin"]
 
 
@@ -141,9 +140,8 @@ def test_download_failure_is_explicit(bot):
 def test_inbox_describe_binary_has_no_preview(tmp_path):
     inbox = FileInbox(FilesSkillConfig(inbox=tmp_path / "ws" / "inbox"), tmp_path, tmp_path / "ws")
     path = inbox.save("photo.png", b"\x89PNG....", T0, "private:1")
-    day = f"{T0.astimezone():%Y-%m-%d}"
     described = inbox.describe(path, "photo.png")
-    assert described.endswith(f"存在工作文件夹的 inbox/{day}/private-1/photo.png]")
+    assert described.endswith("存在工作文件夹的 chats/private-1/photo.png]")
 
 
 # ---- 发 ----
@@ -204,7 +202,8 @@ def test_owner_gets_file_in_private(bot):
 
 def test_others_cannot_get_files(bot):
     put(bot, "out/report.csv")
-    bot.brain["reply"] = "给你【发文件：out/report.csv】"
+    replies = iter(["给你【发文件：out/report.csv】", "这个聊天不能读那个文件"])
+    bot.c.gateway.fallback.client.handler = lambda m, j: next(replies)
     run(bot, {**file_msg("ignored"), "message": [{"type": "text", "data": {"text": "发我"}}]})
     assert not any(a.startswith("upload_") for a, _ in bot.client.sent)
 

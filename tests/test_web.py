@@ -59,6 +59,23 @@ def test_requires_token_cookie_and_local_host(app):
     assert status == 200 and "白璎控制台" in page.decode()
 
 
+def test_trpg_console_requires_auth_explicit_kp_and_deduplicates_request(app):
+    assert call(app, "GET", "/api/trpg", headers=HOST)[0] == 401
+    assert call(app, "POST", "/api/trpg", {"operation": "创建", "channel": "group:111",
+                                          "args": {"name": "控制台团"}})[0] == 200
+    rows = call(app, "GET", "/api/trpg")[2]
+    cid = rows["campaigns"][0]["id"]
+    assert "today" in rows
+    assert call(app, "POST", "/api/trpg", {"campaign": cid, "operation": "暂停"})[0] == 400
+    payload = {"campaign": cid, "as_kp": True, "operation": "推进时间",
+               "request_id": "same", "args": {"minutes": 3}}
+    first = call(app, "POST", "/api/trpg", payload)[2]
+    again = call(app, "POST", "/api/trpg", payload)[2]
+    assert first["changed"] and again["replay"]
+    public = call(app, "POST", "/api/trpg", {"campaign": cid, "operation": "状态"})[2]["data"]
+    assert public["minutes"] == 3 and "state" not in public
+
+
 def test_settings_describe_sources(root):
     fields = {f["path"]: f for f in settings.describe(root)}
     assert fields["qq.groups"]["source"] == ".env" and fields["qq.groups"]["value"] == ["111"]

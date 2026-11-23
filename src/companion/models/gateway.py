@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
@@ -21,6 +22,7 @@ from companion.models.openai_compat import (
     ModelError,
     OpenAICompatClient,
 )
+from companion.models.runtime import Observer, RunControl, ToolSet
 from companion.models.usage import UsageLedger, estimate_cost
 
 log = logging.getLogger(__name__)
@@ -77,6 +79,9 @@ class ModelGateway:
     def close(self) -> None:
         if self.subscription is not None:
             self.subscription.close()
+            sessions = getattr(self.subscription, "sessions", None)
+            if sessions is not None:
+                sessions.close()
         for b in (self.fallback, self.local):
             if b is not None:
                 b.client.close()
@@ -91,23 +96,44 @@ class ModelGateway:
         json_schema: dict[str, Any] | None = None,
         max_tokens: int | None = None,
         now: datetime | None = None,
+        session_key: str | None = None,
+        session_messages: list[ChatMessage] | None = None,
+        session_bootstrap: list[ChatMessage] | None = None,
+        tools: ToolSet | None = None,
+        observer: Observer | None = None,
+        control: RunControl | None = None,
     ) -> ChatResult:
         errors: list[str] = []
         for name in self._order():
+            if control and (control.stopped.is_set()
+                            or (control.deadline and time.monotonic() > control.deadline)):
+                raise ModelError("任务已停止或达到运行时限，不再发起新的模型调用")
             try:
+                if observer is not None:
+                    observer("backend/changed", {"backend": name})
                 if name == "subscription":
                     if not self._subscription_ready(now):
                         continue
                     assert self.subscription is not None
                     result = self.subscription.chat(
-                        messages, json_schema=json_schema, max_tokens=max_tokens
+                        messages, json_schema=json_schema, max_tokens=max_tokens,
+                        **({"tools": tools, "observer": observer, "control": control}
+                           if isinstance(self.subscription, CodexAppServerBackend) else {}),
+                        **({"session_key": session_key, "session_messages": session_messages,
+                            "session_bootstrap": session_bootstrap}
+                           if session_key and getattr(self.subscription, "sessions", None)
+                           is not None else {}),
                     )
                 else:
                     priced = self.fallback if name == "fallback" else self.local
                     if priced is None or not self._within_budget(name, priced, now):
                         continue
+                    known = {(m.role, m.content, m.images) for m in messages}
+                    extra = [m for m in (tools.history if tools else [])
+                             if (m.role, m.content, m.images) not in known]
                     result = priced.client.chat(
-                        messages, json_mode=json_schema is not None, max_tokens=max_tokens
+                        [*messages, *extra],
+                        json_mode=json_schema is not None, max_tokens=max_tokens
                     )
                     self._record(name, priced, result, purpose, now)
             except ModelError as e:
@@ -122,6 +148,24 @@ class ModelGateway:
                 result.text = _extract_json_text(result.text)
             return result
         raise ModelError("所有模型后端都不可用：" + ("；".join(errors) or "没有可用的后端"))
+
+    def note_response(self, result: ChatResult, event_id: str) -> None:
+        note = getattr(self.subscription, "note_response", None)
+        if note is not None and result.backend == self.subscription.name:
+            note(result, event_id)
+
+    def rotate_chat_sessions(self, reason: str) -> int:
+        rotate = getattr(self.subscription, "rotate_sessions", None)
+        return rotate(reason) if rotate is not None else 0
+
+    def interrupt_current(self) -> None:
+        interrupt = getattr(self.subscription, "interrupt_current", None)
+        if interrupt is not None:
+            interrupt()
+
+    def compact_session(self, key: str, observer: Observer | None = None) -> bool:
+        compact = getattr(self.subscription, "compact_session", None)
+        return compact(key, observer) if compact else False
 
     def chat_json(
         self,

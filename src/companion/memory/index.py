@@ -153,6 +153,7 @@ class Strength:
 class MemoryIndex:
     def __init__(self, layout: MemoryLayout) -> None:
         self._path = layout.index_path
+        self._policy_path = layout.root.parent / "run/trpg-protected.json"
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -167,6 +168,10 @@ class MemoryIndex:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def is_public(self, record) -> bool:
+        from companion.trpg.policy import public_memory
+        return public_memory(record, self._policy_path)
 
     def __enter__(self) -> MemoryIndex:
         return self
@@ -244,7 +249,7 @@ class MemoryIndex:
             "WHERE p.person_id = ? ORDER BY e.started_at DESC LIMIT ?",
             (person_id, limit),
         ).fetchall()
-        return [self._episode(r) for r in rows]
+        return [ep for r in rows if self.is_public(ep := self._episode(r))]
 
     def set_episode_state(self, episode_id: str, state: EpisodeState) -> None:
         with self._tx() as c:
@@ -321,7 +326,7 @@ class MemoryIndex:
             sql += " AND predicate = ?"
             args.append(predicate)
         rows = self._conn.execute(sql + " ORDER BY valid_from", args).fetchall()
-        return [_fact(r) for r in rows]
+        return [fact for r in rows if self.is_public(fact := _fact(r))]
 
     def fact_history(self, subject: str, predicate: str) -> list[Fact]:
         """同一主题的全部事实（含已失效的），旧的在前：用来说出“你以前……后来……”。"""
@@ -329,7 +334,7 @@ class MemoryIndex:
             "SELECT * FROM facts WHERE subject = ? AND predicate = ? ORDER BY valid_from",
             (subject, predicate),
         ).fetchall()
-        return [_fact(r) for r in rows]
+        return [fact for r in rows if self.is_public(fact := _fact(r))]
 
     # ---- 强度 ----
 
@@ -526,19 +531,19 @@ class MemoryIndex:
         rows = self._conn.execute(
             "SELECT * FROM episodes WHERE created_at >= ? ORDER BY started_at", (_iso(since),)
         ).fetchall()
-        return [self._episode(r) for r in rows]
+        return [ep for r in rows if self.is_public(ep := self._episode(r))]
 
     def episodes_started_since(self, since: datetime) -> list[Episode]:
         rows = self._conn.execute(
             "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (_iso(since),)
         ).fetchall()
-        return [self._episode(r) for r in rows]
+        return [ep for r in rows if self.is_public(ep := self._episode(r))]
 
     def facts_created_since(self, since: datetime) -> list[Fact]:
         rows = self._conn.execute(
             "SELECT * FROM facts WHERE created_at >= ? ORDER BY valid_from", (_iso(since),)
         ).fetchall()
-        return [_fact(r) for r in rows]
+        return [fact for r in rows if self.is_public(fact := _fact(r))]
 
     def episode_ids(self, states: tuple[EpisodeState, ...]) -> list[str]:
         marks = ",".join("?" * len(states))

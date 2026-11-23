@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 CONFIG_FILE = "config.toml"
 LOCAL_CONFIG_FILE = "config.local.toml"
@@ -62,10 +62,20 @@ class SubscriptionConfig(_Section):
 
     enabled: bool = True
     codex_command: str = "codex"
+    codex_home: Path | None = None  # 独立保存 Codex 登录与会话，不混入桌面端
     model: str | None = None  # None 表示用 Codex 的默认模型；可选值见 app-server 的 model/list
     effort: str = "low"  # 聊天要快，推理强度调低
     switch_at_used_percent: float = 99.0  # 任一额度窗口用到这个百分比就切到兜底 API
     timeout_seconds: float = 120.0
+    persistent_chats: bool = True  # 普通聊天按频道保留线程；辅助模型调用保持隔离
+    native_tools: bool = True  # 原生结构化技能调用；不兼容时回到原标记执行链
+
+    @field_validator("codex_home")
+    @classmethod
+    def absolute_codex_home(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("codex_home 必须为绝对路径")
+        return value
 
 
 class FallbackConfig(_Section):
@@ -167,6 +177,8 @@ class QQConfig(_Section):
         if isinstance(value, str):
             return [v.strip() for v in value.split(",") if v.strip()]
         return value
+
+    conversation_followups: int = Field(default=2, ge=0, le=20)
 
 
 class VisionConfig(_Section):
@@ -344,13 +356,13 @@ class GroupAgentConfig(_Section):
 class FilesSkillConfig(_Section):
     """文件。每个聊天有自己的文件夹（工作文件夹的 chats/聊天/）：能存新文件、能读、能发。
 
-    收到的存进工作文件夹的 inbox/（助手也能用）。主人私聊还能读、发这台电脑上的其他文件
+    收到和生成的文件统一存进 chats/聊天/，不按日期分层。主人私聊还能读、发这台电脑上的其他文件
     （黑名单除外）。任何地方都不改已有文件：重名加序号。
     """
 
     enabled: bool = True
     max_mb: float = 10.0  # 收发都不超过这么大
-    inbox: Path = Path("data/workspace/inbox")  # 相对于项目根目录；按日期分子文件夹
+    inbox: Path = Path("data/workspace/inbox")  # 历史收件根目录；关闭聊天文件夹时的新收件备用位置
     preview_chars: int = 1500  # 小的文本文件，把开头这么多字直接给她看
     # 下面两项只管工作文件夹里替主人做的东西；每个聊天自己的文件夹和收到的文件不受限
     send_owner_only: bool = True  # 只给主人发
@@ -362,6 +374,9 @@ class FilesSkillConfig(_Section):
     read_local: bool = True  # 主人私聊时还能读这台电脑上的其他文件（黑名单除外）
     read_chars: int = 20000  # 长文件分段读，每段多少字
     read_max_mb: float = 20.0  # 超过这么大的文件不读
+    pdf_vision: bool = True  # 扫描页用主模型识别；页图可用于图表和混合 PDF
+    document_tools: bool = True  # 页图、页码检索与文档缓存；关闭可回到原文本提取
+    pdf_batch_pages: int = 3  # 一次交给视觉模型的 PDF 页面数量
 
     @field_validator("group_read_paths", mode="before")
     @classmethod
@@ -404,12 +419,20 @@ class ClipboardSkillConfig(_Section):
     enabled: bool = False
 
 
+class DiceSkillConfig(_Section):
+    """真实骰子：只用程序随机数，按群内约定的CoC七版规则检定。"""
+
+    enabled: bool = True
+
+
 class SkillsConfig(_Section):
     """技能：她在回复里写【标记：参数】，程序执行后把结果交回给她再接着说。"""
 
     enabled: bool = True  # 总开关
-    max_rounds: int = 4  # 一轮回复里最多连续用几次技能
-    owner_max_rounds: int = 10  # 主人私聊时（当电脑助手用，经常要连着做好几步）
+    dice: DiceSkillConfig = DiceSkillConfig()
+    max_rounds: int = 0  # 兼容旧配置，已不再限制技能次数
+    owner_max_rounds: int = 0  # 兼容旧配置，已不再限制技能次数
+    background_timeout_minutes: float = 30.0  # 后台任务的运行时限，不是技能次数限制
     max_result_chars: int = 6000  # 交回给她的结果最长多少字
     search: SearchSkillConfig = SearchSkillConfig()
     image: ImageSkillConfig = ImageSkillConfig()
@@ -420,6 +443,20 @@ class SkillsConfig(_Section):
     reminders: RemindersSkillConfig = RemindersSkillConfig()
     screen: ScreenSkillConfig = ScreenSkillConfig()
     clipboard: ClipboardSkillConfig = ClipboardSkillConfig()
+
+
+class TrpgConfig(_Section):
+    enabled: bool = True
+    auto_route: bool = True
+    narration: bool = True
+    allow_paid_fallback: bool = False
+    max_input_chars: int = Field(default=7000, ge=2000, le=32000)
+    narration_chars: int = Field(default=500, ge=120, le=1500)
+    history_events: int = Field(default=4, ge=0, le=12)
+    context_turns: int = Field(default=8, ge=1, le=30)
+    daily_model_calls: int = Field(default=120, ge=0, le=10000)
+    daily_input_chars: int = Field(default=600000, ge=0, le=20_000_000)
+    stop_at_used_percent: float = Field(default=85, ge=0, le=100)
 
 
 class Config(_Section):
@@ -434,6 +471,7 @@ class Config(_Section):
     skills: SkillsConfig = SkillsConfig()
     sleep: SleepConfig = SleepConfig()
     life: LifeConfig = LifeConfig()
+    trpg: TrpgConfig = TrpgConfig()
 
     @property
     def data_dir(self) -> Path:
