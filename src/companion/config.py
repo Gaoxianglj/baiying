@@ -400,11 +400,13 @@ class HistorySkillConfig(_Section):
 
 
 class RemindersSkillConfig(_Section):
-    """定时提醒：只限私聊，到点她用自己的话主动提醒。关掉后没到点的先留着，打开后再提醒。"""
+    """约定与提醒：私聊可用，群聊限熟络及以上（或主人）建立；含准点提醒、周期行动约定与持续约定。"""
 
     enabled: bool = True
-    owner_only: bool = False  # 只给主人设提醒
-    max_per_person: int = 20  # 每个人最多同时有几条
+    owner_only: bool = False  # 私聊是否只允许主人建立约定
+    in_groups: bool = True  # 允许在接入的群聊里建立约定
+    group_min_familiarity: Literal["初识", "相熟", "熟络", "亲近"] = "熟络"
+    max_per_person: int = 20  # 每个聊天最多同时保留几条约定
 
 
 class ScreenSkillConfig(_Section):

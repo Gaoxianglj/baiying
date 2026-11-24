@@ -41,7 +41,7 @@ from companion.skills.base import MARKER, SkillError
 from companion.skills.builtin import build_skills
 from companion.skills.files import SendFile
 from companion.skills.native import NativeSkills
-from companion.skills.reminder import Reminder, ReminderBook
+from companion.skills.reminder import Promise, PromiseBook, Reminder, ReminderBook
 from companion.skills.tasks import TaskBook, TaskControl
 from companion.skills.trpg import Trpg
 from companion.stickers import Sticker, StickerBook, split_sticker
@@ -55,6 +55,42 @@ IMAGE_REF_NOTE = re.compile(r"（图片编号：[^）]*）")  # 程序标的，�
 
 
 REMINDER_LATE = timedelta(minutes=5)  # 迟了超过这么久，就让她说明迟到了
+PROMISE_SAFE_SKILLS = {
+    "search",
+    "image",
+    "pictures",
+    "files",
+    "send_files",
+    "read_files",
+    "export_text",
+    "write_files",
+    "find_files",
+    "history",
+    "document_pages",
+}
+_PACT_QUERY_RE = re.compile(
+    r"约定|约好|一言为定|以后每天|每天都?(?:画|写|发|记|存|提醒|叫)|"
+    r"每(?:周|星期)[一二三四五六日天]?都?(?:画|写|发|记|存|提醒|叫)|"
+    r"以后(?:别|不要|不许)(?:再)?(?:发|提|说)"
+)
+_PACT_ACCEPT_RE = re.compile(
+    r"约好|一言为定|记下(?:了|啦|这个约定)|以后每天|每天都|每周都|绝不(?:会)?(?:再)?发|不会再发"
+)
+_PACT_CANCEL_QUERY_RE = re.compile(
+    r"(?:解除|取消|停掉|不用再|别再|先停).{0,12}(?:约定|提醒|画|花册|写)"
+)
+_PACT_CANCEL_ACCEPT_RE = re.compile(r"解除|取消|停下|先停|不画了|不再提醒|那就先不")
+
+
+@dataclass
+class PromiseOutcome:
+    ok: bool = True
+    text: str = ""
+    sticker: Sticker | None = None
+    images: list[Path] = field(default_factory=list)
+    files: list[Path] = field(default_factory=list)
+    summary: str = ""
+    defer_minutes: int = 0
 _GREETINGS = {
     "morning": "（现在是早上，你想主动跟{who}说声早安。可以顺口提一句今天打算做什么；"
     "一两句话，别连着问问题。）",
@@ -171,9 +207,11 @@ class Companion:
         )
         self._last_sticker: dict[str, datetime] = {}
         self._rng = random.Random()
-        self.reminders = ReminderBook(config.data_dir / "reminders.json")
+        self.reminders: PromiseBook = ReminderBook(config.data_dir / "reminders.json")
         if skills is None:
-            skills = build_skills(config, self.gateway, self.reminders, self.log, self.media)
+            skills = build_skills(
+                config, self.gateway, self.reminders, self.log, self.media, people=self.people
+            )
         self.tasks = TaskBook(config.data_dir / "run" / "tasks.json")
         self.background_gateway_factory = lambda: build_gateway(self.config, task_mode=True)
         self.skills = Skills(skills, config.skills, config.data_dir / "skills.jsonl", self.tasks)
@@ -199,7 +237,14 @@ class Companion:
             self.tasks,
             self.background_gateway_factory,
             lambda gateway: [
-                *build_skills(self.config, gateway, self.reminders, self.log, self.media),
+                *build_skills(
+                    self.config,
+                    gateway,
+                    self.reminders,
+                    self.log,
+                    self.media,
+                    people=self.people,
+                ),
                 Trpg(self.trpg),
             ],
         )
@@ -361,6 +406,7 @@ class Companion:
             else None
         )
         discovery_retry = False
+        promise_retry = False
         try:
             while True:
                 if ctx and ctx.stop_event and ctx.task_id and ctx.stop_event.is_set():
@@ -407,6 +453,32 @@ class Companion:
                         session_messages = [reminder]
                         session_bootstrap.append(reminder)
                         continue
+                    if (
+                        ctx
+                        and not promise_retry
+                        and self.skills.can_use("约定", ctx)
+                        and not any(c.skill == "reminders" for c in calls)
+                    ):
+                        missed_create = bool(
+                            _PACT_QUERY_RE.search(ctx.query) and _PACT_ACCEPT_RE.search(result.text)
+                        )
+                        missed_cancel = bool(
+                            self.reminders.pending(ctx.channel)
+                            and _PACT_CANCEL_QUERY_RE.search(ctx.query)
+                            and _PACT_CANCEL_ACCEPT_RE.search(result.text)
+                        )
+                        if missed_create or missed_cancel:
+                            promise_retry = True
+                            nudge = ChatMessage(
+                                "skill",
+                                "你刚才在回复里答应了建立、调整或解除约定，但还没有调用【约定】、"
+                                "【修改约定】或【解除约定】写入约定本。若确实达成了约定或解约，"
+                                "请先调用对应工具再回复；若无需变更约定本，请直接给出回复且不要口头承诺自动执行。",
+                            )
+                            messages.append(nudge)
+                            session_messages = [nudge]
+                            session_bootstrap.append(nudge)
+                            continue
                     return result, calls
                 before, skill, marker, arg = found
                 assert ctx is not None
@@ -623,23 +695,28 @@ class Companion:
         self.life.owner.record(now, kind, said)
         return Reply(text, result, bundle, event, sticker, actions=actions)
 
-    # ---- 定时提醒 ----
+    # ---- 约定与提醒 ----
 
     def remind_text(self, reminder: Reminder, now: datetime) -> tuple[str, Sticker | None]:
-        """到点了：让她用自己的话提醒。这时还没发出去，发成功后再调 reminder_sent 记下。
+        """到点了：让她用自己的话提醒。这时还没发出去，发成功后再调 promise_sent 记下。
 
         模型不可用或她没写出来时，退回一句直白的话：提醒比措辞重要。
         """
         who = self._display(reminder.person_id)
-        late = now - reminder.due
+        due = reminder.due or now
+        late = now - due
         lateness = ""
-        if late > REMINDER_LATE:  # 服务没开、NapCat 断线时错过的
+        flexible = bool(reminder.repeat and reminder.repeat.flexible)
+        if late > (timedelta(hours=12) if flexible else REMINDER_LATE):
             lateness = (
-                f"这条本该在 {reminder.due.astimezone():%m月%d日 %H:%M} 提醒，现在已经迟了，"
+                f"这条本该在 {due.astimezone():%m月%d日 %H:%M} 提醒，现在已经迟了，"
                 "先说明一下迟到了。"
             )
+        history_note = ""
+        if reminder.history:
+            history_note = "（上次说过：" + reminder.history[-1] + "，这次换个自然的说法。）"
         note = (
-            f"（到时间了。{who}之前让你提醒：{reminder.what}。{lateness}"
+            f"（到时间了。你和{who}之前约好提醒：{reminder.what}。{lateness}{history_note}"
             "用你自己的语气提醒 ta，一两句话，把要做的事说清楚；"
             "可以结合你们的关系和你现在的心情，不要说成“提醒您”这样的通知。）"
         )
@@ -670,7 +747,7 @@ class Companion:
         )
         text, wanted = split_sticker(text)
         text, actions = split_actions(text)
-        if actions.voice:  # 私聊发不了语音
+        if actions.voice:  # 提醒与约定统一用文字发出，避免私聊误发语音
             text = f"{text} {actions.voice}".strip()
         text = SILENT_MARK.sub("", text).strip()
         if not text:
@@ -684,13 +761,234 @@ class Companion:
         self, reminder: Reminder, text: str, sticker: Sticker | None, now: datetime
     ) -> None:
         """提醒发出去了：记成她说的话，一次性的提醒就此结束，重复的排到下一次。"""
-        self.ingest.record_self(
-            body="qq", channel=reminder.channel, content=text, ts=now,
-            meta={"reminder": reminder.id},
-        )  # fmt: skip
-        if sticker is not None:
-            self._record_sticker("qq", reminder.channel, sticker, now)
-        self.reminders.finish(reminder.id, now)
+        self.promise_sent(
+            reminder,
+            PromiseOutcome(ok=True, text=text, sticker=sticker, summary=text[:80]),
+            now,
+        )
+
+    def fulfill_promise(self, promise: Promise, now: datetime) -> PromiseOutcome:
+        """执行一条到点的约定或提醒：口头提醒走快速通道，行动约定可调用受控技能完成产物。"""
+        if promise.kind != "action":
+            text, sticker = self.remind_text(promise, now)
+            return PromiseOutcome(ok=True, text=text, sticker=sticker, summary=text[:80])
+        return self._fulfill_action_promise(promise, now)
+
+    def _fulfill_action_promise(self, promise: Promise, now: datetime) -> PromiseOutcome:
+        who = self._display(promise.person_id)
+        is_private = promise.channel.startswith("private:")
+        person = self.people.get(promise.person_id)
+        qq_accs = set(person.accounts.get("qq") or []) if person else set()
+        is_owner = bool(qq_accs & set(self.config.qq.owner_accounts))
+        ctx = SkillContext(
+            body="qq",
+            channel=promise.channel,
+            person_id=promise.person_id,
+            private=is_private,
+            owner=is_owner,
+            now=now,
+            query=promise.what,
+        )
+
+        companion_self = self
+        paint_notes: list[str] = []
+        paint_failed = False
+
+        class _SyncPromiseSkills(Skills):
+            def run(
+                self, skill: Skill, marker: str, arg: str, run_ctx: SkillContext
+            ) -> tuple[SkillCall, SkillResult]:
+                nonlocal paint_failed
+                call, res = super().run(skill, marker, arg, run_ctx)
+                if res.later is not None:
+                    painted = res.later()
+                    call.later = None
+                    res.later = None
+                    call.ok = painted.ok
+                    res.ok = painted.ok
+                    if painted.ok:
+                        saved_imgs = companion_self._save_promise_images(painted)
+                        call.images = saved_imgs
+                        res.images = saved_imgs
+                        if painted.note:
+                            paint_notes.append(painted.note)
+                        res.text = (
+                            f"已经画好并处理完毕{painted.note}：{painted.text[:220]}。"
+                            "图片已就绪，不需要再重复调用【画】。"
+                        )
+                    else:
+                        paint_failed = True
+                        res.text = painted.text
+                elif skill.name == "image" and not res.ok:
+                    paint_failed = True
+                return call, res
+
+        action_skills = _SyncPromiseSkills(
+            [s for s in self.skills.all if s.name in PROMISE_SAFE_SKILLS],
+            self.config.skills,
+            self.config.data_dir / "skills.jsonl",
+        )
+        skill_prompt, skill_notes = action_skills.prompt_parts(ctx)
+        history_block = (
+            "过往履约记录（最近几次已经做过的，注意保持连贯、避免重复同一内容）：\n"
+            + "\n".join(f"- {h}" for h in promise.history[-10:])
+            if promise.history
+            else "过往履约记录：（这是第一次履约）"
+        )
+        delivery_hint = (
+            "这个约定设为静默完成：把产物存好后，最后只写一句简短记录说明今天做了什么，不会发消息打扰对方。"
+            if promise.notify == "quiet"
+            else (
+                f"把事情真正做完并保存好后，用你自己的语气自然地告诉{who}一声"
+                "（一两句话，像记着约定主动分享，不要像机器汇报）。"
+            )
+        )
+        note = (
+            f"（到了你和{who}约定的执行时间：{promise.what}\n"
+            f"{history_block}\n"
+            "请先调用需要的技能真正把事情完成（例如：要求每次不重样时先【看目录】或【读文件】核对已有内容；"
+            "画画并存入文件夹用【画：具体画面描述｜存到：文件夹/文件名】；"
+            "需要生成整本 PDF 图册可在存好图后用【做图册：文件夹｜名字】；"
+            f"写文字存档用【写文件：路径】）。\n{delivery_hint}）"
+        )
+        cfg = self.config.stickers
+        emotions = (
+            self.stickers.emotions()
+            if cfg.enabled and len(self.stickers) >= cfg.min_library and promise.notify == "always"
+            else []
+        )
+        bundle = self.context.build(
+            person_id=promise.person_id,
+            body="qq",
+            channel=promise.channel,
+            query=promise.what,
+            now=now,
+            sticker_emotions=emotions,
+            reply_mode="promise_action",
+            extra_sections=[skill_prompt] if skill_prompt else None,
+            dynamic_sections=skill_notes,
+            initiative=note,
+            show_image_refs=action_skills.can_use("看图", ctx),
+        )
+
+        messages = list(bundle.messages)
+        calls: list[SkillCall] = []
+        bridge = (
+            NativeSkills(action_skills, ctx, lambda call, _out: calls.append(call))
+            if self.config.models.subscription.native_tools
+            else None
+        )
+        result: ChatResult | None = None
+        try:
+            for _ in range(8):
+                result = self.gateway.chat(
+                    messages,
+                    purpose="promise",
+                    tools=bridge.tools if bridge else None,
+                )
+                found = action_skills.find(result.text, ctx)
+                if found is None:
+                    break
+                before, skill, marker, arg = found
+                call, outcome = action_skills.run(skill, marker, arg, ctx)
+                calls.append(call)
+                said = before + (f"【{marker}：{arg}】" if arg else f"【{marker}】")
+                messages += [
+                    ChatMessage("assistant", said),
+                    ChatMessage(
+                        "skill",
+                        action_skills.feedback(skill, marker, outcome),
+                        images=tuple(outcome.view),
+                    ),
+                ]
+        except ModelError as e:
+            log.warning("执行约定 %d 失败：%s", promise.id, e)
+            if not any(c.ok for c in calls):
+                return PromiseOutcome(ok=False, defer_minutes=15)
+
+        images = [p for c in calls for p in c.images]
+        files = [p for c in calls for p in c.files]
+        wrote_ok = any(c.ok and c.skill in {"write_files", "pictures", "image"} for c in calls)
+        if paint_failed and not images and not files and not wrote_ok:
+            log.info("约定 %d 因画图暂未成功推迟重试", promise.id)
+            return PromiseOutcome(ok=False, defer_minutes=20)
+        if result is None:
+            return PromiseOutcome(ok=False, defer_minutes=15)
+
+        raw_text = self._take_mood(
+            action_skills.strip_markers(result.text), promise.channel, promise.person_id, now
+        )
+        raw_text = IMAGE_REF_NOTE.sub("", raw_text)
+        raw_text, wanted = split_sticker(raw_text)
+        raw_text, actions = split_actions(raw_text)
+        if actions.voice:
+            raw_text = f"{raw_text} {actions.voice}".strip()
+        text = SILENT_MARK.sub("", raw_text).strip()
+        if promise.notify == "always" and not text:
+            text = f"按我们约好的，今天这件事做好啦：{promise.what}"
+
+        step_bits = [f"{c.marker}({c.arg[:30]})" for c in calls if c.ok]
+        summary_parts = [*step_bits, *paint_notes]
+        if text:
+            summary_parts.append(text[:60])
+        summary = "｜".join(summary_parts) or promise.what[:60]
+
+        if promise.notify == "quiet":
+            return PromiseOutcome(ok=True, summary=summary)
+        sticker = (
+            self._choose_sticker(promise.channel, wanted, now) if wanted and emotions else None
+        )
+        return PromiseOutcome(
+            ok=True,
+            text=text,
+            sticker=sticker,
+            images=images,
+            files=files,
+            summary=summary,
+        )
+
+    def _save_promise_images(self, result: SkillResult) -> list[Path]:
+        paths: list[Path] = []
+        for image in result.images:
+            try:
+                stored = self.media.save(image.read_bytes())
+            except (OSError, media.MediaError) as e:
+                log.warning("保存履约图片失败：%s", e)
+                continue
+            gif = image.suffix.lower() == ".gif"
+            paths.append(
+                (self.media.original_for(stored.digest) or stored.path) if gif else stored.path
+            )
+        return paths
+
+    def promise_sent(self, promise: Promise, outcome: PromiseOutcome, now: datetime) -> None:
+        """约定已履行（并发出通知或静默落盘）：记录事件、生活轨迹并推进到下一周期。"""
+        if promise.notify == "always" and outcome.text:
+            self.ingest.record_self(
+                body="qq",
+                channel=promise.channel,
+                content=outcome.text,
+                ts=now,
+                meta={"reminder": promise.id, "promise_kind": promise.kind},
+            )
+        if outcome.sticker is not None:
+            self._record_sticker("qq", promise.channel, outcome.sticker, now)
+        if outcome.images:
+            self._record_sent_images("qq", promise.channel, outcome.images, now)
+        if outcome.files:
+            self._record_files("qq", promise.channel, outcome.files, now)
+        if promise.kind == "action":
+            self.life.days.append(
+                now,
+                "activities",
+                {
+                    "ts": now.isoformat(),
+                    "kind": "promise",
+                    "title": f"履约：{promise.what[:30]}",
+                    "summary": outcome.summary[:80],
+                },
+            )
+        self.reminders.finish(promise.id, now, summary=outcome.summary)
 
     # ---- 额度充足时的自主活动 ----
 

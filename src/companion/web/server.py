@@ -203,6 +203,8 @@ class ConsoleApp:
             )
         if route == ("POST", "person-familiarity"):
             return self.save_person_familiarity(str(data["id"]), str(data["familiarity"]))
+        if route == ("POST", "promise-cancel"):
+            return self.cancel_promise(int(data["id"]))
         if route == ("GET", "people") and len(parts) == 1:
             return self.people()
         if route == ("GET", "people") and len(parts) == 2:
@@ -344,6 +346,12 @@ class ConsoleApp:
         committed = commit_memory(c.layout, c.name, f"主人在控制台将 {who} 的熟络度设为 {familiarity}")
         return {"saved": True, "familiarity": p.familiarity, "committed": committed}
 
+    def cancel_promise(self, promise_id: int) -> dict[str, Any]:
+        removed = self.companion.reminders.cancel("", promise_id, owner_override=True)
+        if removed is None:
+            raise KeyError(f"没有编号 {promise_id} 这条约定")
+        return {"cancelled": True, "id": removed.id, "what": removed.what}
+
     def people(self) -> dict[str, Any]:
         c = self.companion
         c.people.reload()
@@ -465,6 +473,23 @@ class ConsoleApp:
                 {"name": p.stem, "title": head.lstrip("# ").strip(), "text": body.strip()}
             )
         session = QuotaSession.from_json(self.companion.index.get_meta(QUOTA_META))
+        names = {
+            p.person_id: (p.names[0] if p.names else p.person_id)
+            for p in self.companion.people.list()
+        }
+        promises = [
+            {
+                "id": r.id,
+                "channel": r.channel,
+                "person": names.get(r.person_id, r.person_id),
+                "what": r.what,
+                "when": r.when(),
+                "kind": r.kind,
+                "notify": r.notify,
+                "last_done": r.history[-1] if r.history else "",
+            }
+            for r in self.companion.reminders.pending()
+        ]
         return {
             "date": key,
             "slot": slot_of(now),
@@ -476,6 +501,7 @@ class ConsoleApp:
             "activities": data.get("activities") or [],
             "proactive": [p for p in data.get("proactive") or [] if not p.get("skipped")],
             "writings": writings,
+            "promises": promises,
             "quota_session": None if session is None else {"start_used": session.start_used,
                                                            "count": session.count},
         }  # fmt: skip

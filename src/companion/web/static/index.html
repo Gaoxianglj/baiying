@@ -543,7 +543,8 @@ pages.overview = async (refresh = false) => {
 
 // ---------- 今天 ----------
 const SLOT_NAMES = ["凌晨", "早上", "上午", "中午", "下午", "傍晚", "晚上", "深夜"];
-const ACTIVITY_ICON = { explore: "🔎", write: "✍️", draw: "🎨", chat_owner: "💬" };
+const ACTIVITY_ICON = { explore: "🔎", write: "✍️", draw: "🎨", chat_owner: "💬", promise: "🤝" };
+const PROMISE_TAG = { remind: ["提醒", "grey"], action: ["行动约定", ""], ongoing: ["持续遵守", "green"] };
 const PROACTIVE_NAME = { morning: "早安", night: "晚安", share: "分享", chat_owner: "找主人聊天" };
 pages.today = async () => {
   const d = await api("today");
@@ -573,6 +574,7 @@ pages.today = async () => {
       <div class="memo"><div>✍️</div><div class="body"><b>${esc(w.title)}</b>\n${esc(w.text)}<div class="when">${esc(w.name)}</div></div></div>`).join("")
     : '<p class="faint">她还没有写过东西。额度充足时她可能会写一点。</p>';
   const quota = d.quota_session ? `本轮自主时间已做 ${d.quota_session.count} 件（开始时 5 小时额度已用 ${d.quota_session.start_used}%）` : "";
+  const promises = (d.promises || []).length ? d.promises.map(x => { const tag = PROMISE_TAG[x.kind] || ["约定", "grey"]; return `<div class="memo"><div class="body"><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><b>${esc(x.what)}</b><span class="chip ${tag[1]}">${tag[0]}${x.notify === "quiet" && x.kind !== "ongoing" ? "·静默" : ""}</span></div><div class="when">${esc(x.when)} · 与 ${esc(x.person)}（${esc(x.channel)}）${x.last_done ? " · 最近履约：" + esc(x.last_done) : ""}</div></div><button class="btn small danger" data-cancel-promise="${x.id}">解除</button></div>`; }).join("") : '<p class="faint">目前没有生效中的约定或提醒。聊天中自然约好就会出现在这里。</p>';
   main.innerHTML = `
     <div class="page-head"><div><h2>今天 · ${esc(d.date)}</h2><p>${esc(state.persona)}的 AI 版日常：安排、心情，以及她自己做的事。${esc(quota)}</p></div></div>
     <div class="grid cols-2">
@@ -580,7 +582,9 @@ pages.today = async () => {
       <div class="card section-card" style="margin-bottom:0"><h3>📅 今天的安排</h3>${plan}</div>
       <div class="card timeline"><h3>🕰️ 今天发生的</h3>${timeline}</div>
       <div class="card timeline"><h3>✍️ 她写的东西</h3>${writings}</div>
+      <div class="card" style="grid-column: 1 / -1"><h3>🤝 当前约定与提醒 <span class="chip grey">${(d.promises || []).length}</span></h3>${promises}</div>
     </div>`;
+  main.querySelectorAll("[data-cancel-promise]").forEach(b => b.onclick = async () => { try { await api("promise-cancel", { id: Number(b.dataset.cancelPromise) }); toast("已解除这条约定"); pages.today(); } catch (err) { toast(err.message, true); } });
 };
 
 // ---------- 设置 ----------

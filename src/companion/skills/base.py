@@ -101,6 +101,7 @@ class Skill:
     name = ""  # 配置里的键，如 search
     label = ""  # 显示名，如 联网搜索
     markers: ClassVar[dict[str, str]] = {}  # 标记 → 给她看的用法说明
+    aliases: ClassVar[tuple[str, ...]] = ()  # 兼容旧标记名：可执行、可剥离，但不写进提示词
     takes_block = False  # 标记后面可以跟 <<<内容>>>，内容接在参数后面（用 ｜ 隔开）
     bare = False  # 不用参数：只写【标记】也算
 
@@ -182,7 +183,8 @@ class Skills:
 
     def find(self, text: str, ctx: SkillContext | None) -> tuple[str, Skill, str, str] | None:
         """找到第一个可用的技能标记，返回（标记前的话，技能，标记，参数）。"""
-        by_marker = {m: s for s in self.available(ctx) for m in s.markers_for(ctx)}
+        avail = self.available(ctx)
+        by_marker = {m: s for s in avail for m in (*s.aliases, *s.markers_for(ctx))}
         for match in MARKER.finditer(text):
             skill = by_marker.get(match.group(1))
             if skill is not None and (match.group(2) is not None or skill.bare):
@@ -194,8 +196,8 @@ class Skills:
 
     def strip_markers(self, text: str) -> str:
         """去掉没被执行的技能标记（不认识的、不可用的、超过次数的）。"""
-        known = {m for s in self.all for m in s.markers}
-        bare = {m for s in self.all if s.bare for m in s.markers}
+        known = {m for s in self.all for m in (*s.markers, *s.aliases)}
+        bare = {m for s in self.all if s.bare for m in (*s.markers, *s.aliases)}
         for marker in (m for s in self.all if s.takes_block for m in s.markers):
             text = re.sub(rf"[【\[]\s*{marker}\s*[：:][^】\]]*[】\]]{BLOCK.pattern}", "", text,
                           flags=re.DOTALL)  # fmt: skip

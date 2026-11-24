@@ -7,6 +7,7 @@ from pathlib import Path
 from companion.config import Config
 from companion.media import MediaStore
 from companion.memory.events import EventLog
+from companion.memory.people import PeopleRegistry
 from companion.models.codex_app_server import CodexAppServerBackend, talk_only_overrides
 from companion.models.factory import build_gateway
 from companion.models.gateway import ModelGateway
@@ -33,6 +34,8 @@ def build_skills(
     reminders: ReminderBook,
     log: EventLog,
     store: MediaStore,
+    *,
+    people: PeopleRegistry | None = None,
 ) -> list[Skill]:
     sub = config.models.subscription
     painter = None
@@ -116,7 +119,7 @@ def build_skills(
             quota_ok=lambda: gateway.subscription is not None and gateway.subscription_available(),
         ),
         SendFile(files, access),
-        Reminders(config.skills.reminders, reminders),
+        Reminders(config.skills.reminders, reminders, people),
         reader,
         ExportText(reader),
         WriteFile(files, access),

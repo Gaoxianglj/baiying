@@ -41,12 +41,13 @@ from companion.bodies.qq.message import (
 from companion.bodies.qq.onebot import OneBotClient, OneBotError
 from companion.config import QQConfig
 from companion.core.actions import Actions, emoji_id
-from companion.core.companion import Companion, Reply
+from companion.core.companion import Companion, PromiseOutcome, Reply
 from companion.life.activities import ActivityPrep
+from companion.life.owner import in_quiet
 from companion.media import MediaError
 from companion.memory.events import Event
 from companion.memory.index import MemoryKind
-from companion.memory.people import SELF_ID, PeopleError
+from companion.memory.people import SELF_ID, PeopleError, familiarity_rank
 from companion.models.openai_compat import ModelError
 from companion.skills import SkillCall, SkillContext, SkillError
 from companion.skills.dice import HELP as DICE_HELP
@@ -55,7 +56,6 @@ from companion.skills.dice import command as dice_command
 from companion.skills.files import FileInbox
 from companion.skills.reminder import Reminder
 from companion.skills.tasks import LABELS, TaskControl
-from companion.stickers import Sticker
 
 log = logging.getLogger(__name__)
 
@@ -194,8 +194,8 @@ class QQBot:
         self._forget_offers: dict[str, tuple[datetime, list[tuple[MemoryKind, str, str]]]] = {}
         self._activity: asyncio.Task[None] | None = None  # 正在做的自主活动
         self._last_poke: dict[str, datetime] = {}  # 频道 → 上次理会 / 发出戳一戳的时间
-        self._reminder_text: dict[int, tuple[str, Sticker | None]] = {}  # 写好、还没发出去的提醒
-        self._reminder_retry: dict[int, tuple[int, datetime]] = {}  # 提醒 → （失败次数，下次再试）
+        self._reminder_text: dict[int, PromiseOutcome] = {}  # 已准备好、待发出的约定/提醒结果
+        self._reminder_retry: dict[int, tuple[int, datetime]] = {}  # 编号 → (失败次数, 下次重试)
         skills = companion.config.skills
         self.inbox = FileInbox(skills.files, companion.config.root, skills.agent.workspace)
 
@@ -241,7 +241,7 @@ class QQBot:
                     src, row["id"], text, [Path(p) for p in row.get("files", [])]
                 )
 
-    # ---- 定时提醒 ----
+    # ---- 约定与提醒 ----
 
     async def _reminder_loop(self, every: float = 15.0) -> None:
         while True:
@@ -249,10 +249,10 @@ class QQBot:
             try:
                 await self.reminder_tick()
             except Exception:
-                log.exception("定时提醒出错")
+                log.exception("约定与提醒循环出错")
 
     async def reminder_tick(self) -> None:
-        """到点的提醒发出去。NapCat 断线时先不动，连上后再补发（她会说明迟到了）。"""
+        """到点的约定与提醒执行并发出。NapCat 断线时先不动，连上后再补做。"""
         skills = self.c.config.skills
         connected = getattr(self.client, "connected", None)
         if not (skills.enabled and skills.reminders.enabled):
@@ -265,40 +265,90 @@ class QQBot:
             if retry is None or now >= retry[1]:
                 await self._fire_reminder(reminder, now)
 
+    def _resolve_promise_target(self, reminder: Reminder) -> Source | None:
+        """校验约定的目标频道与立约人权限（私聊归本人；群聊须在白名单且立约人为熟络以上或主人）。"""
+        if reminder.channel.startswith("private:"):
+            account = reminder.channel.removeprefix("private:")
+            if not account.isdigit():
+                return None
+            return Source("private", account, "", "", None, Incoming(text=""))
+        if reminder.channel.startswith("group:"):
+            group_id = reminder.channel.removeprefix("group:")
+            rcfg = self.c.config.skills.reminders
+            if not (group_id.isdigit() and group_id in self.cfg.groups and rcfg.in_groups):
+                return None
+            person = self.c.people.get(reminder.person_id)
+            qq_accs = set(person.accounts.get("qq") or []) if person else set()
+            is_owner = bool(qq_accs & set(self.cfg.owner_accounts))
+            fam_ok = person is not None and familiarity_rank(
+                person.familiarity
+            ) >= familiarity_rank(rcfg.group_min_familiarity)
+            if not (is_owner or fam_ok):
+                return None
+            return Source("group", "", group_id, "", None, Incoming(text=""))
+        return None
+
     async def _fire_reminder(self, reminder: Reminder, now: datetime) -> None:
-        account = reminder.channel.removeprefix("private:")
-        if not account.isdigit():  # 只发回设提醒的私聊
-            log.error("提醒 %d 的聊天不对，不发：%s", reminder.id, reminder.channel)
-            await self._call(self.c.reminders.finish, reminder.id, now)
+        src = await self._call(self._resolve_promise_target, reminder)
+        if src is None:
+            log.error("约定/提醒 %d 的目标或权限不合法，已丢弃：%s", reminder.id, reminder.channel)
+            await self._call(
+                self.c.reminders.cancel, reminder.channel, reminder.id, owner_override=True
+            )
             return
-        written = self._reminder_text.get(reminder.id)
-        if written is None:  # 只写一次：重发时不再调用模型，也不会说出两版
-            written = await self._call(self.c.remind_text, reminder, now)
-            self._reminder_text[reminder.id] = written
-        text, sticker = written
-        src = Source("private", account, "", "", None, Incoming(text=""))
-        self._sent_times.append(now)  # 这是答应过的事，不受每分钟上限限制，但算进去
-        if not await self._send_reply(src, text):
-            self._reminder_failed(reminder, now)
+        if (
+            reminder.notify == "always"
+            and reminder.repeat is not None
+            and reminder.repeat.flexible
+        ):
+            ocfg = self.c.config.life.owner_chat
+            if in_quiet(now, ocfg.quiet_start, ocfg.quiet_end):
+                return  # 弹性日常约定在安静时段暂缓，等白天再履约，不半夜吵人
+
+        outcome = self._reminder_text.get(reminder.id)
+        if outcome is None:  # 只执行一次：重发时不再重复调用模型或重画
+            outcome = await self._call(self.c.fulfill_promise, reminder, now)
+            if not outcome.ok:
+                wait_min = max(5, outcome.defer_minutes)
+                await self._call(
+                    self.c.reminders.postpone, reminder.id, now + timedelta(minutes=wait_min)
+                )
+                return
+            self._reminder_text[reminder.id] = outcome
+
+        if reminder.notify == "quiet":
+            await self._call(self.c.promise_sent, reminder, outcome, now)
+            self._reminder_text.pop(reminder.id, None)
+            self._reminder_retry.pop(reminder.id, None)
             return
-        await self._call(self.c.reminder_sent, reminder, text, sticker, now)
+
+        self._sent_times.append(now)  # 答应过的事不受每分钟上限拦截，但计入发言频率
+        if outcome.text and not await self._send_reply(src, outcome.text):
+            await self._reminder_failed(reminder, now)
+            return
+        for img in outcome.images:
+            await self._send_image(src, img)
+        for path in outcome.files:
+            await self._send_file(src, path)
+        if outcome.sticker is not None:
+            await self._send_sticker(src, outcome.sticker.digest)
+        await self._call(self.c.promise_sent, reminder, outcome, now)
         self._reminder_text.pop(reminder.id, None)
         self._reminder_retry.pop(reminder.id, None)
-        if sticker is not None:
-            await self._send_sticker(src, sticker.digest)
 
-    def _reminder_failed(self, reminder: Reminder, now: datetime) -> None:
-        """发不出去（比如对方把她删了）：隔一会儿再试，隔得越来越久；过了一天还不行就放弃。"""
-        if now - reminder.due > REMINDER_GIVE_UP:
-            log.error("提醒 %d 一直发不出去，放弃：%s", reminder.id, reminder.what)
-            self.c.reminders.finish(reminder.id, now)
+    async def _reminder_failed(self, reminder: Reminder, now: datetime) -> None:
+        """发不出去（比如断网或对方删好友）：隔一会儿再试，过了一天还不行就放弃本次。"""
+        due = reminder.due or now
+        if now - due > REMINDER_GIVE_UP:
+            log.error("约定/提醒 %d 一直发不出去，放弃本次：%s", reminder.id, reminder.what)
+            await self._call(self.c.reminders.finish, reminder.id, now)
             self._reminder_text.pop(reminder.id, None)
             self._reminder_retry.pop(reminder.id, None)
             return
         attempts = self._reminder_retry.get(reminder.id, (0, now))[0] + 1
         wait = min(2**attempts, REMINDER_MAX_WAIT_MINUTES)
         self._reminder_retry[reminder.id] = (attempts, now + timedelta(minutes=wait))
-        log.warning("提醒 %d 没发出去，%d 分钟后再试", reminder.id, wait)
+        log.warning("约定/提醒 %d 没发出去，%d 分钟后再试", reminder.id, wait)
 
     # ---- 主动找主人、自主活动 ----
 
@@ -459,11 +509,18 @@ class QQBot:
         if self._bot_paused(src):  # 和别的机器人聊太久了，先只听不回
             return
 
-        # 决定这条消息算哪一类：必须回 / 对话延续中 / 主动插话 / 只记录
+        # 决定这条消息算哪一类：必须回 / 对话延续中或句中提及 / 主动插话 / 只记录
         if addressed:
             kind = "required"
         else:
             kind = self._conversation_kind(src)
+            if (
+                kind is None
+                and not self._not_for_me(src)
+                and not self._chatter(text)
+                and any(name in text for name in self.cfg.aliases)
+            ):
+                kind = "partner"
             if (
                 kind is None
                 and not self._not_for_me(src)
@@ -530,14 +587,17 @@ class QQBot:
         return self._named_call(inc.text)
 
     def _named_call(self, text: str) -> bool:
+        """群里没 @ 但直接叫她名字（句首、分句首或句末点名），排除“白璎的…”这类第三人称提及。"""
+        if not self.cfg.aliases:
+            return False
         names = "|".join(re.escape(name) for name in self.cfg.aliases)
-        return bool(
-            names
-            and re.search(
-                rf"(?:^|[，。！？,!?\s】\]])(?:{names})(?=$|[，。！？,!?：:\s]|你|在|帮|来|能|请|看|记|把|早|晚|中|今|好)",
-                text,
-            )
+        s = text.strip()
+        head = (
+            rf"(?:^|[，。！？,!?；;：:\s】\]「『（(]|^(?:诶|喂|嗨|嘿|呐|哎|呼叫)\s*)"
+            rf"(?:{names})(?!(?:的|和|与|跟|或|及))"
         )
+        tail = rf"(?<!的)(?:{names})[呀啊呢吗嘛啦吧哦噢~～!！?？。…]*$"
+        return bool(re.search(head, s) or re.search(tail, s))
 
     @staticmethod
     def _chatter(text: str) -> bool:
