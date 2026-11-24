@@ -142,7 +142,7 @@ class Life:
             plan = generate_plan(
                 self.gateway,
                 name=self.name,
-                seed=self._read("seed.md"),
+                seed=self._persona_text(),
                 recent=self.recent_text(now),
                 now=now,
                 start_hour=self.start_hour,
@@ -282,8 +282,12 @@ class Life:
 
     def _activity_context(self, now: datetime) -> str:
         """挑事情时参考：兴趣、今天的安排、心情、最近做过的事、群里最近在聊的（不含私聊）。"""
+        prefs = self._read("preferences.md")
         seed = self._read("seed.md")
-        parts = ["【你的兴趣】\n" + (_seed_section(seed, "闲下来") or _clip(seed, 600))]
+        hobbies = _seed_section(prefs, "闲下来") or _seed_section(seed, "闲下来")
+        tastes = _seed_section(prefs, "读书与品味")
+        interest = "\n".join(x for x in (hobbies, tastes) if x) or _clip(seed, 600)
+        parts = ["【你的兴趣】\n" + interest]
         plan = self.days.plan(now)
         if plan is not None:
             slot = slot_of(now)
@@ -316,6 +320,10 @@ class Life:
             return ""
         lines = [x for x in path.read_text("utf-8").splitlines() if not x.startswith("#")]
         return " ".join(x.strip() for x in lines if x.strip())
+
+    def _persona_text(self) -> str:
+        parts = [self._read("seed.md").strip(), self._read("preferences.md").strip()]
+        return "\n\n".join(p for p in parts if p)
 
     def _read(self, name: str) -> str:
         path = self.layout.self_dir / name

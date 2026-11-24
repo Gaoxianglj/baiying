@@ -79,3 +79,19 @@ def test_body_edits_survive_rewrites(layout):
     registry = PeopleRegistry(layout)
     registry.ensure("qq", "1", "新昵称")
     assert "喜欢不加糖、加奶的咖啡" in path.read_text("utf-8")
+
+
+def test_familiarity_set_and_preserved_across_merge(layout):
+    registry = PeopleRegistry(layout)
+    registry.create("target", "主档")
+    qq_pid = registry.ensure("qq", "10086", "小号")
+    assert registry.get(qq_pid).familiarity == "初识"
+
+    registry.set_familiarity(qq_pid, "熟络")
+    assert PeopleRegistry(layout).get(qq_pid).familiarity == "熟络"
+
+    with pytest.raises(PeopleError):
+        registry.set_familiarity(qq_pid, "满好感")
+
+    registry.bind("qq", "10086", "target")
+    assert PeopleRegistry(layout).get("target").familiarity == "熟络"

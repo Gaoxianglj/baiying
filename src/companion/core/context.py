@@ -1,6 +1,6 @@
 """上下文组装：决定白璎此刻“心里装着什么”。
 
-常驻部分（不依赖检索命中）：种子、自我认知、表达风格、对话者档案与事实、最近的共同经历。
+常驻部分（不依赖检索命中）：种子、喜好与习惯（次核心）、自我认知、表达风格、对话者档案与熟络度、事实、最近的共同经历。
 检索部分：按“相关度 × 可回忆程度 × 重要度”排序的记忆；淡化的会标注“记不太清”。
 最后带上同一频道最近的对话，再在末尾提醒一次关键规则（离生成越近，越管用）。
 
@@ -107,6 +107,25 @@ _SCENES = {
     "qq": "在 QQ 上",
     "minecraft": "在《我的世界》里",
     "cli": "在电脑的命令行里",
+}
+
+FAMILIARITY_HINTS: dict[str, str] = {
+    "初识": (
+        "你们刚认识不久或很少直接交流：温和有礼、留有分寸，"
+        "稳稳维持安静的文学少女形象，不贸然开玩笑。"
+    ),
+    "相熟": (
+        "你们已经认识并聊过几次：语气自然放松，偶尔接一句轻巧的玩笑，"
+        "文学少女的端庄感偶尔轻轻松动。"
+    ),
+    "熟络": (
+        "你们已经很熟络：不用端着架子，会自然吐槽、开玩笑、偶尔嘴硬，"
+        "文学少女形象有时会“维持不住”。"
+    ),
+    "亲近": (
+        "你们非常亲近、彼此信任且默契：完全放松，既能安静认真地聊心事，"
+        "也能毫无顾忌地打趣、嘴硬或露出小得意。"
+    ),
 }
 
 OPENINGS_HOURS = 24  # 从最近多久内她说过的话里取开头
@@ -361,6 +380,10 @@ class ContextAssembler:
         sections = [
             f"你是{self.name}。",
             _section("你的种子（核心性格与底线，必须遵守）", self._read_self("seed.md")),
+            _section(
+                "你的喜好与习惯（被问到喜好或穿搭、或话题正好聊到时才自然带出，平时不要主动往外倒）",
+                self._read_self("preferences.md"),
+            ),
             _section("你对自己的认识", self._read_self("identity.md")),
             _section("你的表达习惯", self._read_self("style.md")),
             _section("说话时注意", "\n".join(r for r in rules if r)),
@@ -404,10 +427,13 @@ class ContextAssembler:
         )
         if person is not None:
             also = "、".join(person.names[1:])
+            fam = person.familiarity or "初识"
+            fam_line = f"当前熟络度：{fam}——{FAMILIARITY_HINTS.get(fam, FAMILIARITY_HINTS['初识'])}"
+            profile = _clean_markdown(person.body)
             sections.append(
                 _section(
                     f"你对{who}的了解" + (f"（ta 也叫 {also}）" if also else ""),
-                    _clean_markdown(person.body),
+                    f"{fam_line}\n\n{profile}" if profile else fam_line,
                 )
             )
         if facts:

@@ -146,8 +146,26 @@ def test_api_overview_people_seed_forget_journal(app, root):
 
     status, _, _ = call(app, "POST", "/api/seed", {"text": "# 种子\n\n- 我很温柔\n"})
     assert status == 200
+    status, _, _ = call(
+        app, "POST", "/api/preferences", {"text": "# 喜好\n\n## 穿搭与随身物\n\n- 月白长裙\n"}
+    )
+    assert status == 200
+    status, _, _ = call(
+        app, "POST", "/api/style", {"text": "# 风格\n\n## 熟络后的破壳与打趣\n\n- 偶尔嘴硬\n"}
+    )
+    assert status == 200
+    status, _, _ = call(
+        app, "POST", "/api/person-familiarity", {"id": pid, "familiarity": "熟络"}
+    )
+    assert status == 200
+    bad = call(app, "POST", "/api/person-familiarity", {"id": pid, "familiarity": "爆表"})
+    assert bad[0] == 400
+
     _, _, self_files = call(app, "GET", "/api/self")
     assert "我很温柔" in self_files["seed"]
+    assert "月白长裙" in self_files["preferences"]
+    assert "偶尔嘴硬" in self_files["style"]
+    assert self_files["people_styles"][0]["familiarity"] == "熟络"
 
     status, _, r = call(app, "POST", "/api/forget", {"kind": "fact", "id": fact.id})
     assert status == 200 and r["memories"] == 1 and r["messages"] == 1

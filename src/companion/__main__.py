@@ -109,10 +109,19 @@ def main(argv: list[str] | None = None) -> int:
 
             with Companion(config) as c:
                 report = Sleeper(c).run()
+            extras = []
+            if report.identity_reflected:
+                extras.append("自我认知")
+            if report.preferences_reflected:
+                extras.append("喜好与习惯")
+            if report.style_reflected:
+                extras.append("表达风格")
+            if report.familiarity_updated:
+                extras.append(f"{len(report.familiarity_updated)} 个人的熟络度与说话方式")
             print(
                 f"整理 {report.extracted} 段会话；淡忘 {report.faded}、沉睡 {report.dormant}；"
                 f"合并 {report.merged} 条重复事实；更新了 {len(report.people_reflected)} 个人的档案"
-                + ("、自我认知" if report.identity_reflected else "")
+                + (f"、{'、'.join(extras)}" if extras else "")
                 + (f"；日记：{report.journal}" if report.journal else "")
             )
             for err in report.errors:

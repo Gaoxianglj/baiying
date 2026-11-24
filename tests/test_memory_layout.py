@@ -19,6 +19,9 @@ def test_init_creates_layout(tmp_path):
     assert manifest["derived"]["embedding_model"] is None
     identity = (layout.self_dir / "identity.md").read_text("utf-8")
     assert identity.startswith("# 白璎 的自我认知")
+    preferences = (layout.self_dir / "preferences.md").read_text("utf-8")
+    assert preferences.startswith("# 白璎 的喜好与习惯")
+    assert "## 穿搭与随身物" in preferences and "## 闲下来喜欢做的事" in preferences
     assert layout.manifest_path in created
 
 

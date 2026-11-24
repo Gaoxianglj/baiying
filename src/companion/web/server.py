@@ -22,11 +22,12 @@ from urllib.parse import parse_qs, urlparse
 
 from companion.config import load_config
 from companion.core.companion import Companion
+from companion.core.sleep import PERSON_STYLE_SECTION, parse_markdown_sections
 from companion.life import slot_of
 from companion.life.activities import QuotaSession
 from companion.life.core import QUOTA_META
 from companion.memory.layout import commit_memory
-from companion.memory.people import SELF_ID
+from companion.memory.people import FAMILIARITY_LEVELS, SELF_ID, PeopleError
 from companion.models.openai_compat import ModelError
 from companion.runtime import AlreadyRunning, InstanceLock, run_dir, setup_logging, stop_flag
 from companion.skills.base import SkillContext, SkillError, recent_usage
@@ -109,7 +110,7 @@ class ConsoleApp:
             data = json.loads(body or b"{}") if method == "POST" else {}
             with self._lock:
                 return _json(self._api(method, url.path, query, data))
-        except (settings.SettingsError, KeyError, ValueError, SkillError) as e:
+        except (settings.SettingsError, KeyError, ValueError, SkillError, PeopleError) as e:
             return _json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
         except ModelError as e:
             return _json({"error": f"模型服务不可用：{e}"}, HTTPStatus.SERVICE_UNAVAILABLE)
@@ -186,6 +187,22 @@ class ConsoleApp:
             return self.self_files()
         if route == ("POST", "seed"):
             return self.save_seed(str(data.get("text", "")))
+        if route == ("POST", "preferences"):
+            return self.save_self_file(
+                "preferences.md",
+                str(data.get("text", "")),
+                "喜好与习惯不能是空的",
+                "主人在控制台修改了喜好与习惯",
+            )
+        if route == ("POST", "style"):
+            return self.save_self_file(
+                "style.md",
+                str(data.get("text", "")),
+                "表达风格不能是空的",
+                "主人在控制台修改了表达风格",
+            )
+        if route == ("POST", "person-familiarity"):
+            return self.save_person_familiarity(str(data["id"]), str(data["familiarity"]))
         if route == ("GET", "people") and len(parts) == 1:
             return self.people()
         if route == ("GET", "people") and len(parts) == 2:
@@ -271,21 +288,61 @@ class ConsoleApp:
             "latest_journal": journals[0] if journals else None,
         }
 
-    def self_files(self) -> dict[str, str]:
-        d = self.companion.layout.self_dir
-        return {
+    def self_files(self) -> dict[str, Any]:
+        c = self.companion
+        d = c.layout.self_dir
+        c.people.reload()
+        files: dict[str, Any] = {
             name: (d / f"{name}.md").read_text("utf-8") if (d / f"{name}.md").exists() else ""
-            for name in ("seed", "identity", "style")
+            for name in ("seed", "preferences", "identity", "style")
         }
+        people_styles = []
+        for p in c.people.list():
+            secs = parse_markdown_sections(p.body)
+            people_styles.append(
+                {
+                    "id": p.person_id,
+                    "name": p.names[0] if p.names else p.person_id,
+                    "familiarity": p.familiarity,
+                    "style": secs.get(PERSON_STYLE_SECTION, []),
+                    "exclusive": secs.get("只对 ta 使用的说法", []),
+                }
+            )
+        people_styles.sort(
+            key=lambda x: (
+                FAMILIARITY_LEVELS.index(x["familiarity"])
+                if x["familiarity"] in FAMILIARITY_LEVELS
+                else 0,
+                len(x["style"]),
+            ),
+            reverse=True,
+        )
+        files["people_styles"] = people_styles
+        files["familiarity_levels"] = list(FAMILIARITY_LEVELS)
+        return files
 
     def save_seed(self, text: str) -> dict[str, Any]:
+        return self.save_self_file(
+            "seed.md", text, "种子不能是空的", "主人在控制台修改了种子"
+        )
+
+    def save_self_file(
+        self, filename: str, text: str, empty_error: str, commit_msg: str
+    ) -> dict[str, Any]:
         if not text.strip():
-            raise ValueError("种子不能是空的")
+            raise ValueError(empty_error)
         c = self.companion
-        path = c.layout.self_dir / "seed.md"
+        path = c.layout.self_dir / filename
         path.write_text(text.replace("\r\n", "\n").rstrip() + "\n", encoding="utf-8", newline="\n")
-        committed = commit_memory(c.layout, c.name, "主人在控制台修改了种子")
+        committed = commit_memory(c.layout, c.name, commit_msg)
         return {"saved": True, "committed": committed}
+
+    def save_person_familiarity(self, person_id: str, familiarity: str) -> dict[str, Any]:
+        c = self.companion
+        p = c.people.set_familiarity(person_id, familiarity)
+        who = p.names[0] if p.names else p.person_id
+        committed = commit_memory(c.layout, c.name, f"主人在控制台将 {who} 的熟络度设为 {familiarity}")
+        return {"saved": True, "familiarity": p.familiarity, "committed": committed}
 
     def people(self) -> dict[str, Any]:
         c = self.companion
@@ -297,29 +354,36 @@ class ConsoleApp:
                     "id": p.person_id,
                     "names": p.names,
                     "accounts": p.accounts,
+                    "familiarity": p.familiarity,
                     "facts": len(c.index.current_facts(p.person_id)),
                     "episodes": len(c.index.episodes_with(p.person_id, limit=1000)),
                 }
             )
         out.sort(key=lambda x: x["facts"] + x["episodes"], reverse=True)
-        return {"people": out, "self_facts": len(c.index.current_facts(SELF_ID))}
+        return {
+            "people": out,
+            "self_facts": len(c.index.current_facts(SELF_ID)),
+            "familiarity_levels": list(FAMILIARITY_LEVELS),
+        }
 
     def person(self, person_id: str) -> dict[str, Any]:
         c = self.companion
         c.people.reload()
         if person_id == SELF_ID:
-            names, body = [c.name], ""
+            names, body, familiarity = [c.name], "", None
         else:
             p = c.people.get(person_id)
             if p is None:
                 raise KeyError(f"没有这个人：{person_id}")
-            names, body = p.names, p.body
+            names, body, familiarity = p.names, p.body, p.familiarity
         facts = c.index.current_facts(person_id)
         facts.sort(key=lambda f: f.valid_from, reverse=True)
         episodes = c.index.episodes_with(person_id, limit=30)
         return {
             "id": person_id,
             "names": names,
+            "familiarity": familiarity,
+            "familiarity_levels": list(FAMILIARITY_LEVELS),
             "profile": body.strip(),
             "facts": [
                 {

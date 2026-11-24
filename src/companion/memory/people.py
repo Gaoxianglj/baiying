@@ -21,6 +21,12 @@ from companion.memory.layout import MemoryLayout, render_template
 SELF_ID = "self"  # 伙伴自己
 PERSON_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _MAX_MERGE_DEPTH = 32
+FAMILIARITY_LEVELS: tuple[str, ...] = ("初识", "相熟", "熟络", "亲近")
+DEFAULT_FAMILIARITY = "初识"
+
+
+def familiarity_rank(level: str) -> int:
+    return FAMILIARITY_LEVELS.index(level) if level in FAMILIARITY_LEVELS else 0
 
 
 class PeopleError(ValueError):
@@ -32,15 +38,18 @@ class Person:
     person_id: str
     names: list[str] = field(default_factory=list)
     accounts: dict[str, list[str]] = field(default_factory=dict)
+    familiarity: str = DEFAULT_FAMILIARITY
     merged_into: str | None = None
     created_at: str = ""
     body: str = ""
 
     def frontmatter(self) -> dict[str, Any]:
+        fam = self.familiarity if self.familiarity in FAMILIARITY_LEVELS else DEFAULT_FAMILIARITY
         data: dict[str, Any] = {
             "person_id": self.person_id,
             "names": self.names,
             "accounts": self.accounts,
+            "familiarity": fam,
             "created_at": self.created_at,
         }
         if self.merged_into:
@@ -55,12 +64,15 @@ def parse_person(text: str) -> Person:
     if end == -1:
         raise PeopleError("人物档案的 frontmatter 没有结束")
     meta = yaml.safe_load(text[4:end]) or {}
+    raw_fam = str(meta.get("familiarity") or DEFAULT_FAMILIARITY)
+    fam = raw_fam if raw_fam in FAMILIARITY_LEVELS else DEFAULT_FAMILIARITY
     return Person(
         person_id=str(meta["person_id"]),
         names=[str(n) for n in meta.get("names") or []],
         accounts={
             str(p): [str(a) for a in accs or []] for p, accs in (meta.get("accounts") or {}).items()
         },
+        familiarity=fam,
         merged_into=meta.get("merged_into"),
         created_at=str(meta.get("created_at") or ""),
         body=text[end + 5 :],
@@ -147,10 +159,25 @@ class PeopleRegistry:
                 if not previous.accounts:
                     previous.merged_into = person_id
                     target.names.extend(n for n in previous.names if n not in target.names)
+                    if familiarity_rank(previous.familiarity) > familiarity_rank(
+                        target.familiarity
+                    ):
+                        target.familiarity = previous.familiarity
                 self._save(previous)
             target.accounts.setdefault(platform, []).append(account)
             self._save(target)
             self._rebuild_index()
+
+    def set_familiarity(self, person_id: str, familiarity: str) -> Person:
+        if familiarity not in FAMILIARITY_LEVELS:
+            raise PeopleError(f"熟络度只能是 {'/'.join(FAMILIARITY_LEVELS)}：{familiarity}")
+        with self._lock:
+            target = self.get(person_id)
+            if target is None or target.merged_into:
+                raise PeopleError(f"没有这个人：{person_id}")
+            target.familiarity = familiarity
+            self._save(target)
+            return target
 
     def _new_person(self, person_id: str | None, name: str) -> Person:
         if person_id is None:

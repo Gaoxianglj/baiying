@@ -7,7 +7,7 @@ import pytest
 
 from companion.config import load_config
 from companion.core.companion import Companion
-from companion.core.sleep import Sleeper
+from companion.core.sleep import Sleeper, clamp_familiarity, familiarity_ceiling
 from companion.memory import Episode, Fact, MemoryLayout, init_memory
 from tests.fakes import FakeEmbedder, scripted_gateway
 
@@ -17,6 +17,10 @@ T0 = datetime(2026, 10, 20, 12, tzinfo=UTC)
 class Brain:
     def __init__(self) -> None:
         self.invent = False
+        self.update_preferences = False
+        self.update_style = False
+        self.update_person_style = False
+        self.proposed_familiarity = "亲近"
 
     def __call__(self, messages, json_mode):
         system, user = messages[0].content, messages[-1].content
@@ -28,6 +32,41 @@ class Brain:
             return json.dumps({"我是谁": [{"text": "我喜欢安静地读诗", "sources": two},
                                           {"text": "我其实很会打游戏", "sources": two[:1]}],
                                "我在意的事": [], "最近的我": []}, ensure_ascii=False)  # fmt: skip
+        if "喜好与习惯（次核心层）" in system:
+            two = [i for i, _ in ids[:2]]
+            return json.dumps(
+                {
+                    "changed": self.update_preferences,
+                    "穿搭与随身物": [{"text": "天冷时想象披一件米白开衫", "sources": two}],
+                    "读书与品味": [{"text": "没有依据的书单", "sources": two[:1]}],
+                    "喜欢与不喜欢": [],
+                    "小习惯与熟悉的事": [],
+                    "闲下来喜欢做的事": [],
+                },
+                ensure_ascii=False,
+            )
+        if "全局表达风格" in system:
+            two = [i for i, _ in ids[:2]]
+            return json.dumps(
+                {
+                    "changed": self.update_style,
+                    "口头禅与常用说法": [],
+                    "句式与语气": [],
+                    "熟络后的破壳与打趣": [{"text": "和熟人打趣时句末偶尔带（）", "sources": two}],
+                    "从大家那里学到的说法": [],
+                },
+                ensure_ascii=False,
+            )
+        if "人际熟络度与说话方式审视" in system:
+            one = [ids[0][0]] if ids else []
+            return json.dumps(
+                {
+                    "changed": self.update_person_style,
+                    "familiarity": self.proposed_familiarity,
+                    "对 ta 的说话方式": [{"text": "可以轻松接话打趣", "sources": one}],
+                },
+                ensure_ascii=False,
+            )
         items = [{"text": text.replace("（新）", ""), "sources": [i]} for i, text in ids]
         if self.invent:
             items.append({"text": "小明是外星人", "sources": ["zzzzzzzz"]})
@@ -118,3 +157,58 @@ def test_journal_and_meta(c):
     # 第二次睡眠：没有新东西，不再反思
     again = Sleeper(c).run(now=T0 + timedelta(days=1))
     assert again.people_reflected == [] and again.journal is None
+
+
+def test_weekly_sync_updates_preferences_style_and_clamps_familiarity(c):
+    # 准备跨两天的互动与至少 3 段经历，使客观上限达到“相熟”（但不到“熟络/亲近”）
+    c.observe(body="qq", channel="group:1", account="1001", text="早", now=T0 - timedelta(days=2))
+    pid = c.people.resolve("qq", "1001")
+    c.people.bind("qq", "1001", "xiaoming")
+    assert pid is not None
+    c.observe(body="qq", channel="group:1", account="1001", text="晚", now=T0 - timedelta(hours=4))
+    for h in (6, 4, 2):
+        add_episode(c, f"和小明第{h}次聊天", T0 - timedelta(hours=h))
+    add_fact(c, "白璎喜欢收集好词", T0 - timedelta(hours=1), subject="self")
+
+    c.brain.update_preferences = True
+    c.brain.update_style = True
+    c.brain.update_person_style = True
+    c.brain.proposed_familiarity = "亲近"  # 模型想直接跳到最高档，程序应按步长和客观上限拦在“相熟”
+
+    report = Sleeper(c).run(now=T0)
+    assert report.preferences_reflected is True
+    assert report.style_reflected is True
+    assert report.familiarity_updated == ["xiaoming"]
+
+    prefs = (c.layout.self_dir / "preferences.md").read_text("utf-8")
+    assert "天冷时想象披一件米白开衫" in prefs
+    assert "没有依据的书单" not in prefs
+
+    style = (c.layout.self_dir / "style.md").read_text("utf-8")
+    assert "和熟人打趣时句末偶尔带（）" in style
+
+    person = c.people.get("xiaoming")
+    assert person.familiarity == "相熟"
+    assert "可以轻松接话打趣" in person.body
+
+    # 次日普通睡眠只跑每日人物反思：不应冲掉 7 天审视写下的“对 ta 的说话方式”与熟络度
+    add_fact(c, "小明爱吃牛肉面", T0 + timedelta(hours=20))
+    Sleeper(c).run(now=T0 + timedelta(days=1))
+    after = c.people.get("xiaoming")
+    assert after.familiarity == "相熟"
+    assert "可以轻松接话打趣" in after.body
+    assert "小明爱吃牛肉面" in after.body
+
+
+def test_familiarity_ceiling_and_step_rules():
+    assert familiarity_ceiling(active_days=1, episodes_count=10, facts_count=5) == "初识"
+    assert familiarity_ceiling(active_days=2, episodes_count=3, facts_count=0) == "相熟"
+    assert familiarity_ceiling(active_days=8, episodes_count=20, facts_count=2) == "熟络"
+    assert (
+        familiarity_ceiling(active_days=20, episodes_count=50, facts_count=20, is_peer_bot=True)
+        == "熟络"
+    )
+    assert familiarity_ceiling(active_days=20, episodes_count=50, facts_count=20) == "亲近"
+    assert clamp_familiarity("初识", "亲近", "亲近") == "相熟"  # 单次最多升 1 档
+    assert clamp_familiarity("相熟", "熟络", "相熟") == "相熟"  # 不能超过客观上限
+    assert clamp_familiarity("熟络", "初识", "熟络") == "相熟"  # 单次最多降 1 档

@@ -205,6 +205,7 @@
     min-height: 460px; resize: vertical; line-height: 1.75; padding: 14px 16px;
     font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Microsoft YaHei", monospace; font-size: 13px;
   }
+  textarea.seed.compact { min-height: 280px; }
   .md h1 { font-size: 18px; margin: 0 0 8px; }
   .md h2 { font-size: 14px; margin: 16px 0 6px; color: var(--violet-700); }
   .md ul { margin: 0; padding-left: 20px; }
@@ -697,28 +698,84 @@ async function resetField(path) {
 }
 
 // ---------- 白璎 ----------
+const FAM_CHIP = { "亲近": "green", "熟络": "", "相熟": "amber", "初识": "grey" };
 pages.persona = async () => {
   const d = await api("self");
+  const pStyles = (d.people_styles || []).map(p => `
+    <div class="memo" style="padding:10px 0">
+      <div class="body">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <b>${esc(p.name)}</b>
+          <span class="chip ${FAM_CHIP[p.familiarity] || "grey"}">${esc(p.familiarity || "初识")}</span>
+        </div>
+        ${p.style && p.style.length
+          ? `<ul style="margin:4px 0 0;padding-left:18px;font-size:13px;color:var(--muted)">${p.style.map(s => `<li>${esc(s.split("〔")[0])}</li>`).join("")}</ul>`
+          : '<span class="faint" style="font-size:12px">尚未记录专属说话方式，按当前熟络度尺度自然交流</span>'}
+      </div>
+    </div>`).join("");
   main.innerHTML = `
     <div class="page-head"><div><h2>${esc(state.persona)}</h2>
-      <p>种子是她的核心性格与底线，只由你修改；自我认知和表达习惯由她每天的反思自动更新。</p></div></div>
+      <p>核心种子只由你修改；喜好与习惯（次核心）、自我认知、表达风格和熟络度每 7 天同步审视一次（无变化时保持原样），你也可以随时手动微调。</p></div></div>
     <div class="grid persona-grid">
-      <div class="card">
-        <h3>🌱 种子 <span class="chip">只由你修改</span></h3>
-        <textarea class="seed" id="seedText" spellcheck="false">${esc(d.seed)}</textarea>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
-          <span class="faint">保存后会记进她的记忆仓库</span>
-          <button class="btn primary" id="saveSeed">保存种子</button>
+      <div class="grid">
+        <div class="card">
+          <h3>🌱 核心种子 <span class="chip">只由你修改</span></h3>
+          <textarea class="seed" id="seedText" spellcheck="false">${esc(d.seed)}</textarea>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+            <span class="faint">身份、基础外貌、说话硬规则与底线</span>
+            <button class="btn primary" id="saveSeed">保存种子</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>🍵 喜好与习惯（次核心） <span class="chip grey">每 7 天审视 · 可手改</span></h3>
+          <textarea class="seed compact" id="prefText" spellcheck="false">${esc(d.preferences || "")}</textarea>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+            <span class="faint">穿搭随身物、书单品味、日常喜好与闲暇兴趣</span>
+            <button class="btn primary" id="savePreferences">保存喜好与习惯</button>
+          </div>
         </div>
       </div>
       <div class="grid">
-        <div class="card md"><h3>🪞 自我认知 <span class="chip grey">每周反思</span></h3>${md(d.identity)}</div>
-        <div class="card md"><h3>🎐 表达习惯 <span class="chip grey">表达学习</span></h3>${md(d.style)}</div>
+        <div class="card md"><h3>🪞 自我认知 <span class="chip grey">每 7 天反思</span></h3>${md(d.identity)}</div>
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h3 style="margin:0">🎐 全局表达风格 <span class="chip grey">每 7 天审视 · 可手改</span></h3>
+            <button class="btn small" id="toggleStyleEdit">编辑</button>
+          </div>
+          <div id="styleView" class="md" style="margin-top:10px">${md(d.style)}</div>
+          <div id="styleEditor" style="display:none;margin-top:10px">
+            <textarea class="seed compact" id="styleText" spellcheck="false">${esc(d.style || "")}</textarea>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
+              <button class="btn primary" id="saveStyle">保存表达风格</button>
+            </div>
+          </div>
+        </div>
+        <div class="card"><h3>💬 对大家的熟络度与破壳尺度 <span class="chip grey">每 7 天审视</span></h3>
+          ${pStyles || '<p class="faint">还没有认识的人</p>'}
+        </div>
       </div>
     </div>`;
   $("#saveSeed").onclick = async () => {
     try { await api("seed", { text: $("#seedText").value }); toast("种子已保存，下一句话起就会生效"); }
     catch (err) { toast(err.message, true); }
+  };
+  $("#savePreferences").onclick = async () => {
+    try { await api("preferences", { text: $("#prefText").value }); toast("喜好与习惯已保存，下一句话起就会生效"); }
+    catch (err) { toast(err.message, true); }
+  };
+  $("#toggleStyleEdit").onclick = () => {
+    const ed = $("#styleEditor"), vw = $("#styleView");
+    const open = ed.style.display === "none";
+    ed.style.display = open ? "block" : "none";
+    vw.style.display = open ? "none" : "block";
+    $("#toggleStyleEdit").textContent = open ? "收起" : "编辑";
+  };
+  $("#saveStyle").onclick = async () => {
+    try {
+      await api("style", { text: $("#styleText").value });
+      toast("表达风格已保存，下一句话起就会生效");
+      pages.persona();
+    } catch (err) { toast(err.message, true); }
   };
 };
 
@@ -734,7 +791,8 @@ pages.people = async () => {
       <div class="plist">${all.map(p => `
         <button class="pitem ${p.id === state.person ? "active" : ""}" data-pid="${esc(p.id)}">
           <div class="pav">${esc((p.names[0] || p.id).slice(0, 1))}</div>
-          <div><div>${esc(p.names.join(" / "))}</div>
+          <div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span>${esc(p.names.join(" / "))}</span>
+            ${p.familiarity ? `<span class="chip ${FAM_CHIP[p.familiarity] || "grey"}">${esc(p.familiarity)}</span>` : ""}</div>
             <div class="meta">${p.facts} 条事实 · ${p.episodes} 段经历${Object.entries(p.accounts).map(([k, v]) => " · " + k + " " + v.length).join("")}</div></div>
         </button>`).join("")}</div>
       <div id="personDetail"><div class="card empty">加载中…</div></div>
@@ -751,7 +809,10 @@ const STATE_CHIP = { vivid: ["鲜活", "green"], faded: ["淡化", "amber"], com
 async function loadPerson() {
   const box = $("#personDetail");
   const p = await api("people/" + encodeURIComponent(state.person));
+  const levels = p.familiarity_levels || ["初识", "相熟", "熟络", "亲近"];
+  const famBar = p.familiarity ? `<div class="card" style="margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap"><div><b>🤝 当前熟络度</b> <span class="faint" style="margin-left:6px">决定面对 ta 时文学少女外壳维持与“破壳”打趣的尺度</span></div><div style="display:flex;gap:6px">${levels.map(lv => `<button class="btn small ${p.familiarity === lv ? "primary" : ""}" data-fam="${esc(lv)}">${esc(lv)}</button>`).join("")}</div></div>` : "";
   box.innerHTML = `
+    ${famBar}
     ${p.profile ? `<div class="card md" style="margin-bottom:18px">${md(p.profile)}</div>` : ""}
     <div class="card" style="margin-bottom:18px"><h3>📌 知道的事 <span class="chip grey">${p.facts.length}</span></h3>
       ${p.facts.length ? p.facts.map(f => `
@@ -775,6 +836,15 @@ async function loadPerson() {
     try {
       const r = await api("forget", { kind, id });
       toast(`已经忘掉了 ${r.memories} 条记忆、${r.messages} 条聊天记录`);
+      pages.people();
+    } catch (err) { toast(err.message, true); }
+  });
+  box.querySelectorAll("[data-fam]").forEach(b => b.onclick = async () => {
+    const lv = b.dataset.fam;
+    if (lv === p.familiarity) return;
+    try {
+      await api("person-familiarity", { id: p.id, familiarity: lv });
+      toast(`已将熟络度设为「${lv}」`);
       pages.people();
     } catch (err) { toast(err.message, true); }
   });

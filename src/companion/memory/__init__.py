@@ -8,7 +8,15 @@ from companion.memory.layout import (
     init_memory,
     load_manifest,
 )
-from companion.memory.people import SELF_ID, PeopleError, PeopleRegistry, Person
+from companion.memory.people import (
+    DEFAULT_FAMILIARITY,
+    FAMILIARITY_LEVELS,
+    SELF_ID,
+    PeopleError,
+    PeopleRegistry,
+    Person,
+    familiarity_rank,
+)
 
 __all__ = [
     "Episode",
@@ -16,10 +24,13 @@ __all__ = [
     "MemoryIndex",
     "MemoryIndexError",
     "TextHit",
+    "DEFAULT_FAMILIARITY",
+    "FAMILIARITY_LEVELS",
     "SELF_ID",
     "PeopleError",
     "PeopleRegistry",
     "Person",
+    "familiarity_rank",
     "Actor",
     "Event",
     "EventLog",

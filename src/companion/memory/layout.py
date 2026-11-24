@@ -4,8 +4,9 @@
       manifest.json          格式版本、人格名、派生层由哪些模型生成
       events/YYYY-MM.jsonl   原始事件日志，只追加，唯一真相（按 UTC 月份分文件）
       self/seed.md           种子：只由用户修改
+      self/preferences.md    次核心：喜好、穿搭与习惯，每周审视或手动修改
       self/identity.md       自我认知：每周反思更新
-      self/style.md          表达风格：表达学习更新
+      self/style.md          表达风格：每周反思同步更新
       self/journal/          每日反思日记
       people/<person_id>.md  对每个人的了解
       archive/               冷存档：沉睡的记忆
@@ -35,7 +36,7 @@ _GITIGNORE = (
     "# 图片体积大、也要能被真正删除\nmedia/\n"
     "# 表情包只记文字信息（index.json），图片本身不进 git\nstickers/*.jpg\nstickers/*.orig.*\n"
 )
-_SELF_TEMPLATES = ("seed.md", "identity.md", "style.md")
+_SELF_TEMPLATES = ("seed.md", "preferences.md", "identity.md", "style.md")
 
 
 class MemoryFormatError(RuntimeError):

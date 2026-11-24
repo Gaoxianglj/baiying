@@ -112,3 +112,29 @@ def test_qq_group_mention_rule(companion):
     assert "写“@”加对方的 QQ 号或群里显示的名字" in system("qq", "group:4000")
     assert "真正的 @" not in system("qq", "private:2000")
     assert "真正的 @" not in system("cli", "cli:test")
+
+
+def test_preferences_style_and_familiarity_in_prompt(companion):
+    (companion.layout.self_dir / "preferences.md").write_text(
+        "# 白璎 的喜好与习惯\n\n## 穿搭与随身物\n\n- 常穿月白色的长裙。\n", "utf-8"
+    )
+    (companion.layout.self_dir / "style.md").write_text(
+        "# 白璎 的表达风格\n\n## 熟络后的破壳与打趣\n\n- 熟人面前偶尔句末带（）。\n", "utf-8"
+    )
+    say(companion, "你好呀", T0)
+    pid = companion.people.resolve("cli", "xiang")
+    companion.people.set_familiarity(pid, "亲近")
+
+    bundle = companion.context.build(
+        person_id=pid, body="cli", channel="cli:test", query="今天穿什么", now=T0
+    )
+    order = [
+        "【你的种子（核心性格与底线，必须遵守）】",
+        "【你的喜好与习惯",
+        "常穿月白色的长裙",
+        "【你的表达习惯】",
+        "熟人面前偶尔句末带（）",
+        "当前熟络度：亲近",
+    ]
+    positions = [bundle.system_prompt.index(s) for s in order]
+    assert positions == sorted(positions)
