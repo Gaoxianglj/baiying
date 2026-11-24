@@ -112,6 +112,10 @@ class Skill:
         """这个场合能不能用（如 Agent 只限主人私聊）。"""
         return True
 
+    def channel_allowed(self, ctx: SkillContext) -> bool:
+        """这个频道整体是否开放该工具声明（避免同一群聊因发言人不同而重建持久线程）。"""
+        return self.allowed(ctx)
+
     def run(self, marker: str, arg: str, ctx: SkillContext) -> SkillResult:
         raise NotImplementedError
 
@@ -152,6 +156,11 @@ class Skills:
             return []
         return [s for s in self.all if s.enabled() and s.allowed(ctx)]
 
+    def channel_available(self, ctx: SkillContext | None) -> list[Skill]:
+        if ctx is None or not self.cfg.enabled:
+            return []
+        return [s for s in self.all if s.enabled() and s.channel_allowed(ctx)]
+
     def can_use(self, marker: str, ctx: SkillContext | None) -> bool:
         return any(marker in s.markers_for(ctx) for s in self.available(ctx))
 
@@ -167,6 +176,22 @@ class Skills:
             return "", []
         lines = [f"- {usage}" for s in skills for usage in s.markers_for(ctx).values()]
         notes = [note for s in skills if (note := s.context(ctx))]
+        return self._usage(lines), notes
+
+    def session_prompt_parts(
+        self, ctx: SkillContext | None
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """持久会话专用：工具说明按频道固定，实时状态按技能名独立去重。"""
+        channel_skills = self.channel_available(ctx)
+        if not channel_skills:
+            return "", []
+        lines = [f"- {usage}" for s in channel_skills for usage in s.markers_for(ctx).values()]
+        active_skills = self.available(ctx)
+        notes = [
+            (s.name or f"skill_{i}", note)
+            for i, s in enumerate(active_skills)
+            if (note := s.context(ctx))
+        ]
         return self._usage(lines), notes
 
     @staticmethod

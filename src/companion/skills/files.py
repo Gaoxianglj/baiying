@@ -146,6 +146,13 @@ class SendFile(Skill):
     def enabled(self) -> bool:
         return self.cfg.enabled
 
+    def channel_allowed(self, ctx: SkillContext) -> bool:
+        if self.cfg.folder_enabled:
+            return True
+        if not ctx.private:
+            return self.cfg.send_in_groups
+        return self.allowed(ctx)
+
     def allowed(self, ctx: SkillContext) -> bool:
         if self.cfg.folder_enabled:  # 每个聊天都有自己的文件夹可以发
             return True

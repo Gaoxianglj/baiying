@@ -334,6 +334,7 @@ class Companion:
         if skill_ctx is not None:
             skill_ctx.query = query
         skill_prompt, skill_notes = self.skills.prompt_parts(skill_ctx)
+        session_skill_prompt, session_skill_notes = self.skills.session_prompt_parts(skill_ctx)
         bundle = self.context.build(
             person_id=incoming.actor.person_id,
             body=body,
@@ -344,6 +345,8 @@ class Companion:
             reply_mode=mode,
             extra_sections=[skill_prompt] if skill_prompt else None,
             dynamic_sections=skill_notes,
+            session_extra_sections=[session_skill_prompt] if session_skill_prompt else [],
+            session_dynamic_sections=session_skill_notes,
             show_image_refs=self.skills.can_use("看图", skill_ctx),
         )
         result, calls = self._chat_with_skills(bundle, skill_ctx, on_interim)
@@ -396,6 +399,14 @@ class Companion:
         session_key = bundle.session_key
         session_messages = list(bundle.session_messages or messages)
         session_bootstrap = list(session_messages)
+        turn_tail = [
+            m for m in (bundle.session_messages or []) if m.role == "system" and m.event_id is None
+        ]
+        session_prefix_and_history = [
+            m
+            for m in (bundle.session_messages or messages)
+            if not (m.role == "system" and m.event_id is None)
+        ]
 
         def native_result(call: SkillCall, outcome: SkillResult) -> None:
             calls.append(call)
@@ -450,7 +461,11 @@ class Companion:
                             "若本地缺少且提供了群文件工具，再查当前QQ群文件。完成查找前不要要求重传或贴正文。",
                         )
                         messages.append(reminder)
-                        session_messages = [reminder]
+                        session_messages = (
+                            [reminder, *turn_tail]
+                            if result.raw.get("session_key") == session_key and session_key
+                            else [*session_prefix_and_history, reminder, *turn_tail]
+                        )
                         session_bootstrap.append(reminder)
                         continue
                     if (
@@ -476,7 +491,11 @@ class Companion:
                                 "请先调用对应工具再回复；若无需变更约定本，请直接给出回复且不要口头承诺自动执行。",
                             )
                             messages.append(nudge)
-                            session_messages = [nudge]
+                            session_messages = (
+                                [nudge, *turn_tail]
+                                if result.raw.get("session_key") == session_key and session_key
+                                else [*session_prefix_and_history, nudge, *turn_tail]
+                            )
                             session_bootstrap.append(nudge)
                             continue
                     return result, calls
@@ -508,11 +527,11 @@ class Companion:
                     ),
                 ]
                 session_bootstrap += messages[-2:]
-                # 原生线程已保存它自己的回复，不把同一技能标记再追加一遍。
-                session_messages = [m for m in bundle.messages if m.role == "system"] + (
-                    messages[-1:]
+                # 原生线程已保存它自己的回复与设定，只补交最新技能结果与本轮精简页脚。
+                session_messages = (
+                    [*messages[-1:], *turn_tail]
                     if result.raw.get("session_key") == session_key and session_key
-                    else messages[-2:]
+                    else [*session_prefix_and_history, *messages[-2:], *turn_tail]
                 )
         finally:
             for path in temporary:
@@ -1340,8 +1359,8 @@ class Companion:
             self.index.add_episode(extraction.episode)
         for fact, supersedes in extraction.facts:
             self.index.add_fact(fact, supersedes=supersedes)
-        if any(supersedes for _, supersedes in extraction.facts):
-            self.gateway.rotate_chat_sessions("corrected-facts")
+        # 人物事实或经历更新后，持久会话会在下一轮通过 state@person:<id> 增量推送最新事实，
+        # 不再在日间空闲抽取时清空整天的聊天线程。
 
     def _after_cursor(self, channel: str, events: list[Event]) -> list[Event]:
         raw = self.index.get_meta(_CURSOR + channel)

@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 INSTRUCTIONS = """你是一个对话代理，不是编程助手。
 每条输入里都会给出角色设定、相关记忆和最近的对话记录。
 严格以设定中的角色身份，只输出这个角色接下来要说的话：不要解释，不要加引号或说话人前缀。
+即使对方询问编程、运维命令或分步教程，也不要切换成技术助手模式，不要在日常聊天里输出代码块或长篇分步清单，始终按设定中角色的知识边界与聊天口吻简短回应。
 不要执行命令，不要读写文件。如果输入要求输出 JSON，就只输出符合要求的 JSON。
 """
 
@@ -96,17 +97,28 @@ def parse_rate_limits(payload: dict[str, Any]) -> RateLimits:
 
 
 def render_prompt(messages: list[ChatMessage], json_schema: dict[str, Any] | None) -> str:
-    """把聊天消息压成一段输入文本。"""
+    """把聊天消息压成一段输入文本；相邻的 system 段合并进同一个 <设定> 块。"""
     parts: list[str] = []
+    sys_buf: list[str] = []
+
+    def flush_system() -> None:
+        if sys_buf:
+            parts.append("<设定>\n" + "\n\n".join(sys_buf) + "\n</设定>")
+            sys_buf.clear()
+
     for m in messages:
         if m.role == "system":
-            parts.append(f"<设定>\n{m.content}\n</设定>")
-        elif m.role == "assistant":
+            if m.content.strip():
+                sys_buf.append(m.content.strip())
+            continue
+        flush_system()
+        if m.role == "assistant":
             parts.append(f"<你之前说>\n{m.content}\n</你之前说>")
         elif m.role == "skill":
             parts.append(f"<技能结果>\n{m.content}\n</技能结果>")
         else:
             parts.append(f"<对方说>\n{m.content}\n</对方说>")
+    flush_system()
     if json_schema is not None:
         parts.append(
             "只输出符合以下 JSON Schema 的 JSON：\n" + json.dumps(json_schema, ensure_ascii=False)

@@ -52,20 +52,15 @@ def run_qq(config: Config, log_file: Path | None = None) -> int:
             companion.trpg.recover_delivery()
             bot = QQBot(companion, cfg, on_daily=daily)
             log.info("连接 NapCat：%s（按 Ctrl+C 或运行停止脚本退出）", cfg.ws_url)
-            planned_stop = False
             try:
                 asyncio.run(_run_until_stopped(bot, flag))
-                planned_stop = flag.exists()
             except KeyboardInterrupt:
-                planned_stop = True
                 log.info("正在退出……")
             finally:
                 bot.close()
                 try:
                     done = companion.extract_pending(force=True)
                     log.info("退出前整理了 %d 段会话", len(done))
-                    if planned_stop:
-                        companion.rotate_chat_sessions("stop")
                 except ModelError as e:
                     log.error("退出前整理失败（下次启动会重试）：%s", e)
     finally:

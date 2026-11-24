@@ -24,7 +24,8 @@ class NativeSkills:
         self._done: dict[str, tuple[str, dict]] = {}
         specs = []
         # 原生 rollout 会保留工具结果；临时桌面资料继续沿用原来的临时会话标记路径。
-        for skill in skills.available(ctx):
+        # 按频道级可用技能生成工具表，避免群里不同人发言时 policy 哈希抖动导致断线重建。
+        for skill in skills.channel_available(ctx):
             if skill.name in {"screen", "clipboard"}:
                 continue
             for marker, usage in skill.markers_for(ctx).items():
@@ -55,7 +56,7 @@ class NativeSkills:
                        for m in s.markers_for(self.ctx)}
             skill = choices.get(marker)
             if skill is None:
-                raise SkillError("当前聊天不能使用这个工具")
+                raise SkillError("当前聊天或当前对话对象的权限/熟络度不能使用这个工具")
             if self.ctx.stop_event and self.ctx.stop_event.is_set():
                 raise SkillError("任务已停止，不能继续执行工具")
             arg, content = args["arg"], args.get("content", "")

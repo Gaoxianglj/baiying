@@ -336,6 +336,7 @@ class ConsoleApp:
         c = self.companion
         path = c.layout.self_dir / filename
         path.write_text(text.replace("\r\n", "\n").rstrip() + "\n", encoding="utf-8", newline="\n")
+        c.rotate_chat_sessions(f"console-edit:{filename}")
         committed = commit_memory(c.layout, c.name, commit_msg)
         return {"saved": True, "committed": committed}
 
@@ -343,6 +344,7 @@ class ConsoleApp:
         c = self.companion
         p = c.people.set_familiarity(person_id, familiarity)
         who = p.names[0] if p.names else p.person_id
+        c.rotate_chat_sessions("console-familiarity")
         committed = commit_memory(c.layout, c.name, f"主人在控制台将 {who} 的熟络度设为 {familiarity}")
         return {"saved": True, "familiarity": p.familiarity, "committed": committed}
 
@@ -350,6 +352,7 @@ class ConsoleApp:
         removed = self.companion.reminders.cancel("", promise_id, owner_override=True)
         if removed is None:
             raise KeyError(f"没有编号 {promise_id} 这条约定")
+        self.companion.rotate_chat_sessions("console-promise-cancel")
         return {"cancelled": True, "id": removed.id, "what": removed.what}
 
     def people(self) -> dict[str, Any]:

@@ -506,7 +506,8 @@ class Promises(Skill):
     markers: ClassVar[dict[str, str]] = {
         "约定": (
             "【约定：时间或持续｜约定内容｜方式（可选）】当你在自然聊天中与对方达成约定、承诺定期做某件事"
-            "（如每天画一幅不同的花放进花册里）或答应到点提醒时调用，无需对方说指令词。"
+            "（如每天画一幅不同的花放进花册里）或答应到点提醒时调用，无需对方说指令词"
+            "（群聊里仅限熟络以上的朋友或主人）。"
             "第 1 段写时间：准点时间（2026-11-02 18:30、30分钟后、每天 08:00、每周一 09:00、工作日 08:00）、"
             "不卡几点的日常周期（每天、每天 下午、每周五 晚上、明天 上午），或平时一直遵守的相处约定（写 持续）。"
             "第 2 段写清完整要求与保存目录（如 每天画一朵不重样的花存入 花册/ 并发给大家看），履约时你靠这句话和过往记录行动。"
@@ -534,6 +535,13 @@ class Promises(Skill):
 
     def enabled(self) -> bool:
         return self.cfg.enabled
+
+    def channel_allowed(self, ctx: SkillContext) -> bool:
+        if ctx.body != "qq":
+            return False
+        if not ctx.private and ctx.channel.startswith("group:"):
+            return self.cfg.in_groups
+        return self.allowed(ctx)
 
     def allowed(self, ctx: SkillContext) -> bool:
         if ctx.body != "qq":

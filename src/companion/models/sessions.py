@@ -58,6 +58,13 @@ class ChatSessions:
             row = self.get(key)
             if row is None or row[0] != thread_id:
                 return
+            for eid in event_ids:
+                if eid.startswith("state@") and "=" in eid:
+                    prefix = eid.split("=", 1)[0] + "="
+                    self._db.execute(
+                        "DELETE FROM seen WHERE key = ? AND substr(event_id, 1, ?) = ?",
+                        (key, len(prefix), prefix),
+                    )
             self._db.executemany(
                 "INSERT OR IGNORE INTO seen(key, event_id) VALUES (?, ?)",
                 [(key, eid) for eid in event_ids],

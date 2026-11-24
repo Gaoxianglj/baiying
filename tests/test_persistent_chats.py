@@ -306,3 +306,156 @@ def test_partial_extraction_failure_retries_only_uncommitted_batches(tmp_path, m
             c.extract_pending(force=True, now=T0 + timedelta(minutes=1))
         c.extract_pending(force=True, now=T0 + timedelta(minutes=1))
         assert seen == ["0", "1", "1", "2", "3"]
+
+
+def test_reply_mode_switch_and_steady_turns_do_not_resend_persona_or_facts(tmp_path, monkeypatch):
+    folder = tmp_path / "codex"
+    b = backend(folder, monkeypatch)
+    with companion(tmp_path, b) as c:
+        (c.layout.self_dir / "seed.md").write_text("核心种子特征-SEED-ONCE", "utf-8")
+        ev0 = c.observe(
+            body="qq", channel="group:9", account="u1", display_name="阿青", text="早呀", now=T0
+        )
+        c.remember(ev0, "喜欢桂花乌龙-FACT-ONCE", now=T0)
+        ctx = SkillContext("qq", "group:9", ev0.actor.person_id, private=False, owner=False, now=T0)
+        r1 = c.respond(ev0, now=T0, mode="required", skill_ctx=ctx)
+
+        ev1 = c.observe(
+            body="qq",
+            channel="group:9",
+            account="u1",
+            display_name="阿青",
+            text="接着聊一句",
+            now=T0 + timedelta(seconds=20),
+        )
+        r2 = c.respond(ev1, now=T0 + timedelta(seconds=20), mode="optional", skill_ctx=ctx)
+
+        ev2 = c.observe(
+            body="qq",
+            channel="group:9",
+            account="u1",
+            display_name="阿青",
+            text="群里旁白",
+            now=T0 + timedelta(seconds=40),
+        )
+        r3 = c.respond(ev2, now=T0 + timedelta(seconds=40), mode="strict", skill_ctx=ctx)
+
+        tids_mode = {
+            r1.result.raw["thread_id"],
+            r2.result.raw["thread_id"],
+            r3.result.raw["thread_id"],
+        }
+        assert len(tids_mode) == 1
+        turns = requests(folder, "turn/start")
+        assert "核心种子特征-SEED-ONCE" in text_of(turns[0])
+        assert "喜欢桂花乌龙-FACT-ONCE" in text_of(turns[0])
+        for follow in turns[1:]:
+            payload = text_of(follow)
+            assert "核心种子特征-SEED-ONCE" not in payload
+            assert "喜欢桂花乌龙-FACT-ONCE" not in payload
+            assert "【换个说法】" not in payload
+        assert "这条消息没有直接叫你" in text_of(turns[1])
+        assert "这条消息不是冲你来的" in text_of(turns[2])
+        assert len(text_of(turns[1])) < len(text_of(turns[0])) * 0.35
+
+
+def test_group_speakers_with_different_familiarity_keep_single_thread(tmp_path, monkeypatch):
+    from companion.skills.native import NativeSkills
+    from companion.skills.reminder import Promises
+
+    folder = tmp_path / "codex"
+    b = backend(folder, monkeypatch)
+    with companion(tmp_path, b) as c:
+        c.skills.all.append(Promises(c.config.skills.reminders, c.reminders, c.people))
+        p_close = c.people.ensure("qq", "1001", "老友")
+        p_casual = c.people.ensure("qq", "1002", "新群友")
+        c.people.set_familiarity(p_close, "熟络")
+        c.people.set_familiarity(p_casual, "相熟")
+
+        tids = []
+        for idx, (acc, name, pid) in enumerate(
+            [
+                ("1001", "老友", p_close),
+                ("1002", "新群友", p_casual),
+                ("1001", "老友", p_close),
+                ("1002", "新群友", p_casual),
+            ]
+        ):
+            now = T0 + timedelta(seconds=idx * 15)
+            ev = c.observe(
+                body="qq",
+                channel="group:77",
+                account=acc,
+                display_name=name,
+                text=f"发言{idx}",
+                now=now,
+            )
+            ctx = SkillContext("qq", "group:77", pid, private=False, owner=False, now=now)
+            rep = c.respond(ev, now=now, mode="required", skill_ctx=ctx)
+            tids.append(rep.result.raw["thread_id"])
+
+        assert len(set(tids)) == 1
+        assert len(requests(folder, "thread/start")) == 1
+        turns = requests(folder, "turn/start")
+        assert "你对老友的了解" in text_of(turns[0])
+        assert "你对新群友的了解" in text_of(turns[1])
+        assert "你对老友的了解" not in text_of(turns[2])
+        assert "你对新群友的了解" not in text_of(turns[3])
+
+        # 新群友（相熟）在工具执行层仍无权调用群约定工具
+        ctx_casual = SkillContext("qq", "group:77", p_casual, private=False, owner=False, now=T0)
+        ns = NativeSkills(c.skills, ctx_casual, lambda call, out: None)
+        pact_tool = next(s["name"] for s in ns.tools.specs if "约定" in s["description"])
+        res = ns.call(pact_tool, {"arg": "每天｜喝水", "content": ""}, "c1")
+        assert res["success"] is False
+
+
+def test_fact_correction_and_mood_revert_update_in_place_without_rotating_thread(
+    tmp_path, monkeypatch
+):
+    from companion.core.extract import Extraction
+    from companion.memory.index import Fact
+
+    folder = tmp_path / "codex"
+    b = backend(folder, monkeypatch)
+    with companion(tmp_path, b) as c:
+        ev0 = c.observe(body="qq", channel="private:1", account="one", text="我喜欢美式", now=T0)
+        pid = ev0.actor.person_id
+        old_fact = Fact(
+            subject=pid,
+            predicate="drink",
+            statement="喜欢喝冰美式-OLD",
+            valid_from=T0,
+            event_ids=[ev0.id],
+        )
+        c.index.add_fact(old_fact, now=T0)
+        c.life.note_mood("平静", "读书", channel="private:1", person_id=pid, now=T0)
+
+        ctx0 = SkillContext("qq", "private:1", pid, private=True, owner=True, now=T0)
+        r0 = c.respond(ev0, now=T0, skill_ctx=ctx0)
+        tid = r0.result.raw["thread_id"]
+        assert "喜欢喝冰美式-OLD" in text_of(requests(folder, "turn/start")[-1])
+
+        # 心情变成“小得意”，随后又回到一模一样的“平静（读书）”：A -> B -> A 都应投递
+        t1 = T0 + timedelta(minutes=1)
+        c.life.note_mood("小得意", "被夸了", channel="private:1", person_id=pid, now=t1)
+        say(c, "夸夸你", 60)
+        assert "小得意" in text_of(requests(folder, "turn/start")[-1])
+
+        t2 = T0 + timedelta(minutes=2)
+        c.life.note_mood("平静", "读书", channel="private:1", person_id=pid, now=t2)
+        # 同时模拟空闲记忆抽取产生了 supersedes 纠正事实：不应轮换线程，而是在下一轮增量刷新事实
+        new_fact = Fact(
+            subject=pid,
+            predicate="drink",
+            statement="改喝热桂花茶-NEW",
+            valid_from=t2,
+            event_ids=[ev0.id],
+        )
+        c._store(Extraction(episode=None, facts=[(new_fact, [old_fact.id])]))
+        r2 = say(c, "现在喝什么", 120)
+        assert r2.result.raw["thread_id"] == tid
+        last_payload = text_of(requests(folder, "turn/start")[-1])
+        assert "改喝热桂花茶-NEW" in last_payload
+        assert "喜欢喝冰美式-OLD" not in last_payload
+        assert "平静" in last_payload

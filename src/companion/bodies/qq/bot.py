@@ -517,8 +517,8 @@ class QQBot:
             if (
                 kind is None
                 and not self._not_for_me(src)
-                and not self._chatter(text)
-                and any(name in text for name in self.cfg.aliases)
+                and not self._chatter(src.incoming.text)
+                and any(name in src.incoming.text for name in self.cfg.aliases)
             ):
                 kind = "partner"
             if (
