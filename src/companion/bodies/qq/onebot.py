@@ -35,10 +35,12 @@ class OneBotClient:
         self._echo = count(1)
         self._tasks: set[asyncio.Task[None]] = set()
         self.connected = asyncio.Event()
+        self._was_connected = False
 
     async def run_forever(self, *, max_backoff: float = 60.0) -> None:
         backoff = 1.0
         while True:
+            self._was_connected = False
             try:
                 await self.run_once()
                 backoff = 1.0
@@ -53,6 +55,8 @@ class OneBotClient:
                     "%s 拒绝了连接（HTTP %d）：%s；%.0f 秒后重试", self.url, status, hint, backoff
                 )
             except (OSError, InvalidHandshake, ConnectionClosed, TimeoutError) as e:
+                if self._was_connected:
+                    backoff = 1.0
                 log.warning("与 NapCat 的连接断开：%s；%.0f 秒后重连", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
@@ -61,6 +65,7 @@ class OneBotClient:
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         async with connect(self.url, additional_headers=headers, max_size=2**24) as ws:
             self._ws = ws
+            self._was_connected = True
             self.connected.set()
             log.info("已连接 NapCat：%s", self.url)
             try:
@@ -75,13 +80,17 @@ class OneBotClient:
                 self._pending.clear()
 
     async def call(self, action: str, params: dict[str, Any], timeout: float = 30.0) -> Any:
-        if self._ws is None:
+        ws = self._ws
+        if ws is None:
             raise OneBotError("还没有连上 NapCat")
         echo = str(next(self._echo))
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[echo] = fut
-        await self._ws.send(json.dumps({"action": action, "params": params, "echo": echo}))
         try:
+            try:
+                await ws.send(json.dumps({"action": action, "params": params, "echo": echo}))
+            except (ConnectionClosed, OSError) as e:
+                raise OneBotError(f"{action} 发送失败（连接已断开）：{e}") from e
             resp = await asyncio.wait_for(fut, timeout)
         finally:
             self._pending.pop(echo, None)

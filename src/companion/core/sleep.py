@@ -270,11 +270,12 @@ class Sleeper:
             except ModelError as e:
                 weekly_ok = False
                 report.errors.append(f"表达风格审视：{e}")
-            try:
-                report.familiarity_updated = self._reflect_people_weekly(since)
-            except ModelError as e:
+            before_errors = len(report.errors)
+            report.familiarity_updated = self._reflect_people_weekly(
+                since, errors=report.errors
+            )
+            if len(report.errors) > before_errors:
                 weekly_ok = False
-                report.errors.append(f"熟络度审视：{e}")
             if weekly_ok:
                 self.c.index.set_meta(LAST_IDENTITY, now.isoformat())
 
@@ -472,7 +473,9 @@ class Sleeper:
         style_path.write_text(new_text, encoding="utf-8", newline="\n")
         return True
 
-    def _reflect_people_weekly(self, since: datetime) -> list[str]:
+    def _reflect_people_weekly(
+        self, since: datetime, *, errors: list[str] | None = None
+    ) -> list[str]:
         episodes = self.c.index.episodes_created_since(since)
         facts = self.c.index.facts_created_since(since)
         touched = {f.subject for f in facts if f.subject != SELF_ID}
@@ -495,15 +498,21 @@ class Sleeper:
             pid = person.person_id
             if pid in updated:
                 continue
-            changed = self._reflect_one_person_weekly(
-                person,
-                since=since,
-                active_days=len(active_days.get(pid, ())),
-                owners=owners,
-                peer_bots=peer_bots,
-                seed=seed,
-                style=style,
-            )
+            try:
+                changed = self._reflect_one_person_weekly(
+                    person,
+                    since=since,
+                    active_days=len(active_days.get(pid, ())),
+                    owners=owners,
+                    peer_bots=peer_bots,
+                    seed=seed,
+                    style=style,
+                )
+            except ModelError as e:
+                log.warning("熟络度审视 %s 失败：%s", pid, e)
+                if errors is not None:
+                    errors.append(f"熟络度审视 {pid}：{e}")
+                continue
             if changed:
                 updated.append(pid)
         if updated:

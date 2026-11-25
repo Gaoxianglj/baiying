@@ -12,16 +12,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import shutil
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 from PIL import Image
+
+log = logging.getLogger(__name__)
 
 STICKER_MARK = re.compile(r"\s*[【\[]表情[:：]\s*([^】\]\n]{1,12})[】\]]\s*")
 
@@ -64,7 +69,8 @@ class StickerBook:
         self.capacity = capacity
         self._lock = threading.RLock()
         self._items: dict[str, Sticker] = {}
-        self._load()
+        self._stamp: int | None = None
+        self._reload_if_changed()
 
     @property
     def index_path(self) -> Path:
@@ -83,19 +89,25 @@ class StickerBook:
         return self.original_path(digest) or self.image_path(digest)
 
     def __len__(self) -> int:
-        return len(self._items)
+        with self._lock:
+            self._reload_if_changed()
+            return len(self._items)
 
     def get(self, digest: str) -> Sticker | None:
-        return self._items.get(digest)
+        with self._lock:
+            self._reload_if_changed()
+            return self._items.get(digest)
 
     def all(self) -> list[Sticker]:
         with self._lock:
+            self._reload_if_changed()
             return sorted(self._items.values(), key=lambda s: s.seen + s.used, reverse=True)
 
     def emotions(self, limit: int = 20) -> list[str]:
         """库里有的情绪词，按常见程度排序（给模型选）。"""
         counts: dict[str, int] = {}
         with self._lock:
+            self._reload_if_changed()
             for s in self._items.values():
                 counts[s.emotion] = counts.get(s.emotion, 0) + s.seen + s.used
         return [e for e, _ in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)][:limit]
@@ -114,6 +126,7 @@ class StickerBook:
         """`image` 是 JPEG；`original` 是原图，只有动图才留下（静态图有 JPEG 就够了）。"""
         now_s = (now or datetime.now(UTC)).isoformat(timespec="seconds")
         with self._lock:
+            self._reload_if_changed()
             self.root.mkdir(parents=True, exist_ok=True)
             self._keep_original(digest, original)  # 以前收藏的没有原图，再见到时补上
             sticker = self._items.get(digest)
@@ -133,6 +146,7 @@ class StickerBook:
 
     def remove(self, digest: str) -> bool:
         with self._lock:
+            self._reload_if_changed()
             if self._items.pop(digest, None) is None:
                 return False
             self._delete_files(digest)
@@ -150,6 +164,7 @@ class StickerBook:
         """按情绪词挑一张：先找情绪词相同的；没有就用向量找最像的（需要 embed 函数）。"""
         rng = rng or random.Random()
         with self._lock:
+            self._reload_if_changed()
             items = list(self._items.values())
         if not items:
             return None
@@ -170,6 +185,7 @@ class StickerBook:
 
     def mark_used(self, digest: str, now: datetime | None = None) -> None:
         with self._lock:
+            self._reload_if_changed()
             sticker = self._items.get(digest)
             if sticker is None:
                 return
@@ -179,13 +195,30 @@ class StickerBook:
 
     # ---- 内部 ----
 
+    def _reload_if_changed(self) -> None:
+        try:
+            stamp = self.index_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            if self._stamp is not None:
+                self._items.clear()
+                self._stamp = None
+            return
+        except OSError:
+            return
+        if stamp != self._stamp and self._load():
+            self._stamp = stamp
+
     def _keep_original(self, digest: str, original: Path | None) -> None:
         if original is None or self.original_path(digest) is not None or not is_animated(original):
             return
         target = self.root / f"{digest}.orig{original.suffix.lower()}"
-        tmp = target.with_suffix(".tmp")
-        shutil.copyfile(original, tmp)
-        tmp.replace(target)
+        tmp = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+        try:
+            shutil.copyfile(original, tmp)
+            tmp.replace(target)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _delete_files(self, digest: str) -> None:
         self.image_path(digest).unlink(missing_ok=True)
@@ -198,15 +231,42 @@ class StickerBook:
             self._items.pop(worst.digest)
             self._delete_files(worst.digest)
 
-    def _load(self) -> None:
-        if not self.index_path.exists():
-            return
-        data = json.loads(self.index_path.read_text("utf-8"))
+    def _load(self) -> bool:
+        text: str | None = None
+        for attempt in range(3):
+            try:
+                text = self.index_path.read_text("utf-8")
+                break
+            except FileNotFoundError:
+                self._items = {}
+                return True
+            except OSError as e:
+                if attempt < 2:
+                    time.sleep(0.03)
+                    continue
+                log.warning("暂时无法读取表情包索引（%s），保留当前内存状态", e)
+                return False
+        if text is None:
+            return True
+        data = json.loads(text)
         self._items = {d["digest"]: Sticker(**d) for d in data.get("stickers", [])}
+        return True
 
     def _save(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        tmp = self.index_path.with_suffix(".tmp")
+        tmp = self.index_path.with_name(f"{self.index_path.name}.{uuid4().hex}.tmp")
         payload = {"stickers": [asdict(s) for s in self._items.values()]}
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(self.index_path)
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            for attempt in range(3):
+                try:
+                    tmp.replace(self.index_path)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.03)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        self._stamp = self.index_path.stat().st_mtime_ns

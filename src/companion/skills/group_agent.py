@@ -387,6 +387,7 @@ class GroupAgent(Skill):
         watcher: threading.Thread | None = None
         try:
             if ctx.stop_event and ctx.stop_event.is_set():
+                self._refund(ctx.channel, stamp)
                 return SkillResult("任务已停止。", ok=False, report=True)
             try:
                 folder.mkdir(parents=True, exist_ok=True)

@@ -82,9 +82,13 @@ class EventLog:
                     else:
                         kept.append(line)
                 if len(kept) != len(lines):
-                    tmp = path.with_suffix(".jsonl.tmp")
-                    tmp.write_text("".join(kept), encoding="utf-8", newline="")
-                    tmp.replace(path)
+                    tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+                    try:
+                        tmp.write_text("".join(kept), encoding="utf-8", newline="")
+                        tmp.replace(path)
+                    except BaseException:
+                        tmp.unlink(missing_ok=True)
+                        raise
         return removed
 
     def iter_events(self, since: datetime | None = None,

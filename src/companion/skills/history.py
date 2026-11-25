@@ -28,6 +28,7 @@ _DIGEST = re.compile(r"[0-9a-f]{6,20}")
 _MESSAGE = re.compile(r"[mM](\d+)(?:-(\d+))?")
 _DATE = re.compile(r"(?:(\d{4})-)?(\d{1,2})-(\d{1,2})")
 _DAYS = re.compile(r"(\d+)\s*天内")
+_HOURS = re.compile(r"(\d+)\s*小时内")
 _PAGE = re.compile(r"第\s*(\d+)\s*页")
 _CHAT = re.compile(r"(群|私聊)\s*(\d+)")
 
@@ -219,9 +220,11 @@ class _Query:
 
     @classmethod
     def parse(cls, parts: list[str], ctx: SkillContext) -> _Query:
-        query = cls(words=parts[0].lower().split() if parts else [])
+        query = cls(words=[])
         now = ctx.now or datetime.now(UTC)
-        for part in parts[1:]:
+        for part in parts:
+            if not part:
+                continue
             if part in ("图片", "图", "带图"):
                 query.images_only = True
             elif part in ("全部", "所有", "所有聊天"):
@@ -234,6 +237,8 @@ class _Query:
                 query.channel = part
             elif m := _DAYS.fullmatch(part):
                 query.since = now - timedelta(days=int(m.group(1)))
+            elif m := _HOURS.fullmatch(part):
+                query.since = now - timedelta(hours=int(m.group(1)))
             elif m := _PAGE.fullmatch(part):
                 query.page = max(int(m.group(1)), 1)
             elif m := _DATE.fullmatch(part):
@@ -243,7 +248,7 @@ class _Query:
                 except ValueError as e:
                     raise SkillError(f"日期不对：{part}") from e
                 query.since, query.until = local, local + timedelta(days=1)
-            elif part:
+            else:
                 query.words += part.lower().split()
         return query
 

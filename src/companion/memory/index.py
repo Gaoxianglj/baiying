@@ -160,6 +160,7 @@ class MemoryIndex:
         try:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA busy_timeout = 5000")
             self._ensure_schema()
         except BaseException:
             self._conn.close()
@@ -239,17 +240,22 @@ class MemoryIndex:
             self._index_text(c, "episode", ep.id, ep.summary)
 
     def get_episode(self, episode_id: str) -> Episode | None:
-        row = self._conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone()
-        return None if row is None else self._episode(row)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM episodes WHERE id = ?", (episode_id,)
+            ).fetchone()
+            return None if row is None else self._episode(row)
 
     def episodes_with(self, person_id: str, limit: int = 20) -> list[Episode]:
         """某人参与过的情景，新的在前。"""
-        rows = self._conn.execute(
-            "SELECT e.* FROM episodes e JOIN episode_people p ON p.episode_id = e.id "
-            "WHERE p.person_id = ? ORDER BY e.started_at DESC LIMIT ?",
-            (person_id, limit),
-        ).fetchall()
-        return [ep for r in rows if self.is_public(ep := self._episode(r))]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT e.* FROM episodes e JOIN episode_people p ON p.episode_id = e.id "
+                "WHERE p.person_id = ? ORDER BY e.started_at DESC LIMIT ?",
+                (person_id, limit),
+            ).fetchall()
+            episodes = [self._episode(r) for r in rows]
+        return [ep for ep in episodes if self.is_public(ep)]
 
     def set_episode_state(self, episode_id: str, state: EpisodeState) -> None:
         with self._tx() as c:
@@ -316,7 +322,8 @@ class MemoryIndex:
             self._index_text(c, "fact", fact.id, fact.statement)
 
     def get_fact(self, fact_id: str) -> Fact | None:
-        row = self._conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
         return None if row is None else _fact(row)
 
     def current_facts(self, subject: str, predicate: str | None = None) -> list[Fact]:
@@ -325,25 +332,28 @@ class MemoryIndex:
         if predicate is not None:
             sql += " AND predicate = ?"
             args.append(predicate)
-        rows = self._conn.execute(sql + " ORDER BY valid_from", args).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY valid_from", args).fetchall()
         return [fact for r in rows if self.is_public(fact := _fact(r))]
 
     def fact_history(self, subject: str, predicate: str) -> list[Fact]:
         """同一主题的全部事实（含已失效的），旧的在前：用来说出“你以前……后来……”。"""
-        rows = self._conn.execute(
-            "SELECT * FROM facts WHERE subject = ? AND predicate = ? ORDER BY valid_from",
-            (subject, predicate),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM facts WHERE subject = ? AND predicate = ? ORDER BY valid_from",
+                (subject, predicate),
+            ).fetchall()
         return [fact for r in rows if self.is_public(fact := _fact(r))]
 
     # ---- 强度 ----
 
     def strength(self, kind: MemoryKind, memory_id: str) -> Strength:
-        row = self._conn.execute(
-            f"SELECT stability_days, last_recalled_at, recall_count, pinned "
-            f"FROM {_table(kind)} WHERE id = ?",
-            (memory_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT stability_days, last_recalled_at, recall_count, pinned "
+                f"FROM {_table(kind)} WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(memory_id)
         return Strength(row[0], _dt(row[1]), row[2], bool(row[3]))
@@ -382,32 +392,34 @@ class MemoryIndex:
         for kind in kinds:
             _table(kind)  # 校验
         placeholders = ",".join("?" * len(kinds))
-        rows = self._conn.execute(
-            "SELECT f.kind, f.memory_id, -bm25(memory_fts) AS score FROM memory_fts f "
-            "LEFT JOIN episodes e ON f.kind = 'episode' AND e.id = f.memory_id "
-            "LEFT JOIN facts t ON f.kind = 'fact' AND t.id = f.memory_id "
-            f"WHERE memory_fts MATCH ? AND f.kind IN ({placeholders}) "
-            "AND ((f.kind = 'episode' AND e.state != 'dormant') "
-            "  OR (f.kind = 'fact' AND t.valid_to IS NULL)) "
-            "ORDER BY score DESC LIMIT ?",
-            (expr, *kinds, limit),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT f.kind, f.memory_id, -bm25(memory_fts) AS score FROM memory_fts f "
+                "LEFT JOIN episodes e ON f.kind = 'episode' AND e.id = f.memory_id "
+                "LEFT JOIN facts t ON f.kind = 'fact' AND t.id = f.memory_id "
+                f"WHERE memory_fts MATCH ? AND f.kind IN ({placeholders}) "
+                "AND ((f.kind = 'episode' AND e.state != 'dormant') "
+                "  OR (f.kind = 'fact' AND t.valid_to IS NULL)) "
+                "ORDER BY score DESC LIMIT ?",
+                (expr, *kinds, limit),
+            ).fetchall()
         return [TextHit(r[0], r[1], r[2]) for r in rows]
 
     # ---- 向量 ----
 
     def texts_needing_vectors(self, model: str) -> list[tuple[MemoryKind, str, str]]:
         """还没有用 `model` 算过向量的记忆：(kind, id, 文本)。"""
-        rows = self._conn.execute(
-            "SELECT 'episode', e.id, e.summary FROM episodes e "
-            "LEFT JOIN vectors v ON v.kind = 'episode' AND v.memory_id = e.id "
-            "WHERE v.model IS NULL OR v.model != ? "
-            "UNION ALL "
-            "SELECT 'fact', f.id, f.statement FROM facts f "
-            "LEFT JOIN vectors v ON v.kind = 'fact' AND v.memory_id = f.id "
-            "WHERE v.model IS NULL OR v.model != ?",
-            (model, model),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT 'episode', e.id, e.summary FROM episodes e "
+                "LEFT JOIN vectors v ON v.kind = 'episode' AND v.memory_id = e.id "
+                "WHERE v.model IS NULL OR v.model != ? "
+                "UNION ALL "
+                "SELECT 'fact', f.id, f.statement FROM facts f "
+                "LEFT JOIN vectors v ON v.kind = 'fact' AND v.memory_id = f.id "
+                "WHERE v.model IS NULL OR v.model != ?",
+                (model, model),
+            ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
     def put_vectors(
@@ -428,14 +440,15 @@ class MemoryIndex:
         self, model: str, allowed: set[tuple[MemoryKind, str]] | None = None
     ) -> tuple[list[tuple[MemoryKind, str]], np.ndarray]:
         """可检索记忆（有效事实、未沉睡情景）的向量。`allowed` 进一步限定范围。"""
-        rows = self._conn.execute(
-            "SELECT v.kind, v.memory_id, v.vec FROM vectors v "
-            "LEFT JOIN episodes e ON v.kind = 'episode' AND e.id = v.memory_id "
-            "LEFT JOIN facts f ON v.kind = 'fact' AND f.id = v.memory_id "
-            "WHERE v.model = ? AND ((v.kind = 'episode' AND e.state != 'dormant') "
-            "  OR (v.kind = 'fact' AND f.valid_to IS NULL))",
-            (model,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT v.kind, v.memory_id, v.vec FROM vectors v "
+                "LEFT JOIN episodes e ON v.kind = 'episode' AND e.id = v.memory_id "
+                "LEFT JOIN facts f ON v.kind = 'fact' AND f.id = v.memory_id "
+                "WHERE v.model = ? AND ((v.kind = 'episode' AND e.state != 'dormant') "
+                "  OR (v.kind = 'fact' AND f.valid_to IS NULL))",
+                (model,),
+            ).fetchall()
         keys: list[tuple[MemoryKind, str]] = []
         vecs: list[np.ndarray] = []
         for kind, mid, blob in rows:
@@ -478,25 +491,28 @@ class MemoryIndex:
         fact_sql = "SELECT id FROM facts" + (
             " WHERE " + " AND ".join(fact_where) if fact_where else ""
         )
-        keys: set[tuple[MemoryKind, str]] = {
-            ("episode", r[0]) for r in self._conn.execute(ep_sql, ep_args)
-        }
-        keys |= {("fact", r[0]) for r in self._conn.execute(fact_sql, fact_args)}
+        with self._lock:
+            keys: set[tuple[MemoryKind, str]] = {
+                ("episode", r[0]) for r in self._conn.execute(ep_sql, ep_args).fetchall()
+            }
+            keys |= {("fact", r[0]) for r in self._conn.execute(fact_sql, fact_args).fetchall()}
         return keys
 
     def importance(self, kind: MemoryKind, memory_id: str) -> float:
-        row = self._conn.execute(
-            f"SELECT importance FROM {_table(kind)} WHERE id = ?", (memory_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT importance FROM {_table(kind)} WHERE id = ?", (memory_id,)
+            ).fetchone()
         if row is None:
             raise KeyError(memory_id)
         return float(row[0])
 
     def text_of(self, kind: MemoryKind, memory_id: str) -> str:
         column = "summary" if kind == "episode" else "statement"
-        row = self._conn.execute(
-            f"SELECT {column} FROM {_table(kind)} WHERE id = ?", (memory_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {column} FROM {_table(kind)} WHERE id = ?", (memory_id,)
+            ).fetchone()
         if row is None:
             raise KeyError(memory_id)
         return str(row[0])
@@ -521,33 +537,44 @@ class MemoryIndex:
     def memories_from_events(self, event_ids: set[str]) -> list[tuple[MemoryKind, str]]:
         """出处里含有这些事件的记忆。"""
         out: list[tuple[MemoryKind, str]] = []
-        for kind in ("episode", "fact"):
-            for mid, raw in self._conn.execute(f"SELECT id, event_ids FROM {_table(kind)}"):
-                if event_ids & set(json.loads(raw)):
-                    out.append((kind, mid))  # type: ignore[arg-type]
+        with self._lock:
+            for kind in ("episode", "fact"):
+                for mid, raw in self._conn.execute(
+                    f"SELECT id, event_ids FROM {_table(kind)}"
+                ).fetchall():
+                    if event_ids & set(json.loads(raw)):
+                        out.append((kind, mid))  # type: ignore[arg-type]
         return out
 
     def episodes_created_since(self, since: datetime) -> list[Episode]:
-        rows = self._conn.execute(
-            "SELECT * FROM episodes WHERE created_at >= ? ORDER BY started_at", (_iso(since),)
-        ).fetchall()
-        return [ep for r in rows if self.is_public(ep := self._episode(r))]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM episodes WHERE created_at >= ? ORDER BY started_at", (_iso(since),)
+            ).fetchall()
+            episodes = [self._episode(r) for r in rows]
+        return [ep for ep in episodes if self.is_public(ep)]
 
     def episodes_started_since(self, since: datetime) -> list[Episode]:
-        rows = self._conn.execute(
-            "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (_iso(since),)
-        ).fetchall()
-        return [ep for r in rows if self.is_public(ep := self._episode(r))]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM episodes WHERE started_at >= ? ORDER BY started_at", (_iso(since),)
+            ).fetchall()
+            episodes = [self._episode(r) for r in rows]
+        return [ep for ep in episodes if self.is_public(ep)]
 
     def facts_created_since(self, since: datetime) -> list[Fact]:
-        rows = self._conn.execute(
-            "SELECT * FROM facts WHERE created_at >= ? ORDER BY valid_from", (_iso(since),)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM facts WHERE created_at >= ? ORDER BY valid_from", (_iso(since),)
+            ).fetchall()
         return [fact for r in rows if self.is_public(fact := _fact(r))]
 
     def episode_ids(self, states: tuple[EpisodeState, ...]) -> list[str]:
         marks = ",".join("?" * len(states))
-        rows = self._conn.execute(f"SELECT id FROM episodes WHERE state IN ({marks})", states)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id FROM episodes WHERE state IN ({marks})", states
+            ).fetchall()
         return [r[0] for r in rows]
 
     def supersede(self, old_id: str, new_id: str, at: datetime) -> None:
@@ -562,19 +589,23 @@ class MemoryIndex:
             raise MemoryIndexError(f"要取代的事实不存在或已失效：{old_id}")
 
     def counts(self) -> dict[str, int]:
-        c = self._conn
-        return {
-            "episodes": c.execute("SELECT COUNT(*) FROM episodes").fetchone()[0],
-            "facts": c.execute("SELECT COUNT(*) FROM facts WHERE valid_to IS NULL").fetchone()[0],
-            "superseded_facts": c.execute(
-                "SELECT COUNT(*) FROM facts WHERE valid_to IS NOT NULL"
-            ).fetchone()[0],
-        }
+        with self._lock:
+            c = self._conn
+            return {
+                "episodes": c.execute("SELECT COUNT(*) FROM episodes").fetchone()[0],
+                "facts": c.execute("SELECT COUNT(*) FROM facts WHERE valid_to IS NULL").fetchone()[
+                    0
+                ],
+                "superseded_facts": c.execute(
+                    "SELECT COUNT(*) FROM facts WHERE valid_to IS NOT NULL"
+                ).fetchone()[0],
+            }
 
     # ---- 元数据（如抽取进度）----
 
     def get_meta(self, key: str) -> str | None:
-        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
     def set_meta(self, key: str, value: str) -> None:

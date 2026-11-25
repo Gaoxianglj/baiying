@@ -228,21 +228,28 @@ class ModelGateway:
         if self.subscription is None:
             return False
         now = now or datetime.now(UTC)
+        need_check = False
         with self._lock:
             if self._paused_until and now < self._paused_until:
                 return False
             if self._limits_checked_at is None or now - self._limits_checked_at > RATE_LIMIT_CACHE:
                 self._limits_checked_at = now
-                try:
-                    limits = self.subscription.read_rate_limits()
-                except ModelError as e:
-                    log.warning("读取订阅额度失败：%s", e)
-                    return True  # 读不到额度也先试着用，失败会触发暂停
-                if limits.max_used_percent() >= self.switch_at:
-                    self._paused_until = limits.reset_time(self.switch_at) or now + DEFAULT_COOLDOWN
-                    log.info("订阅额度已用到阈值，暂停至 %s", self._paused_until)
-                    return False
+                need_check = True
+        if not need_check:
             return True
+        try:
+            limits = self.subscription.read_rate_limits()
+        except ModelError as e:
+            log.warning("读取订阅额度失败：%s", e)
+            return True  # 读不到额度也先试着用，失败会触发暂停
+        if limits.max_used_percent() >= self.switch_at:
+            reset = limits.reset_time(self.switch_at)
+            paused_until = reset if reset and reset > now else now + DEFAULT_COOLDOWN
+            with self._lock:
+                self._paused_until = paused_until
+            log.info("订阅额度已用到阈值，暂停至 %s", paused_until)
+            return False
+        return True
 
     def _pause_subscription(self, now: datetime | None) -> None:
         now = now or datetime.now(UTC)

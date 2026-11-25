@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -90,26 +91,65 @@ class PeopleRegistry:
         self._lock = threading.RLock()
         self._people: dict[str, Person] = {}
         self._index: dict[tuple[str, str], str] = {}
+        self._sig: tuple[tuple[str, int, int], ...] = ()
         self.reload()
+
+    def _dir_sig(self) -> tuple[tuple[str, int, int], ...]:
+        if not self._layout.people_dir.exists():
+            return ()
+        sig: list[tuple[str, int, int]] = []
+        for path in sorted(self._layout.people_dir.glob("*.md")):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            sig.append((path.name, st.st_mtime_ns, st.st_size))
+        return tuple(sig)
+
+    def _reload_if_changed(self) -> None:
+        if self._dir_sig() != self._sig:
+            self.reload()
 
     def reload(self) -> None:
         with self._lock:
-            self._people.clear()
-            for path in sorted(self._layout.people_dir.glob("*.md")):
-                person = parse_person(path.read_text("utf-8"))
-                if person.person_id != path.stem:
-                    raise PeopleError(f"{path.name} 里的 person_id 与文件名不一致")
-                self._people[person.person_id] = person
-            self._rebuild_index()
+            people: dict[str, Person] = {}
+            sig: list[tuple[str, int, int]] = []
+            if self._layout.people_dir.exists():
+                for path in sorted(self._layout.people_dir.glob("*.md")):
+                    text = _read_text_retry(path)
+                    if text is None:
+                        continue
+                    person = parse_person(text)
+                    if person.person_id != path.stem:
+                        raise PeopleError(f"{path.name} 里的 person_id 与文件名不一致")
+                    people[person.person_id] = person
+                    try:
+                        st = path.stat()
+                        sig.append((path.name, st.st_mtime_ns, st.st_size))
+                    except OSError:
+                        pass
+            index = self._build_index(people)
+            self._people = people
+            self._index = index
+            self._sig = tuple(sig)
 
     def get(self, person_id: str) -> Person | None:
-        return self._people.get(self.canonical(person_id))
+        with self._lock:
+            self._reload_if_changed()
+            return self._people.get(self._canonical_locked(person_id))
 
     def list(self) -> list[Person]:
-        return [p for p in self._people.values() if not p.merged_into]
+        with self._lock:
+            self._reload_if_changed()
+            return [p for p in self._people.values() if not p.merged_into]
 
     def canonical(self, person_id: str) -> str:
         """沿 merged_into 找到当前的人。"""
+        with self._lock:
+            self._reload_if_changed()
+            return self._canonical_locked(person_id)
+
+    def _canonical_locked(self, person_id: str) -> str:
         for _ in range(_MAX_MERGE_DEPTH):
             person = self._people.get(person_id)
             if person is None or not person.merged_into:
@@ -118,12 +158,15 @@ class PeopleRegistry:
         raise PeopleError(f"merged_into 出现循环：{person_id}")
 
     def resolve(self, platform: str, account: str) -> str | None:
-        return self._index.get((platform, account))
+        with self._lock:
+            self._reload_if_changed()
+            return self._index.get((platform, account))
 
     def ensure(self, platform: str, account: str, display_name: str | None = None) -> str:
         """返回账号对应的人；陌生账号自动建档。见到新昵称时记进 names。"""
         with self._lock:
-            person_id = self.resolve(platform, account)
+            self._reload_if_changed()
+            person_id = self._index.get((platform, account))
             if person_id is None:
                 person = self._new_person(None, display_name or account)
                 person.accounts[platform] = [account]
@@ -138,6 +181,7 @@ class PeopleRegistry:
 
     def create(self, person_id: str, name: str) -> Person:
         with self._lock:
+            self._reload_if_changed()
             person = self._new_person(person_id, name)
             self._save(person)
             return person
@@ -145,10 +189,11 @@ class PeopleRegistry:
     def bind(self, platform: str, account: str, person_id: str) -> None:
         """把账号绑到某人（显式确认）。原持有者若因此没有任何账号，就并入目标。"""
         with self._lock:
+            self._reload_if_changed()
             target = self._people.get(person_id)
             if target is None or target.merged_into:
                 raise PeopleError(f"没有这个人：{person_id}")
-            previous_id = self.resolve(platform, account)
+            previous_id = self._index.get((platform, account))
             if previous_id == person_id:
                 return
             if previous_id is not None:
@@ -172,7 +217,8 @@ class PeopleRegistry:
         if familiarity not in FAMILIARITY_LEVELS:
             raise PeopleError(f"熟络度只能是 {'/'.join(FAMILIARITY_LEVELS)}：{familiarity}")
         with self._lock:
-            target = self.get(person_id)
+            self._reload_if_changed()
+            target = self._people.get(self._canonical_locked(person_id))
             if target is None or target.merged_into:
                 raise PeopleError(f"没有这个人：{person_id}")
             target.familiarity = familiarity
@@ -198,12 +244,25 @@ class PeopleRegistry:
     def _save(self, person: Person) -> None:
         self._layout.people_dir.mkdir(parents=True, exist_ok=True)
         path = self._layout.person_path(person.person_id)
-        path.write_text(dump_person(person), encoding="utf-8", newline="\n")
+        tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+        try:
+            tmp.write_text(dump_person(person), encoding="utf-8", newline="\n")
+            _replace_retry(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         self._people[person.person_id] = person
+        self._sig = self._dir_sig()
 
     def _rebuild_index(self) -> None:
+        self._index = self._build_index(self._people)
+
+    @staticmethod
+    def _build_index(people: dict[str, Person]) -> dict[tuple[str, str], str]:
         index: dict[tuple[str, str], str] = {}
-        for person in self.list():
+        for person in people.values():
+            if person.merged_into:
+                continue
             for platform, accounts in person.accounts.items():
                 for account in accounts:
                     key = (platform, account)
@@ -212,4 +271,28 @@ class PeopleRegistry:
                             f"账号 {platform}:{account} 同时属于 {index[key]} 和 {person.person_id}"
                         )
                     index[key] = person.person_id
-        self._index = index
+        return index
+
+
+def _read_text_retry(path: Any, retries: int = 3) -> str | None:
+    for attempt in range(retries):
+        try:
+            return path.read_text("utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.03)
+    return None
+
+
+def _replace_retry(src: Any, dst: Any, retries: int = 3) -> None:
+    for attempt in range(retries):
+        try:
+            src.replace(dst)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.03)

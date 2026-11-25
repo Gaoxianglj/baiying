@@ -173,12 +173,21 @@ class Skills:
         stable, dynamic = self.prompt_parts(ctx)
         return "\n".join([stable, *dynamic]) if stable else None
 
+    @staticmethod
+    def _marker_lines(skills: list[Skill], ctx: SkillContext | None) -> list[str]:
+        """按标记名去重（后者覆盖前者，与 find() 的路由优先级一致）。"""
+        by_marker: dict[str, str] = {}
+        for s in skills:
+            for marker, usage in s.markers_for(ctx).items():
+                by_marker[marker] = f"- {usage}"
+        return list(by_marker.values())
+
     def prompt_parts(self, ctx: SkillContext | None) -> tuple[str, list[str]]:
         """工具说明按版本复用，任务/群/文件夹等实时状态每轮刷新。"""
         skills = self.available(ctx)
         if not skills:
             return "", []
-        lines = [f"- {usage}" for s in skills for usage in s.markers_for(ctx).values()]
+        lines = self._marker_lines(skills, ctx)
         notes = [note for s in skills if (note := s.context(ctx))]
         return self._usage(lines), notes
 
@@ -189,7 +198,7 @@ class Skills:
         channel_skills = self.channel_available(ctx)
         if not channel_skills:
             return "", []
-        lines = [f"- {usage}" for s in channel_skills for usage in s.markers_for(ctx).values()]
+        lines = self._marker_lines(channel_skills, ctx)
         active_skills = self.available(ctx)
         notes = [
             (s.name or f"skill_{i}", note)

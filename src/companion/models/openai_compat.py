@@ -124,8 +124,13 @@ class OpenAICompatClient:
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
         data = self._post("/embeddings", {"model": self.model, "input": texts})
-        rows = sorted(data["data"], key=lambda d: d["index"])
-        matrix = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
+        try:
+            rows = sorted(data["data"], key=lambda d: d["index"])
+            matrix = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
+        except (KeyError, TypeError, ValueError) as e:
+            raise ModelError(f"{self.name} 向量返回格式异常：{str(data)[:200]}") from e
+        if matrix.ndim != 2 or len(matrix) != len(texts):
+            raise ModelError(f"{self.name} 向量条数或维度异常：{matrix.shape}")
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         return matrix / np.where(norms == 0, 1, norms)
 
@@ -140,4 +145,14 @@ class OpenAICompatClient:
             raise ModelError(
                 f"{self.name} 返回 HTTP {resp.status_code}：{resp.text[:200]}", retryable=retryable
             )
-        return resp.json()
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise ModelError(
+                f"{self.name} 返回了非 JSON 响应：{resp.text[:200]}", retryable=True
+            ) from e
+        if not isinstance(data, dict):
+            raise ModelError(
+                f"{self.name} 返回了异常 JSON 结构：{str(data)[:200]}", retryable=True
+            )
+        return data

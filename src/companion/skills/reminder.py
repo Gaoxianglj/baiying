@@ -18,7 +18,9 @@ import zlib
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from time import sleep
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from uuid import uuid4
 
 from companion.config import RemindersSkillConfig
 from companion.memory.people import familiarity_rank
@@ -285,19 +287,36 @@ class PromiseBook:
         self._stamp: int | None = None
         self._reload_if_changed()
 
-    def _load(self) -> None:
+    def _load(self) -> bool:
+        text: str | None = None
+        for attempt in range(3):
+            try:
+                text = self.path.read_text("utf-8")
+                break
+            except FileNotFoundError:
+                return True
+            except OSError as e:
+                if attempt < 2:
+                    sleep(0.05)
+                    continue
+                log.warning("暂时无法读取约定文件（%s），保留当前内存状态", e)
+                return False
+        if text is None:
+            return True
         try:
-            raw = json.loads(self.path.read_text("utf-8"))
+            raw = json.loads(text)
             items = [_from_json(x) for x in raw["items"]]
             self._next_id = int(raw["next_id"])
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError, KeyError, TypeError) as e:
+        except (ValueError, KeyError, TypeError) as e:
             backup = self.path.with_suffix(".bad.json")
             log.error("约定文件读不懂（%s），已改名为 %s", e, backup.name)
-            self.path.replace(backup)
-            return
+            try:
+                self.path.replace(backup)
+            except OSError:
+                log.warning("无法备份损坏的约定文件 %s", self.path.name)
+            return True
         self._items = {r.id: r for r in items}
+        return True
 
     def _save(self) -> None:
         data = {
@@ -305,9 +324,20 @@ class PromiseBook:
             "items": [_to_json(r) for r in self._items.values()],
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
-        tmp.replace(self.path)
+        tmp = self.path.with_name(f"{self.path.name}.{uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", "utf-8")
+            for attempt in range(3):
+                try:
+                    tmp.replace(self.path)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    sleep(0.03)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         self._stamp = self.path.stat().st_mtime_ns
 
     def add(
@@ -434,8 +464,8 @@ class PromiseBook:
         except OSError:
             return
         if stamp != self._stamp:
-            self._stamp = stamp
-            self._load()
+            if self._load():
+                self._stamp = stamp
 
     def pending(self, channel: str | None = None) -> list[Promise]:
         with self._lock:

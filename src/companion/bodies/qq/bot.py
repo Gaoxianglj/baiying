@@ -140,8 +140,8 @@ class _Pending:
 
     @property
     def mode(self) -> str:
-        """交给 Companion 的回复模式：required 一般要回；optional 可沉默；strict 更倾向沉默。"""
-        return {"required": "required", "partner": "optional", "chime": "optional"}.get(
+        """交给 Companion 的回复模式：required 要回；optional/chime 可沉默；strict 更倾向沉默。"""
+        return {"required": "required", "partner": "optional", "chime": "chime"}.get(
             self.kind, "strict"
         )
 
@@ -203,6 +203,7 @@ class QQBot:
         self._pending: dict[str, _Pending] = {}
         self._jobs: set[asyncio.Task[None]] = set()
         self._task_reporting: set[str] = set()
+        self._backfill_live_sets: list[set[str]] = []
         self._approvals: dict[str, list[Any]] = {}  # 审批码 → [threading.Event, 是否批准]
         self._bot_rounds: dict[str, int] = {}  # 频道 → 和别的机器人连着聊了几轮
         self._bot_paused_until: dict[str, datetime] = {}
@@ -228,6 +229,9 @@ class QQBot:
     async def _task_notification_loop(self, every: float = 15.0) -> None:
         while True:
             await asyncio.sleep(every)
+            connected = getattr(self.client, "connected", None)
+            if connected is not None and not connected.is_set():
+                continue
             try:
                 pending = self.c.tasks.pending_notifications()
             except (OSError, ValueError, KeyError):
@@ -252,9 +256,12 @@ class QQBot:
                     f"任务 {row['id']}：{LABELS[row['state']]}。\n"
                     + (row["result"] or row["progress"])[:2000]
                 )
-                await self._send_task_result(
-                    src, row["id"], text, [Path(p) for p in row.get("files", [])]
-                )
+                try:
+                    await self._send_task_result(
+                        src, row["id"], text, [Path(p) for p in row.get("files", [])]
+                    )
+                except Exception:
+                    log.exception("发送任务 %s 通知失败，稍后重试", row["id"])
 
     # ---- 约定与提醒 ----
 
@@ -400,6 +407,9 @@ class QQBot:
                 log.exception("主动找主人 / 自主活动出错")
 
     async def life_tick(self) -> None:
+        connected = getattr(self.client, "connected", None)
+        if connected is not None and not connected.is_set():
+            return
         now = self.now()
         owner = await self._owner()
         if owner is not None and self._can_send():
@@ -446,15 +456,17 @@ class QQBot:
         src = Source("private", account, "", "", None, Incoming(text=""))
         return src, pid
 
-    async def _send_proactive(self, src: Source, reply: Reply, images: list[Path]) -> None:
+    async def _send_proactive(self, src: Source, reply: Reply, images: list[Path]) -> bool:
         self._sent_times.append(self.now())
-        if reply.text.strip():
-            await self._send_reply(src, reply.text)
+        if reply.text.strip() and not await self._send_reply(src, reply.text):
+            log.warning("主动发送给 %s 失败", src.channel)
+            return False
         await self._do_actions(src, reply.actions, None)
         for path in images:
             await self._send_image(src, path)
         if reply.sticker is not None:
             await self._send_sticker(src, reply.sticker.digest)
+        return True
 
     async def _maintenance(self, every: float = 300.0) -> None:
         """定时整理已结束的会话；每天到点做一次“睡眠”；确保今天有安排。"""
@@ -495,9 +507,18 @@ class QQBot:
         if post_type == "meta_event":
             if ev.get("meta_event_type") == "lifecycle" and ev.get("self_id"):
                 self.self_id = str(ev["self_id"])
-                await self._announce_groups()
-                if self.cfg.backfill:  # 每次连上都补一次离线期间的群消息（按消息编号去重）
-                    self._spawn(self.backfill())
+                live_events: set[str] | None = None
+                if self.cfg.backfill:
+                    live_events = set()
+                    self._backfill_live_sets.append(live_events)
+                try:
+                    await self._announce_groups()
+                except BaseException:
+                    if live_events is not None and live_events in self._backfill_live_sets:
+                        self._backfill_live_sets.remove(live_events)
+                    raise
+                if live_events is not None:  # 每次连上都补一次离线期间的群消息（按消息编号去重）
+                    self._spawn(self._run_connect_backfill(live_events))
             return
         if post_type == "notice":
             await self._notice(ev)
@@ -562,6 +583,8 @@ class QQBot:
             now=src.received_at,
             meta=meta,
         )
+        for live_set in self._backfill_live_sets:
+            live_set.add(event.id)
 
         if bot_paused:  # 和别的机器人聊太久了，先只听不回
             return
@@ -724,6 +747,42 @@ class QQBot:
                 break
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _make_skill_ctx(
+        self,
+        src: Source,
+        person_id: str,
+        *,
+        is_owner: bool | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> SkillContext:
+        active_loop = loop or asyncio.get_running_loop()
+        owner = (src.user_id in self.cfg.owner_accounts) if is_owner is None else is_owner
+
+        def interim(text: str) -> None:
+            """她用技能前先说的话（如“我查一下”）、后台任务的进度：从别的线程里立刻发出去。"""
+            asyncio.run_coroutine_threadsafe(self._send(src, text), active_loop).result(timeout=30)
+
+        return SkillContext(
+            body="qq",
+            channel=src.channel,
+            person_id=person_id,
+            private=src.message_type == "private",
+            owner=owner,
+            now=src.received_at,
+            notify=interim,
+            ask=lambda question: self._ask_owner(src, question, active_loop),
+            fetch_images=lambda message_id: asyncio.run_coroutine_threadsafe(
+                self._message_images(message_id), active_loop
+            ).result(timeout=90),
+            fetch_files=(
+                lambda query: asyncio.run_coroutine_threadsafe(
+                    self._group_files(src, query), active_loop
+                ).result(timeout=60)
+            )
+            if src.message_type == "group"
+            else None,
+        )
+
     async def _reply_batch(self, pending: _Pending) -> None:
         src = pending.primary_source
         primary_event = pending.primary_event
@@ -732,32 +791,7 @@ class QQBot:
         if not owner_private and not self._can_send():
             log.warning("发言过于频繁，这一轮只记录不回复")
             return
-        loop = asyncio.get_running_loop()
-
-        def interim(text: str) -> None:
-            """她用技能前先说的话（如“我查一下”）、后台任务的进度：从别的线程里立刻发出去。"""
-            asyncio.run_coroutine_threadsafe(self._send(src, text), loop).result(timeout=30)
-
-        ctx = SkillContext(
-            body="qq",
-            channel=src.channel,
-            person_id=primary_event.actor.person_id or "",
-            private=src.message_type == "private",
-            owner=src.user_id in self.cfg.owner_accounts,
-            now=src.received_at,
-            notify=interim,
-            ask=lambda question: self._ask_owner(src, question, loop),
-            fetch_images=lambda message_id: asyncio.run_coroutine_threadsafe(
-                self._message_images(message_id), loop
-            ).result(timeout=90),
-            fetch_files=(
-                lambda query: asyncio.run_coroutine_threadsafe(
-                    self._group_files(src, query), loop
-                ).result(timeout=60)
-            )
-            if src.message_type == "group"
-            else None,
-        )
+        ctx = self._make_skill_ctx(src, primary_event.actor.person_id or "")
         try:
             reply = await self._call(
                 self.c.respond,
@@ -765,7 +799,7 @@ class QQBot:
                 mode=pending.mode,
                 batch=pending.events,
                 skill_ctx=ctx,
-                on_interim=interim,
+                on_interim=ctx.notify,
             )
         except ModelError as e:
             log.error("生成回复失败：%s", e)
@@ -803,7 +837,7 @@ class QQBot:
         )
         partners = self._partners.setdefault(src.channel, {})
         for s in pending.sources:
-            if self._addressed(s) or pending.kind == "partner":
+            if self._addressed(s) or (pending.kind == "partner" and s is pending.primary_source):
                 partners[s.user_id] = self.now()
         if any(s.user_id in self.cfg.peer_bots for s in pending.sources):
             self._count_bot_round(src.channel)
@@ -1048,7 +1082,7 @@ class QQBot:
             try:
                 params = {"message_id": int(message_id), "emoji_id": emoji, "set": True}
                 await self.client.call("set_msg_emoji_like", params)
-            except (OneBotError, ValueError) as e:
+            except (OneBotError, ValueError, TimeoutError) as e:
                 log.info("表情回应失败：%s", e)
         if actions.poke and self.cfg.poke:
             await self._poke(src)
@@ -1059,7 +1093,7 @@ class QQBot:
             params["group_id"] = src.group_id
         try:
             await self.client.call("send_poke", params)
-        except OneBotError as e:
+        except (OneBotError, TimeoutError) as e:
             log.info("戳一戳失败：%s", e)
             return
         self._last_poke[src.channel] = self.now()
@@ -1171,12 +1205,19 @@ class QQBot:
 
     # ---- 补上离线期间的群消息 ----
 
-    async def backfill(self) -> int:
+    async def _run_connect_backfill(self, live_events: set[str]) -> None:
+        try:
+            await self.backfill(ignore_last_events=live_events)
+        finally:
+            if live_events in self._backfill_live_sets:
+                self._backfill_live_sets.remove(live_events)
+
+    async def backfill(self, *, ignore_last_events: set[str] | None = None) -> int:
         """把服务没开时群里的消息补记进来（只记不回）；返回补了几条。"""
         total = 0
         for gid in self.cfg.groups:
             try:
-                n = await self._backfill_group(gid)
+                n = await self._backfill_group(gid, ignore_last_events=ignore_last_events)
             except (OneBotError, TimeoutError) as e:
                 log.warning("补群 %s 的消息失败：%s", gid, e)
                 continue
@@ -1185,20 +1226,24 @@ class QQBot:
             total += n
         return total
 
-    async def _backfill_group(self, gid: str) -> int:
+    async def _backfill_group(
+        self, gid: str, *, ignore_last_events: set[str] | None = None
+    ) -> int:
         channel = f"group:{gid}"
         since = self.now() - timedelta(hours=self.cfg.backfill_hours)
-        last, known = await self._call(self._channel_tail, channel, since)
+        last, known = await self._call(
+            self._channel_tail, channel, since, ignore_last_events
+        )
         params = {"group_id": gid, "message_seq": 0, "count": self.cfg.backfill_max}
         data = await self.client.call("get_group_msg_history", params, timeout=60)
         messages = (data or {}).get("messages") or [] if isinstance(data, dict) else []
         added = 0
         for m in sorted(messages, key=lambda x: x.get("time") or 0):
             uid, mid = str(m.get("user_id") or ""), str(m.get("message_id") or "")
-            if not m.get("time") or uid in ("", self.self_id) or mid in known:
+            if not m.get("time") or uid in ("", self.self_id) or (mid and mid in known):
                 continue
             ts = datetime.fromtimestamp(m["time"], UTC)
-            if ts < since or (last is not None and ts <= last):
+            if ts < since or (last is not None and ts < last):
                 continue
             text = self._offline_text(parse_segments(m.get("message"), self.self_id))
             if not text:
@@ -1209,6 +1254,8 @@ class QQBot:
                 self.c.observe, body="qq", channel=channel, account=uid, text=text,
                 display_name=name, now=ts, meta={"message_id": mid, "backfill": True},
             )  # fmt: skip
+            if mid:
+                known.add(mid)
             added += 1
         return added
 
@@ -1220,7 +1267,12 @@ class QQBot:
         files = [self.inbox.skipped(r.name, r.size, "没收") for r in inc.files]
         return inc.fill(images, forwards, files, "[语音（没听）]").strip()
 
-    def _channel_tail(self, channel: str, since: datetime) -> tuple[datetime | None, set[str]]:
+    def _channel_tail(
+        self,
+        channel: str,
+        since: datetime,
+        ignore_last_events: set[str] | None = None,
+    ) -> tuple[datetime | None, set[str]]:
         """（在工作线程里）这个频道最后一条记录的时间，以及最近记过的消息编号。"""
         last: datetime | None = None
         known: set[str] = set()
@@ -1229,7 +1281,11 @@ class QQBot:
                 continue
             if e.meta.get("message_id"):
                 known.add(str(e.meta["message_id"]))
-            if e.actor.person_id != SELF_ID and (last is None or e.ts > last):
+            if (
+                e.actor.person_id != SELF_ID
+                and (ignore_last_events is None or e.id not in ignore_last_events)
+                and (last is None or e.ts > last)
+            ):
                 last = e.ts
         return last, known
 
@@ -1436,7 +1492,7 @@ class QQBot:
             if ref.sticker and src is not None:
                 pid = await self._call(self.c.people.ensure, "qq", src.user_id, src.name)
             return await self._call(self.c.look, data, sticker=ref.sticker, person_id=pid)
-        except (MediaError, ModelError, OneBotError, OSError) as e:
+        except (MediaError, ModelError, OneBotError, OSError, TimeoutError) as e:
             log.warning("看图失败：%s", e)
             return None, None
 
@@ -1465,14 +1521,14 @@ class QQBot:
         for ref in parse_segments(msg.get("message"), self.self_id).images:
             try:
                 out.append(await self._download(ref))
-            except (MediaError, OneBotError, OSError) as e:
+            except (MediaError, OneBotError, OSError, TimeoutError) as e:
                 log.info("取消息 %s 的图片失败：%s", message_id, e)
         return out
 
     async def _get_message(self, message_id: str) -> dict[str, Any] | None:
         try:
             msg = await self.client.call("get_msg", {"message_id": int(message_id)})
-        except (OneBotError, ValueError) as e:
+        except (OneBotError, ValueError, TimeoutError) as e:
             log.warning("取被引用的消息失败：%s", e)
             return None
         return msg if isinstance(msg, dict) else None
@@ -1567,7 +1623,7 @@ class QQBot:
                 data = await self.client.call(
                     "send_group_msg", {"group_id": int(gid), "message": text_segments(text)}
                 )
-            except OneBotError as e:
+            except (OneBotError, TimeoutError) as e:
                 log.error("向群 %s 发送说明失败：%s", gid, e)
                 continue
             if isinstance(data, dict) and data.get("message_id") is not None:
@@ -1621,7 +1677,7 @@ class QQBot:
                     "send_private_msg",
                     {"user_id": int(owner), "message": text_segments(text)},
                 )
-            except OneBotError as e:
+            except (OneBotError, TimeoutError) as e:
                 log.error("通知主人失败：%s", e)
 
     # ---- 指令 ----
@@ -1995,7 +2051,7 @@ class QQBot:
             entry[0].set()
             await self._send(src, "好，批准了。" if cmd == "批准" else "好，拒绝了。")
         elif cmd in {"任务", "任务状态", "继续任务", "停止任务", "追加任务", "压缩任务"}:
-            ctx = SkillContext("qq", src.channel, pid, src.message_type == "private", is_owner)
+            ctx = self._make_skill_ctx(src, pid, is_owner=is_owner)
             control = next(s for s in self.c.skills.all if isinstance(s, TaskControl))
             try:
                 if cmd == "追加任务" and "｜" not in arg and "|" not in arg:
