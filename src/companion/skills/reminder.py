@@ -351,6 +351,8 @@ class PromiseBook:
         repeat: Any = _UNSET,
         kind: PromiseKind | None = None,
         notify: NotifyMode | None = None,
+        actor_person_id: str | None = None,
+        allow_others: bool = False,
         owner_override: bool = False,
     ) -> Promise | None:
         with self._lock:
@@ -358,8 +360,22 @@ class PromiseBook:
             promise = self._items.get(promise_id)
             if promise is None:
                 return None
-            if not owner_override and promise.channel != channel:
-                return None
+            if not owner_override:
+                if promise.channel != channel:
+                    if not (
+                        channel.startswith("private:")
+                        and actor_person_id is not None
+                        and promise.person_id == actor_person_id
+                        and promise.kind == "ongoing"
+                    ):
+                        return None
+                elif (
+                    channel.startswith("group:")
+                    and not allow_others
+                    and actor_person_id is not None
+                    and promise.person_id != actor_person_id
+                ):
+                    return None
             if what is not None:
                 promise.what = what
             if kind is not None:
@@ -378,16 +394,36 @@ class PromiseBook:
             return promise
 
     def cancel(
-        self, channel: str, promise_id: int, *, owner_override: bool = False
+        self,
+        channel: str,
+        promise_id: int,
+        *,
+        actor_person_id: str | None = None,
+        allow_others: bool = False,
+        owner_override: bool = False,
     ) -> Promise | None:
-        """只能解除同一个聊天里的约定（主人控制台或全局维护可显式 override）。"""
+        """只能解除自己有权管理的约定（群聊限创建者或主人；私聊可解自己跨频道的持续约定）。"""
         with self._lock:
             self._reload_if_changed()
             promise = self._items.get(promise_id)
             if promise is None:
                 return None
-            if not owner_override and promise.channel != channel:
-                return None
+            if not owner_override:
+                if promise.channel != channel:
+                    if not (
+                        channel.startswith("private:")
+                        and actor_person_id is not None
+                        and promise.person_id == actor_person_id
+                        and promise.kind == "ongoing"
+                    ):
+                        return None
+                elif (
+                    channel.startswith("group:")
+                    and not allow_others
+                    and actor_person_id is not None
+                    and promise.person_id != actor_person_id
+                ):
+                    return None
             del self._items[promise_id]
             self._save()
             return promise
@@ -589,6 +625,9 @@ class Promises(Skill):
             + "\n".join(lines)
         )
 
+    def session_context(self, ctx: SkillContext) -> str:
+        return self.context(ctx) or "当前聊天没有生效的约定或提醒。"
+
     def run(self, marker: str, arg: str, ctx: SkillContext) -> SkillResult:
         if marker in ("解除约定", "取消提醒"):
             return self._cancel(arg, ctx)
@@ -654,10 +693,12 @@ class Promises(Skill):
             repeat=repeat,
             kind=kind,
             notify=notify,
+            actor_person_id=ctx.person_id,
+            allow_others=ctx.owner,
             owner_override=(ctx.owner and ctx.private),
         )
         if updated is None:
-            raise SkillError(f"没有编号 {pid} 这条约定")
+            raise SkillError(f"没有编号 {pid} 这条约定，或你无权修改他人在群里立下的约定")
         return SkillResult(
             f"已更新约定 {updated.id}：{updated.when()}，“{updated.what}”。自然告诉对方一声就好。"
         )
@@ -667,10 +708,14 @@ class Promises(Skill):
         if digits is None:
             raise SkillError("要写清楚解除哪一条（编号）")
         promise = self.book.cancel(
-            ctx.channel, int(digits.group()), owner_override=(ctx.owner and ctx.private)
+            ctx.channel,
+            int(digits.group()),
+            actor_person_id=ctx.person_id,
+            allow_others=ctx.owner,
+            owner_override=(ctx.owner and ctx.private),
         )
         if promise is None:
-            raise SkillError(f"没有编号 {digits.group()} 这条约定或提醒")
+            raise SkillError(f"没有编号 {digits.group()} 这条约定或提醒，或无权解除他人的群约定")
         return SkillResult(f"已解除：{promise.when()}，“{promise.what}”。自然告诉对方一声。")
 
 

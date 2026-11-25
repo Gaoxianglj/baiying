@@ -86,6 +86,10 @@ while True:
                 "id": "u1", "status": "failed",
                 "error": {"message": "You've hit your usage limit."}}}})  # fmt: skip
             continue
+        if os.environ.get("FAKE_WILL_RETRY"):
+            send({"method": "error", "params": {
+                "threadId": tid, "turnId": "u1", "willRetry": True,
+                "error": {"message": "Reconnecting... 1/5"}}})  # fmt: skip
         out = '{"ok": true}' if "outputSchema" in params else (
             replies[min(turns, len(replies) - 1)] if replies else reply
         )

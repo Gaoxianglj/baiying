@@ -236,9 +236,13 @@ class Sleeper:
 
         new_episodes = self.c.index.episodes_created_since(last)
         new_facts = self.c.index.facts_created_since(last)
-        touched = {f.subject for f in new_facts if f.subject != SELF_ID}
+        touched = {
+            self.c.people.canonical(f.subject) for f in new_facts if f.subject != SELF_ID
+        }
         for ep in new_episodes:
-            touched |= {p for p in ep.participants if p != SELF_ID}
+            touched |= {
+                self.c.people.canonical(p) for p in ep.participants if p != SELF_ID
+            }
         for pid in sorted(touched):
             try:
                 if self._reflect_person(pid, new_episodes, new_facts):
@@ -348,9 +352,17 @@ class Sleeper:
         person = self.c.people.get(pid)
         if person is None:
             return False
-        who = person.names[0] if person.names else pid
-        mine_eps = [e for e in episodes if pid in e.participants]
-        mine_facts = [f for f in self.c.index.current_facts(pid)]
+        canonical_id = person.person_id
+        who = person.names[0] if person.names else canonical_id
+        mine_eps = [
+            e
+            for e in episodes
+            if any(self.c.people.canonical(p) == canonical_id for p in e.participants)
+        ]
+        mine_facts = list(self.c.index.current_facts(canonical_id))
+        if canonical_id != pid:
+            seen_fids = {f.id for f in mine_facts}
+            mine_facts += [f for f in self.c.index.current_facts(pid) if f.id not in seen_fids]
         new_ids = {f.id for f in facts}
         memories = [(e.id, e.summary) for e in mine_eps] + [
             (f.id, f.statement + ("（新）" if f.id in new_ids else "")) for f in mine_facts
@@ -364,15 +376,18 @@ class Sleeper:
         )
         existing_map = parse_markdown_sections(person.body)
         updated = _validated(data, PERSON_SECTIONS, memories, person.body, min_sources=1)
+        if not any(updated.values()) and any(existing_map.get(s) for s in PERSON_SECTIONS):
+            return False
         merged: dict[str, list[str]] = {}
         for sec in ALL_PERSON_SECTIONS:
             if sec == PERSON_STYLE_SECTION:
                 merged[sec] = existing_map.get(sec, [])
             else:
-                merged[sec] = updated.get(sec, [])
+                # 若本节原有内容非空，而本次校验后整个小节被清空，保留原有条目防误抹除
+                merged[sec] = updated.get(sec) or existing_map.get(sec, [])
         header = render_template("person.md", display_name=who).split("## ")[0].rstrip()
         person.body = header + "\n\n" + _render_sections(merged) + "\n"
-        path = self.c.layout.person_path(pid)
+        path = self.c.layout.person_path(canonical_id)
         path.write_text(dump_person(person), encoding="utf-8", newline="\n")
         self.c.people.reload()
         return True

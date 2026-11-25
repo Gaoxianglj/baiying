@@ -360,12 +360,12 @@ class Companion:
             text, wanted = "", None
         images = [p for c in calls for p in c.images]
         files = [p for c in calls for p in c.files]
-        if not images and not files and not actions and not text.strip() and not wanted:
+        sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
+        if not images and not files and not actions and not text.strip() and sticker is None:
             return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls,
                          skill_ctx=skill_ctx)  # fmt: skip
         text = SILENT_MARK.sub("", text).strip()
         self.context.mark_recalled(bundle, now=now)
-        sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
         meta: dict[str, object] = {
             "backend": result.backend,
             "model": result.model,
@@ -418,8 +418,11 @@ class Companion:
         )
         discovery_retry = False
         promise_retry = False
+        rounds = 0
+        consecutive_failures = 0
         try:
             while True:
+                rounds += 1
                 if ctx and ctx.stop_event and ctx.task_id and ctx.stop_event.is_set():
                     raise SkillError("任务已停止")
                 result = self.gateway.chat(
@@ -431,7 +434,14 @@ class Companion:
                     tools=bridge.tools if bridge else None,
                 )
                 found = self.skills.find(result.text, ctx)
-                if found is None:
+                if found is None or rounds >= 50 or consecutive_failures >= 5:
+                    if found is not None:
+                        log.warning(
+                            "单轮对话技能链触发熔断（%d 轮，连续失败 %d 次），提前结束",
+                            rounds,
+                            consecutive_failures,
+                        )
+                        return result, calls
                     file_request = bool(
                         ctx
                         and re.search(
@@ -512,6 +522,7 @@ class Companion:
                         on_interim(interim)
                 call, outcome = self.skills.run(skill, marker, arg, ctx)
                 calls.append(call)
+                consecutive_failures = 0 if outcome.ok else consecutive_failures + 1
                 if outcome.temporary:
                     temporary += outcome.view
                 if outcome.temporary or skill.name in ("screen", "clipboard"):
@@ -597,8 +608,9 @@ class Companion:
                 f"直接发过去（{self.config.skills.files.max_mb:g} MB 以内）。"
             )
         files: list[Path] = []
+        base = [m for m in bundle.messages if m.role == "system" or m.event_id is not None]
         try:
-            answer = self.gateway.chat([*bundle.messages, ChatMessage("skill", note)])
+            answer = self.gateway.chat([*base, ChatMessage("skill", note)])
             files = self._files_in(answer.text, sender, ctx)
             text = self._take_mood(
                 self.skills.strip_markers(answer.text), ctx.channel, ctx.person_id, None
@@ -1210,7 +1222,7 @@ class Companion:
         """和某人有关、与关键词相关的记忆，供 ta 挑选要忘掉的。"""
         pid = self.people.canonical(person_id)
         out: list[tuple[MemoryKind, str, str]] = []
-        for c in self.retriever.search(keyword, person_id=pid, limit=limit * 2):
+        for c in self.retriever.search(keyword, person_id=pid, limit=limit * 2, text_weight=0.5):
             text = self.index.text_of(c.kind, c.memory_id)
             if c.in_text or (c.cosine is not None and c.cosine >= self.retriever.min_cosine):
                 out.append((c.kind, c.memory_id, text))

@@ -1,6 +1,6 @@
 # 项目执行计划：长期记忆 AI 伙伴系统
 
-> 最后更新：2026-11-11
+> 最后更新：2026-11-25
 > 依据：[可行性与方向报告](feasibility-report.md)（[在线版](https://claude.ai/artifact/LFNswtRTRsbzx1Au3JKD47)）
 
 **阶段 0（地基）已完成，G0 通过**：重启后，GPT 订阅与 DeepSeek 两个后端都 5/5 答对。现在可以用 `uv run companion chat --as <你的 id>` 和白璎聊天（优先走 GPT 订阅，额度用尽自动切 DeepSeek）。阶段 1 已上线（2026-10-24 起），正在进行 G1 的两周试用（预计 2026-11-07 验收）。阶段 1.6（情感与生活：今日状态、心情、主动找主人、额度充足时自主活动）已完成（2026-10-26），重启服务后生效。用 `uv run companion web` 打开本机控制台查看状态、调整设置。私有仓库在 [Gaoxianglj/baiying](https://github.com/Gaoxianglj/baiying)。
@@ -349,6 +349,23 @@
 - [x] TR-06 控制台、公开/KP战报、检查点恢复和多角色端到端验收
 - [x] TR-07 独立AI主持身份、逐团私有资料授权与线程隔离、自然语言接续、旧模组审核包与NPC轮次；见 [AI主持说明](trpg-ai-host.md)
 
+### 阶段 1.9 · 全量 Review 缺陷修复与控费优化（2026-11-25 登记）
+
+> 按影响面分 `P0`（严重隐私/逻辑/控费漏洞，立即修复）、`P1`（明显质量/稳定性隐患，顺手或次批修复）、`P2`（跨进程并发与断线健壮性）。
+
+- [x] REV-01 [P0] 私聊进群聊隐私隔离（2026-11-25）：`context._shared_recent_events`、`life._visible`、`episodes_with` 与向量召回在 `group:*` 频道严格排除他人 `private:*` 消息与私聊情景，本人私聊进群聊须命中实质非停用词双字词重叠，防止私聊原话或经历写入群聊持久线程
+- [x] REV-02 [P0] 混合检索 `text_weight == 0` 修复 `min_cosine` 豁免漏洞（2026-11-25）：向量可用且 `text_weight == 0` 时不再把无关 FTS5 命中以 `relevance == 0.0` 塞进回忆与刷新遗忘曲线；`/忘掉` 显式传 `text_weight=0.5` 保留词面匹配；无过滤条件时跳过 `allowed_keys()` 全表扫描
+- [x] REV-03 [P0] 群聊合批取对发言人、防抖窗补发图、`_not_for_me` 修复与群约定防越权（2026-11-25）：合批按最高优先级触发者确定主发言人与权限；防抖期内同人补发图纳入看图与合并批次；修复 `_not_for_me` 短路（区分句首直接点名与 `@别人` 后顺口提及）；限制群约定仅创建者或主人可改/删，并允许非主人私聊取消自己跨频道 `ongoing` 约定
+- [x] REV-04 [P0] Codex `willRetry` 处理与 `pending` 落盘时机（2026-11-25）：忽略 `willRetry: true` 临时重连通知避免杀进程报废全天线程；`turn/start` 成功后才标 `pending`；修复 `start()` 失败残留未初始化进程与 `dynamicTools` 回退未同步更新 `policy`
+- [x] REV-05 [P0] `_reflect_person` 写盘防错/防清空 + `task_worker` 去重熔断 + 群活跃窗看图控费（2026-11-25）：`_reflect_person` 统一按主 `person.person_id` 写盘并补空校验兜底；`task_worker` 首段 system 设稳定 `event_id`、加步数/连续催促上限并兼容 ASCII 结束标记；`_chat_with_skills` 加连续失败与上限熔断；`_enrich` 在 `_not_for_me`/`_bot_paused` 后执行并限制单条看图张数，`_describe_quote` 缓存复用已看图描述
+- [x] REV-06 [P1] 约定清空状态覆盖 + 抽取补 `predicate` + `report()` 消除假 `<对方说>` + 空贴纸防落盘幽灵 `"…"`（2026-11-25，顺手修复）
+- [ ] REV-07 [P1] 行动约定异步化防阻塞 `_executor`、修正中途失败误报完成
+- [x] REV-08 [P1] 持久会话槽位防抖（`ReadFile.session_context` 稳定排序、`TaskControl.session_context` 去高频时间戳）、建线 24h 历史条数上限与 `Life.prepare_activity` 停订不轮询 `read_rate_limits`（2026-11-25，顺手修复）
+- [ ] REV-09 [P1] PDF 扫描件误判收紧（避免单页空白/封面触发全页视觉）、单次返回字数上限与 `ExportText` 扫描页上限及复用视觉网关
+- [ ] REV-10 [P2] `qq`/`web` 跨进程同步与并发锁：`PeopleRegistry` 读/重载加锁、原子写盘与按 mtime 刷新；`MemoryIndex` 读加锁；`PromiseBook._load` 区分 JSON 损坏与 Windows 锁冲突；`EventLog.redact`/`StickerBook` 跨进程防覆盖
+- [ ] REV-11 [P2] QQ 断线与异常健壮性：`OneBotClient.call()` 包装 `ConnectionClosed` 与退避重置、`_task_notification_loop` 异常保护、`backfill()` 离线回补游标竞态、`life_tick` 断线不空耗、`/任务`/`/继续任务` 补全 `SkillContext` 回调
+- [ ] REV-12 [P2] 杂项边界修复：`chime`/句中提及独立接话文案、`ChatHistory` 省略关键词解析、`GroupAgent` 启用时提示去重与提前停止退额、`OpenAICompatClient._post` JSON 解码包装、`ModelGateway._subscription_ready` 校验 `reset_time > now` 且不持锁阻塞 RPC、每周反思逐人容错避免单人失败整批重跑
+
 ### 阶段 2 · 我的世界身体（关口 G2，核心验收）
 
 > 2026-10-24：按你的要求，优先级降到阶段 1.5 之后。
@@ -414,6 +431,7 @@
 
 | 日期 | 变更 |
 | --- | --- |
+| 2026-11-25 | 全量 Review 登记阶段 1.9（`REV-01`～`REV-12`），并完成全部 5 项 P0（`REV-01`～`REV-05`）及顺手修复 `REV-06`/`REV-08`；新增 6 项专项回归单测，全量 897 项单元测试 + `ruff` + 隔离环境真实 GPT 拟真验证全部通过 |
 | 2026-11-11 | 完成跑团系统调研：核对群内约定、现有备团与记忆路径，并查阅Chaosium、海豹、Foundry官方资料；提出独立团务状态、角色与资料权限、检定事务、共享记忆适配及6项后续待办；未上线这些扩展 |
 | 2026-11-11 | E-23：真实骰子、CoC七版百分比与奖惩、聊天隔离审计和请求去重；71项专项测试，完整785通过、24跳过；保留原有记忆、睡眠和任务逻辑 |
 | 2026-11-10 | 完成其余 CX-01～06、09（合计 9/9）：结构化技能、真实状态、任务原线程恢复、追加/中断、压缩、扫描 PDF 页图与视觉识别缓存、写入和发送去重及兼容回退；新增项目本地 pypdfium2 5.15.2；24 项新回归，完整测试 714 通过、24 跳过；真实 Codex 任务恢复、steer、压缩、视觉及主人/群沙箱权限验证通过；既有记忆和睡眠整理保留 |

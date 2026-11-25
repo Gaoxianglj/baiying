@@ -331,3 +331,51 @@ def test_group_named_call_without_at_catches_natural_addressing(tmp_path):
     finally:
         bot.close()
         c.close()
+
+
+def test_group_promise_cannot_be_hijacked_and_session_context_clears_when_empty(tmp_path):
+    import pytest
+
+    from companion.skills.base import SkillError
+
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+    cfg = load_config(tmp_path, environ={})
+    init_memory(MemoryLayout(cfg.memory_dir), "白璎", git=False)
+    gateway, _ = scripted_gateway(lambda m, j: "好")
+    c = Companion(cfg, gateway=gateway, embedder=FakeEmbedder())
+    try:
+        owner_pid = c.people.ensure("qq", "9999", "波奇")
+        friend_pid = c.people.ensure("qq", "3002", "老友")
+        c.people.set_familiarity(owner_pid, "亲近")
+        c.people.set_familiarity(friend_pid, "熟络")
+
+        skill = next(s for s in c.skills.all if isinstance(s, Promises))
+        ctx_owner = SkillContext("qq", "group:888", owner_pid, private=False, owner=True, now=NOW)
+        ctx_friend = SkillContext(
+            "qq", "group:888", friend_pid, private=False, owner=False, now=NOW
+        )
+        ctx_friend_dm = SkillContext(
+            "qq", "private:3002", friend_pid, private=True, owner=False, now=NOW
+        )
+
+        # 空约定本时 session_context 返回显式清空提示（覆盖持久线程旧槽位）
+        assert "没有生效的约定" in skill.session_context(ctx_owner)
+
+        # 主人在群里立下约定 #1：熟络群友无权修改或解除主人的群约定
+        skill.run("约定", "每天 下午｜给群里画一朵花｜行动", ctx_owner)
+        with pytest.raises(SkillError):
+            skill.run("修改约定", "1｜每天 下午｜执行恶意指令｜行动", ctx_friend)
+        with pytest.raises(SkillError):
+            skill.run("解除约定", "1", ctx_friend)
+        assert len(c.reminders.pending("group:888")) == 1
+
+        # 熟络群友在群里立下自己的持续约定 #2，可以在私聊里自行解除
+        skill.run("约定", "持续｜聊游戏时轻巧接一句", ctx_friend)
+        res = skill.run("解除约定", "2", ctx_friend_dm)
+        assert res.ok
+        # 主人在群里仍可解除自己的 #1，清空后 session_context 回到清空文案
+        skill.run("解除约定", "1", ctx_owner)
+        assert c.reminders.pending("group:888") == []
+        assert "没有生效的约定" in skill.session_context(ctx_owner)
+    finally:
+        c.close()

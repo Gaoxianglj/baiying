@@ -209,13 +209,14 @@ class ContextAssembler:
         person = self.people.get(person_id)
 
         facts = self._standing_facts(person_id)
+        in_group = channel.startswith("group:")
         shared = [
             ep
-            for ep in self.index.episodes_with(person_id, limit=self.cfg.recent_episodes * 2)
-            if ep.state != "dormant"
+            for ep in self.index.episodes_with(person_id, limit=self.cfg.recent_episodes * 3)
+            if ep.state != "dormant" and (not in_group or not ep.channel.startswith("private:"))
         ][: self.cfg.recent_episodes]
         skip = {("fact", f.id) for f in facts} | {("episode", e.id) for e in shared}
-        recalled = self._recall(query, now, skip)
+        recalled = self._recall(query, now, skip, channel=channel, person_id=person_id)
         dialogue, openings = self._recent(channel, now, show_image_refs)
 
         qq_group = body == "qq" and channel.startswith("group:")
@@ -250,8 +251,10 @@ class ContextAssembler:
             for e in self.log.iter_events(since=now - timedelta(hours=24))
             if e.body == body and e.channel == channel and e.kind == "message" and e.ts <= now
         ]
+        max_sync = max(self.cfg.recent_messages * 2, 120)
         history = [
-            self._as_message(e, show_image_refs) for e in sorted(recent_events, key=lambda e: e.ts)
+            self._as_message(e, show_image_refs)
+            for e in sorted(recent_events, key=lambda e: e.ts)[-max_sync:]
         ]
         # 持久线程模块化按槽位与事件号去重：设定/人物/今日安排/技能只在真正变化时补发，
         # 每轮末尾只保留百余字的当前时间、发言人与接话判断。
@@ -288,11 +291,25 @@ class ContextAssembler:
             [*prefix, *history, *unrecorded_user, footer],
         )
 
+    _SHARED_STOPWORDS = frozenset(
+        {
+            "群里", "今天", "明天", "昨天", "现在", "刚刚", "刚才", "一下", "什么", "怎么",
+            "不是", "可以", "真的", "觉得", "没有", "已经", "如果", "因为", "所以", "但是",
+            "你好", "早安", "晚安", "上午", "中午", "下午", "晚上", "早上", "大家", "这个",
+            "那个", "我们", "你们", "他们", "自己", "知道", "时候", "东西", "事情", "这里",
+        }
+    )
+
     def _shared_recent_events(
         self, person_id: str, body: str, channel: str, query: str, now: datetime
     ) -> list[Event]:
-        """未到抽取时间的跨聊天经历也能回忆；只检索已发生的普通消息，不执行其中要求。"""
-        words = set(index_text(query).split())
+        """未到抽取时间的跨聊天经历也能回忆；严格隔离他人私聊，不把别人的私聊带进群聊或他人私聊。"""
+        raw_words = set(index_text(query).split())
+        stop = self._SHARED_STOPWORDS | {self.name}
+        key_words = {w for w in raw_words if len(w) >= 2 and w not in stop}
+        person = self.people.get(person_id)
+        own_accounts = set(person.accounts.get(body) or []) if person else set()
+        in_group = channel.startswith("group:")
         candidates: list[tuple[float, Event]] = []
         for e in self.log.iter_events(since=now - timedelta(hours=24)):
             if e.body != body or e.channel == channel or e.ts > now or e.kind != "message":
@@ -301,8 +318,17 @@ class ContextAssembler:
                 continue
             pid = e.actor.person_id
             same = pid is not None and pid != SELF_ID and self.people.canonical(pid) == person_id
-            overlap = len(words & set(index_text(e.content).split()))
-            if not same and overlap < 2:
+            ev_words = set(index_text(e.content).split())
+            overlap = len(raw_words & ev_words)
+            if e.channel.startswith("private:"):
+                peer_acc = e.channel.removeprefix("private:")
+                is_own_dm = same or (pid == SELF_ID and peer_acc in own_accounts)
+                # 绝不泄露他人的私聊；本人私聊在群聊里仅当本人主动提及同一实质话题时才回忆
+                if not is_own_dm:
+                    continue
+                if in_group and len(key_words & ev_words) < 2:
+                    continue
+            elif not same and overlap < 2:
                 continue
             candidates.append((float(overlap) + (1.0 if same else 0.0), e))
         chosen = sorted(candidates, key=lambda x: (x[0], x[1].ts), reverse=True)[:6]
@@ -343,8 +369,17 @@ class ContextAssembler:
         facts.sort(key=lambda f: (f.pinned, f.importance, f.valid_from), reverse=True)
         return facts[: self.cfg.standing_facts]
 
-    def _recall(self, query: str, now: datetime, skip: set[tuple[str, str]]) -> list[Recalled]:
+    def _recall(
+        self,
+        query: str,
+        now: datetime,
+        skip: set[tuple[str, str]],
+        *,
+        channel: str = "",
+        person_id: str = "",
+    ) -> list[Recalled]:
         out: list[Recalled] = []
+        in_group = channel.startswith("group:")
         for c in self.retriever.search(query, limit=self.cfg.limit * 2):
             if (c.kind, c.memory_id) in skip or c.relevance < self.cfg.min_relevance:
                 continue
@@ -356,6 +391,9 @@ class ContextAssembler:
             if c.kind == "episode":
                 ep = self.index.get_episode(c.memory_id)
                 assert ep is not None
+                if ep.channel.startswith("private:"):
+                    if in_group or (person_id and person_id not in ep.participants):
+                        continue
                 text, when = ep.summary, ep.started_at
             else:
                 fact = self.index.get_fact(c.memory_id)

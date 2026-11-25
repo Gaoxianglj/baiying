@@ -243,6 +243,13 @@ class ReadFile(Skill):
         return f"每段 {self.cfg.read_chars} 字；{scope}"
 
     def context(self, ctx: SkillContext) -> str:
+        return self._render_context(ctx, sort_by_query=True)
+
+    def session_context(self, ctx: SkillContext) -> str:
+        # 持久会话按修改时间稳定排序，避免普通闲聊出现数字或英文导致文件列表槽位哈希频繁抖动。
+        return self._render_context(ctx, sort_by_query=False)
+
+    def _render_context(self, ctx: SkillContext, *, sort_by_query: bool) -> str:
         notes = []
         if self.cfg.folder_enabled:
             folder = self.access.folder(ctx.channel).relative_to(self.workspace).as_posix()
@@ -255,14 +262,17 @@ class ReadFile(Skill):
             notes.append(self._local_usage)
         recent = self._recent.get(ctx.channel)
         files = self.access.inventory(ctx)
-        words = re.findall(r"[a-zA-Z0-9]+|规则|人物卡|角色卡|车卡|模组|地图|模板", ctx.query)
-        files.sort(
-            key=lambda p: (
-                sum(w.casefold() in p.name.casefold() for w in words),
-                p.stat().st_mtime,
-            ),
-            reverse=True,
-        )
+        if sort_by_query:
+            words = re.findall(r"[a-zA-Z0-9]+|规则|人物卡|角色卡|车卡|模组|地图|模板", ctx.query)
+            files.sort(
+                key=lambda p: (
+                    sum(w.casefold() in p.name.casefold() for w in words),
+                    p.stat().st_mtime,
+                ),
+                reverse=True,
+            )
+        else:
+            files.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
         if files:
             notes.append(
                 "当前聊天可重新读取的实际文件（只列部分）："

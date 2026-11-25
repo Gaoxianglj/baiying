@@ -100,3 +100,15 @@ def test_superseded_fact_not_retrieved(index):
     index.add_fact(new, supersedes=[old.id])
     sync_vectors(index, emb)
     assert [h.memory_id for h in HybridRetriever(index, emb).search("咖啡加糖")] == [new.id]
+
+
+def test_zero_text_weight_does_not_leak_low_cosine_fts_noise(index):
+    emb = FakeEmbedder()
+    ep = episode("小明今天在公园看见一只白猫", ["xiaoming"])
+    index.add_episode(ep)
+    sync_vectors(index, emb)
+    # 词面沾边（“今天”）但向量余弦远低于 0.99：text_weight=0.0 时绝不能放行零分噪音
+    strict = HybridRetriever(index, emb, text_weight=0.0, min_cosine=0.99)
+    assert strict.search("今天怎么算账") == []
+    # 但显式指定 text_weight=0.5（如 /忘掉 关键词查找）仍可按词面命中
+    assert [h.memory_id for h in strict.search("今天怎么算账", text_weight=0.5)] == [ep.id]

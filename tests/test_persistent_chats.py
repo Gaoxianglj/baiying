@@ -459,3 +459,70 @@ def test_fact_correction_and_mood_revert_update_in_place_without_rotating_thread
         assert "改喝热桂花茶-NEW" in last_payload
         assert "喜欢喝冰美式-OLD" not in last_payload
         assert "平静" in last_payload
+
+
+def test_private_dm_never_leaks_to_other_people_or_unprompted_group_chat(tmp_path, monkeypatch):
+    from companion.memory.index import Episode
+
+    with companion(tmp_path, backend(tmp_path / "codex", monkeypatch)) as c:
+        say(c, "我私下存的密码提示是紫藤花瓣", 0, channel="private:1")
+        pid_one = c.people.resolve("qq", "one")
+        pid_two = c.people.ensure("qq", "two", "群友乙")
+        c.index.add_episode(
+            Episode(
+                started_at=T0,
+                ended_at=T0 + timedelta(minutes=5),
+                body="qq",
+                channel="private:1",
+                summary="私聊秘密：紫藤花瓣藏在抽屉里",
+                participants=["self", pid_one],
+            ),
+            now=T0,
+        )
+
+        # 1. 他人在群里提到相同词，绝不能泄露私聊原话或私聊情景
+        other_group = c.context.build(
+            person_id=pid_two,
+            body="qq",
+            channel="group:2",
+            query="紫藤花瓣在哪里",
+            now=T0 + timedelta(seconds=10),
+        )
+        assert "密码提示" not in other_group.system_prompt
+        assert "抽屉里" not in other_group.system_prompt
+
+        # 2. 他人在私聊里提到相同词，绝不能泄露第一个人的私聊
+        other_dm = c.context.build(
+            person_id=pid_two,
+            body="qq",
+            channel="private:2",
+            query="紫藤花瓣在哪里",
+            now=T0 + timedelta(seconds=15),
+        )
+        assert "密码提示" not in other_dm.system_prompt
+        assert "抽屉里" not in other_dm.system_prompt
+
+        # 3. 本人在群里只是随口打招呼（未提该话题），不应主动把私聊原话和私聊经历灌进群聊
+        unprompted_group = c.context.build(
+            person_id=pid_one,
+            body="qq",
+            channel="group:2",
+            query="大家晚上好",
+            now=T0 + timedelta(seconds=20),
+        )
+        assert "密码提示" not in unprompted_group.system_prompt
+        assert "抽屉里" not in unprompted_group.system_prompt
+
+
+def test_codex_will_retry_error_keeps_persistent_thread_alive(tmp_path, monkeypatch):
+    folder = tmp_path / "codex"
+    b = backend(folder, monkeypatch, FAKE_WILL_RETRY="1")
+    try:
+        r1 = b.chat(messages("第一条", "e1"), session_key="qq/private:1")
+        r2 = b.chat(messages("第二条", "e2"), session_key="qq/private:1")
+        assert r1.text == "你好呀" and r2.text == "你好呀"
+        assert r1.raw["thread_id"] == r2.raw["thread_id"]
+        assert len(requests(folder, "thread/start")) == 1
+        assert not b.sessions.get("qq/private:1")[2]
+    finally:
+        b.close()

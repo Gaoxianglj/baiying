@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -16,6 +18,10 @@ from companion.skills.base import Skill, SkillContext, SkillError, SkillResult, 
 from companion.skills.files import SendFile
 from companion.skills.native import NativeSkills
 from companion.skills.tasks import TaskBook
+
+MAX_TASK_STEPS = 40
+MAX_CONSECUTIVE_NUDGES = 3
+_DONE_MARK = re.compile(r"[【\[]\s*(任务完成|任务失败)\s*[：:]\s*(.*?)[】\]]", re.DOTALL)
 
 SAFE_SKILLS = {
     "search",
@@ -73,7 +79,8 @@ def run_background(
         "没有真实工具结果或落盘文件，不得宣称完成。\n" + (skills.prompt(ctx) or "没有可用技能")
     )
     saved = checkpoint.get("messages", [])
-    messages = [ChatMessage("system", system)] + (
+    sys_id = "state@tasksys=" + hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
+    messages = [ChatMessage("system", system, event_id=sys_id)] + (
         [
             ChatMessage(m["role"], m["content"], event_id=m.get("event_id"))
             for m in saved
@@ -134,7 +141,17 @@ def run_background(
 
     try:
         save()
+        step_num = 0
+        nudges = 0
         while True:
+            step_num += 1
+            if step_num > MAX_TASK_STEPS:
+                return SkillResult(
+                    f"后台任务已达到最大步数上限（{MAX_TASK_STEPS} 步），检查点已保存，可核对已有产出后继续。",
+                    ok=False,
+                    report=True,
+                    files=files,
+                )
             if control.stopped.is_set():
                 return SkillResult(
                     "任务已停止，检查点和已有文件保留。", ok=False, report=True, files=files
@@ -167,12 +184,16 @@ def run_background(
                         task_id, "主动压缩暂未成功，保留原上下文继续；自动压缩由 Codex 管理"
                     )
             book.progress(task_id, "正在生成下一步操作")
+            step_footer = ChatMessage(
+                "system",
+                f"【后台任务第 {step_num} 步】请基于已有工具结果继续执行，完成后用【任务完成：结果】收尾。",
+            )
             answer: ChatResult = gateway.chat(
                 messages,
                 purpose="background_task",
                 session_key=key,
-                session_messages=messages,
-                session_bootstrap=messages,
+                session_messages=[*messages, step_footer],
+                session_bootstrap=[*messages, step_footer],
                 tools=bridge.tools if bridge else None,
                 observer=observe,
                 control=control,
@@ -181,8 +202,10 @@ def run_background(
                 return SkillResult(
                     "任务已停止，检查点和已有文件保留。", ok=False, report=True, files=files
                 )
+            used_native = False
             if bridge:
                 for m in bridge.history[history_offset:]:
+                    used_native = True
                     added = append(m.role, m.content, m.images)
                     gateway.note_response(answer, added.event_id)
                 history_offset = len(bridge.history)
@@ -191,6 +214,7 @@ def run_background(
             save()
             found = skills.find(answer.text, ctx)
             if found:
+                nudges = 0
                 _, skill, marker, arg = found
                 ctx.now = datetime.now(UTC)
                 book.progress(task_id, f"正在{skill.label}：{arg[:160]}")
@@ -200,13 +224,25 @@ def run_background(
                 save()
                 continue
             if book.pending_inputs(task_id):
+                nudges = 0
                 continue
-            for marker, ok in (("任务完成", True), ("任务失败", False)):
-                start = answer.text.find(f"【{marker}：")
-                if start >= 0:
-                    detail = answer.text[start + len(marker) + 2 :].split("】", 1)[0].strip()
+            done_match = _DONE_MARK.search(answer.text)
+            if done_match is not None:
+                marker, detail = done_match.group(1), done_match.group(2).strip()
+                ok = marker == "任务完成"
+                return SkillResult(
+                    detail or "没有执行结果", ok=ok and bool(detail), report=True, files=files
+                )
+            if used_native:
+                nudges = 0
+            else:
+                nudges += 1
+                if nudges > MAX_CONSECUTIVE_NUDGES:
                     return SkillResult(
-                        detail or "没有执行结果", ok=ok and bool(detail), report=True, files=files
+                        "后台任务连续多轮未调用工具也未给出【任务完成】或【任务失败】标记，已暂停保护额度。",
+                        ok=False,
+                        report=True,
+                        files=files,
                     )
             append(
                 "skill",

@@ -447,3 +447,35 @@ def test_mention_send_failure_falls_back_to_text(bot):
     run(bot, msg("白璎", group=GROUP, mid=11))
     sends = [p["message"] for a, p in bot.client.sent if a == "send_group_msg"]
     assert sends[-2][1] == at("99999999") and sends[-1][1] == txt("@99999999 你好")
+
+
+def test_group_batch_keeps_primary_speaker_and_not_for_me_blocks_at_other(bot):
+    # 1. @别人 再提白璎，不应算冲我来
+    other_at = msg(" 白璎画得真好", group=GROUP, mid=21)
+    other_at["message"] = [at("5000"), txt(" 白璎画得真好")]
+    run(bot, other_at)
+    assert bot.client.sent == []
+
+    # 2. 主人 @白璎 后，防抖窗口内非主人插话：主发言人与 owner 权限仍归主人
+    bot.cfg.debounce_group_seconds = 0.05
+    seen_ctx = []
+    orig_respond = bot.c.respond
+
+    def spy_respond(incoming, *args, **kwargs):
+        seen_ctx.append((incoming.actor.display_name, kwargs.get("skill_ctx").owner))
+        return orig_respond(incoming, *args, **kwargs)
+
+    bot.c.respond = spy_respond
+
+    async def scenario():
+        await bot.handle_event(
+            msg("帮我看看", group=GROUP, user=OWNER, name="波奇", at_bot=True, mid=31)
+        )
+        # 非主人 10ms 后插话（先记下活跃或 other 消息）
+        await bot.handle_event(
+            msg("我也看看", group=GROUP, user="3009", name="路人", mid=32)
+        )
+        await bot.drain()
+
+    asyncio.run(scenario())
+    assert seen_ctx and seen_ctx[-1] == ("波奇", True)

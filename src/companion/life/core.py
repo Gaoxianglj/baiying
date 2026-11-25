@@ -213,6 +213,8 @@ class Life:
         # 额度读数缓存 5 分钟，先看它，免得每分钟都去问订阅。
         if self.gateway.prefer not in ("auto", "subscription"):
             return None
+        if not self.gateway.subscription_available(now):
+            return None
         limits = self._rate_limits(now)
         if limits is None:
             return None
@@ -220,8 +222,6 @@ class Life:
         session, why = quota_check(limits, session, cfg, now)
         if session is None:
             log.debug("先不做自主活动：%s", why)
-            return None
-        if not self.gateway.subscription_available(now):
             return None
         self.index.set_meta(QUOTA_META, session.to_json())
         return ActivityPrep(
@@ -331,12 +331,12 @@ class Life:
 
 
 def _visible(ep: Episode, person_id: str, channel: str) -> bool:
-    """今天的哪些经历可以在这里提：本频道的、群里的；私聊的只在和当事人聊时提。"""
+    """今天的哪些经历可以在这里提：本频道的、群里的；私聊的只在和当事人私聊时提。"""
     if ep.channel.startswith("self:"):
         return False  # 她自己做的事另外列
     if ep.channel == channel or ep.channel.startswith("group:"):
         return True
-    return person_id in ep.participants
+    return not channel.startswith("group:") and person_id in ep.participants
 
 
 def _seed_section(seed: str, keyword: str) -> str:

@@ -140,7 +140,13 @@ class SessionExtractor:
                 "参与者（id：名字）：\n"
                 + "\n".join(f"- {pid}：{name}" for pid, name in participants.items()),
                 "已知事实（id：内容）：\n"
-                + ("\n".join(f"- {fid}：{f.statement}" for fid, f in known.items()) or "（无）"),
+                + (
+                    "\n".join(
+                        f"- {fid}：{f.statement}（predicate={f.predicate}）"
+                        for fid, f in known.items()
+                    )
+                    or "（无）"
+                ),
                 "对话：\n" + transcript,
             ]
         )

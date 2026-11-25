@@ -235,13 +235,13 @@ class CodexAppServerBackend:
         try:
             self._request("initialize", init)
         except ModelError as e:
+            self.close()
             if not self._experimental_api or not any(w in str(e).lower() for w in (
                 "experimental", "capabilities", "unknown field", "unsupported",
             )):
                 raise
             self._experimental_api = False
             self.native_tools_supported = False
-            self.close()
             self.start()
             return
         self._send({"method": "initialized"})
@@ -339,7 +339,13 @@ class CodexAppServerBackend:
                         raise
                     self.native_tools_supported = False
                     tools = None
+                    instructions = self.instructions
+                    thread_params["baseInstructions"] = instructions
                     thread_params.pop("dynamicTools", None)
+                    policy = hashlib.sha256(
+                        (f"{self.model}\n{instructions}\n{self._workdir}\n{self._command}\n"
+                         + json.dumps([], sort_keys=True)).encode()
+                    ).hexdigest()
                     log.warning("当前 Codex 不支持动态工具，改用原技能标记执行链")
                     thread = self._request("thread/start", thread_params)
                 thread_id = (thread.get("thread") or {}).get("id")
@@ -376,11 +382,13 @@ class CodexAppServerBackend:
                 )
             if json_schema is not None:
                 turn_params["outputSchema"] = json_schema
-            if key:
-                assert self.sessions is not None
-                self.sessions.pending(key)
+            turn_started = False
             try:
                 turn = self._request("turn/start", turn_params)
+                turn_started = True
+                if key:
+                    assert self.sessions is not None
+                    self.sessions.pending(key)
                 self._tools, self._observer = tools, observer
                 self._active_thread = thread_id
                 self._active_turn = (turn.get("turn") or {}).get("id")
@@ -392,8 +400,9 @@ class CodexAppServerBackend:
                                                "turn": turn.get("turn") or {}})
                 text, _ = self._collect_turn(thread_id, turn_id=(turn.get("turn") or {}).get("id"))
             except ModelError:
-                # 避免仍在生成的旧 turn 与下一条消息竞争；索引 pending 留作恢复依据。
-                if key:
+                # 只有 turn 已启动才可能与后续消息竞争，需关闭子进程并保留 pending 作恢复依据；
+                # 若 turn/start 本身被拒（如临时限流），不破坏健康持久线程。
+                if key and turn_started:
                     self.close()
                 raise
             finally:
@@ -536,6 +545,12 @@ class CodexAppServerBackend:
             elif method == "account/rateLimits/updated":
                 self.last_rate_limits = parse_rate_limits(params)
             elif method == "error":
+                if params.get("willRetry"):
+                    log.warning(
+                        "Codex 临时连接波动，等待服务端自动重试：%s",
+                        str(params.get("error") or params)[:200],
+                    )
+                    continue
                 text = str(params.get("error") or params)
                 raise ModelError(f"Codex 出错：{text[:300]}", retryable=_is_limit(text))
             elif method == "turn/completed":

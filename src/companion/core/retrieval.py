@@ -75,28 +75,39 @@ class HybridRetriever:
         until: datetime | None = None,
         limit: int = 10,
         pool: int = 50,
+        text_weight: float | None = None,
     ) -> list[Candidate]:
         filtered = person_id is not None or since is not None or until is not None
-        allowed = self.index.allowed_keys(person_id=person_id, since=since, until=until)
-        if filtered and not allowed:
+        scope = (
+            self.index.allowed_keys(person_id=person_id, since=since, until=until)
+            if filtered
+            else None
+        )
+        if filtered and not scope:
             return []
-        scope = allowed if filtered else None
 
-        text_ranked: list[Key] = [
-            (h.kind, h.memory_id)
-            for h in self.index.search_text(query, limit=pool * 4 if filtered else pool)
-            if scope is None or (h.kind, h.memory_id) in scope
-        ][:pool]
         vector_ranked, cosines = self._vector_search(query, scope, pool)
+        base_text_weight = self.text_weight if text_weight is None else text_weight
+        # 向量可用时关键词只按 text_weight 参与；向量不可用时全靠关键词
+        eff_text_weight = base_text_weight if vector_ranked else 1.0
+        text_ranked: list[Key] = (
+            [
+                (h.kind, h.memory_id)
+                for h in self.index.search_text(query, limit=pool * 4 if filtered else pool)
+                if scope is None or (h.kind, h.memory_id) in scope
+            ][:pool]
+            if eff_text_weight > 0.0
+            else []
+        )
 
         scores: dict[Key, float] = {}
-        # 向量可用时关键词只按 text_weight 参与；向量不可用时全靠关键词
-        text_weight = self.text_weight if vector_ranked else 1.0
-        weights = ((text_ranked, text_weight), (vector_ranked, 1.0))
+        weights = ((text_ranked, eff_text_weight), (vector_ranked, 1.0))
         for ranked, weight in weights:
+            if weight <= 0.0:
+                continue
             for rank, key in enumerate(ranked, 1):
                 scores[key] = scores.get(key, 0.0) + weight / (RRF_K + rank)
-        best_possible = (text_weight + (1.0 if vector_ranked else 0.0)) / (RRF_K + 1)
+        best_possible = (eff_text_weight + (1.0 if vector_ranked else 0.0)) / (RRF_K + 1)
 
         text_set = set(text_ranked)
         out: list[Candidate] = []
@@ -106,7 +117,11 @@ class HybridRetriever:
             if record is None or not self.index.is_public(record):
                 continue
             cos = cosines.get(key)
-            if key not in text_set and cos is not None and cos < self.min_cosine:
+            if (
+                (eff_text_weight <= 0.0 or key not in text_set)
+                and cos is not None
+                and cos < self.min_cosine
+            ):
                 continue
             out.append(
                 Candidate(key[0], key[1], min(score / best_possible, 1.0), cos, key in text_set)

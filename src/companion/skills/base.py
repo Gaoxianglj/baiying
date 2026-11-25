@@ -127,6 +127,10 @@ class Skill:
         """这个场合她用技能前需要知道的情况（如这个人还有哪些提醒没到），写进技能说明。"""
         return ""
 
+    def session_context(self, ctx: SkillContext) -> str:
+        """持久会话专用状态块；默认与 context 一致，需在清空时显式覆盖旧槽位的技能可覆写。"""
+        return self.context(ctx)
+
     def markers_for(self, ctx: SkillContext) -> dict[str, str]:
         return self.markers
 
@@ -190,7 +194,7 @@ class Skills:
         notes = [
             (s.name or f"skill_{i}", note)
             for i, s in enumerate(active_skills)
-            if (note := s.context(ctx))
+            if (note := s.session_context(ctx))
         ]
         return self._usage(lines), notes
 

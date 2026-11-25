@@ -116,16 +116,27 @@ class _Pending:
     sources: list[Source] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     kind: str = "other"
+    primary_index: int = 0  # 本轮主发言人下标（最高优先级触发者；同优先级取最新一条）
     required_message_id: str | None = None  # 最后一条直接叫她的消息，群里回复时引用它
     task: asyncio.Task[None] | None = None
 
     def add(self, src: Source, event: Event, kind: str) -> None:
+        idx = len(self.sources)
         self.sources.append(src)
         self.events.append(event)
-        if _MODE_RANK[kind] > _MODE_RANK[self.kind]:
+        if _MODE_RANK[kind] >= _MODE_RANK[self.kind]:
             self.kind = kind
+            self.primary_index = idx
         if kind == "required":
             self.required_message_id = src.message_id
+
+    @property
+    def primary_source(self) -> Source:
+        return self.sources[self.primary_index]
+
+    @property
+    def primary_event(self) -> Event:
+        return self.events[self.primary_index]
 
     @property
     def mode(self) -> str:
@@ -178,6 +189,8 @@ class QQBot:
         self._trpg_busy: dict[str, bool] = {}
         self._followups: dict[str, int] = {}
         self._quote_authors: dict[str, str] = {}
+        # message_id → (已看图正文, digests)，供引用消息复用描述避免重复看图
+        self._observed_quotes: dict[str, tuple[str, list[str]]] = {}
         self._trpg_questions: dict[tuple[str, str], tuple[datetime, str, int, str]] = {}
         self._sent_times: deque[datetime] = deque()
         self._sent_ids: deque[str] = deque(maxlen=500)
@@ -488,13 +501,31 @@ class QQBot:
             await self._command(src, text[1:].strip())
             return
 
+        pending_now = self._pending.get(src.channel)
+        not_for_me = self._not_for_me(src)
+        bot_paused = self._bot_paused(src)
         addressed = self._addressed(src)
-        text, digests = await self._enrich(src, addressed)
+        same_sender_followup = (
+            src.message_type == "group"
+            and pending_now is not None
+            and any(s.user_id == src.user_id for s in pending_now.sources)
+            and not not_for_me
+            and not bot_paused
+        )
+        text, digests = await self._enrich(
+            src,
+            addressed or same_sender_followup,
+            allow_active=(not not_for_me and not bot_paused),
+        )
         meta: dict[str, object] = {}
         if src.message_id:
             meta["message_id"] = src.message_id
         if digests:
             meta["images"] = digests
+            if src.message_id and "（没看" not in text:
+                if len(self._observed_quotes) >= 500:
+                    self._observed_quotes.pop(next(iter(self._observed_quotes)))
+                self._observed_quotes[src.message_id] = (text, list(digests))
         event = await self._call(
             self.c.observe,
             body="qq",
@@ -506,24 +537,26 @@ class QQBot:
             meta=meta,
         )
 
-        if self._bot_paused(src):  # 和别的机器人聊太久了，先只听不回
+        if bot_paused:  # 和别的机器人聊太久了，先只听不回
             return
 
-        # 决定这条消息算哪一类：必须回 / 对话延续中或句中提及 / 主动插话 / 只记录
+        # 决定这条消息算哪一类：必须回 / 同人防抖窗补发 / 对话延续中或句中提及 / 主动插话 / 只记录
         if addressed:
             kind = "required"
+        elif same_sender_followup and pending_now is not None:
+            kind = pending_now.kind
         else:
             kind = self._conversation_kind(src)
             if (
                 kind is None
-                and not self._not_for_me(src)
+                and not not_for_me
                 and not self._chatter(src.incoming.text)
                 and any(name in src.incoming.text for name in self.cfg.aliases)
             ):
                 kind = "partner"
             if (
                 kind is None
-                and not self._not_for_me(src)
+                and not not_for_me
                 and not self._chatter(text)
                 and await self._should_chime_in(src.channel, text)
             ):
@@ -566,12 +599,27 @@ class QQBot:
 
     def _not_for_me(self, src: Source) -> bool:
         inc = src.incoming
-        if src.message_type != "group" or inc.mentioned_self or self._named_call(inc.text):
+        if src.message_type != "group" or inc.mentioned_self:
             return False
-        if inc.at and self.self_id not in inc.at:
-            return True
         author = self._quote_authors.get(inc.reply_to or "")
-        return bool(author and author != self.self_id)
+        if author and author != self.self_id:
+            return True
+        if inc.at and self.self_id not in inc.at:
+            # 句首直接点名白璎并 @ 他人作目标（如“白璎，帮我绑定给 @某人”）仍算冲我来；
+            # 先 @ 别人再在句中提到白璎（如“@张三 白璎画得真好”）则不是冲我来。
+            return not self._leading_named_call(inc.text)
+        return False
+
+    def _leading_named_call(self, text: str) -> bool:
+        if not self.cfg.aliases:
+            return False
+        names = "|".join(re.escape(name) for name in self.cfg.aliases)
+        return bool(
+            re.match(
+                rf"^(?:(?:诶|喂|嗨|嘿|呐|哎|呼叫)\s*)?(?:{names})(?!(?:的|和|与|跟|或|及))",
+                text.strip(),
+            )
+        )
 
     def _addressed(self, src: Source) -> bool:
         inc = src.incoming
@@ -651,7 +699,8 @@ class QQBot:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _reply_batch(self, pending: _Pending) -> None:
-        src = pending.sources[-1]
+        src = pending.primary_source
+        primary_event = pending.primary_event
         # 上限是防刷屏、防风控的；主人私聊是一对一，当电脑助手用时连着说几句很正常，不能悄悄不回
         owner_private = src.message_type == "private" and src.user_id in self.cfg.owner_accounts
         if not owner_private and not self._can_send():
@@ -666,7 +715,7 @@ class QQBot:
         ctx = SkillContext(
             body="qq",
             channel=src.channel,
-            person_id=pending.events[-1].actor.person_id or "",
+            person_id=primary_event.actor.person_id or "",
             private=src.message_type == "private",
             owner=src.user_id in self.cfg.owner_accounts,
             now=src.received_at,
@@ -686,7 +735,7 @@ class QQBot:
         try:
             reply = await self._call(
                 self.c.respond,
-                pending.events[-1],
+                primary_event,
                 mode=pending.mode,
                 batch=pending.events,
                 skill_ctx=ctx,
@@ -716,7 +765,7 @@ class QQBot:
         if actions.poke and poker is None:  # 只能戳回戳了她的人，不随手戳别人
             log.info("%s：没人戳她，不戳", src.channel)
             actions.poke = False
-        await self._do_actions(poker or src, actions, pending.sources[-1].message_id)
+        await self._do_actions(poker or src, actions, src.message_id)
         for path in reply.images:
             await self._send_image(src, path)
         for path in reply.files:
@@ -831,22 +880,28 @@ class QQBot:
         window = timedelta(seconds=self.c.config.vision.active_seconds)
         return last is not None and self.now() - last <= window
 
-    async def _enrich(self, src: Source, addressed: bool) -> tuple[str, list[str]]:
+    async def _enrich(
+        self, src: Source, addressed: bool, *, allow_active: bool = True
+    ) -> tuple[str, list[str]]:
         """补全一条消息：按规则看图、写明引用了谁的什么话；返回（正文，看过的图片哈希）。
 
-        看图：私聊、@她、引用并 @她 时看；群里没冲她来的，只在她活跃时看，否则记作“[图片]”且不下载。
-        转发的聊天记录总是展开成文字（记录里的图不看）。
+        看图：私聊、@她、引用并 @她或同人防抖窗内补发时看；群里非冲她来的仅在活跃且非 @别人/非暂停
+        机器人时看，并限制单条最多看图张数，否则记作“[图片（没看）]”且不下载。
         """
         inc = src.incoming
         vision = self.c.config.vision
-        read = vision.enabled and (addressed or self._active(src.channel))
+        active = allow_active and self._active(src.channel)
+        read = vision.enabled and (addressed or active)
+        max_images = 6 if (src.message_type == "private" or addressed) else 2
         descriptions: list[str] = []
         digests: list[str] = []
+        looked = 0
         for ref in inc.images:
             label = "表情包" if ref.sticker else "图片"
-            if not read:
+            if not read or looked >= max_images:
                 descriptions.append(await self._unseen(ref, label, "没看"))  # 明说没看，免得她猜
                 continue
+            looked += 1
             desc, digest = await self._look(ref, src)
             descriptions.append(
                 f"[{label}：{desc}]" if desc else await self._unseen(ref, label, "没看清")
@@ -854,7 +909,7 @@ class QQBot:
             if digest:
                 digests.append(digest)
         forwards = [await self._read_forward(ref) for ref in inc.forwards]
-        receive = addressed or self._active(src.channel)
+        receive = addressed or active
         files = [await self._receive_file(ref, src, receive) for ref in inc.files]
         voice = await self._hear(src, receive) if inc.voice else None
         text = inc.fill(descriptions, forwards, files, voice)
@@ -864,7 +919,7 @@ class QQBot:
         return text, digests
 
     async def _describe_quote(self, message_id: str, look: bool, digests: list[str]) -> str:
-        """引用了一条消息：写明引用的是谁的什么话；@她 时顺便看被引用的图。"""
+        """引用了一条消息：写明引用的是谁的什么话；@她 时看被引用的图（已看过则复用缓存描述）。"""
         msg = await self._get_message(message_id)
         if msg is None:
             return "（引用了一条消息）"
@@ -875,17 +930,32 @@ class QQBot:
             if uid == self.self_id
             else str(sender.get("card") or sender.get("nickname") or uid or "某人")
         )
-        quoted = parse_segments(msg.get("message"), self.self_id)
-        descriptions = []
-        for ref in quoted.images:
-            label = "表情包" if ref.sticker else "图片"
-            desc = None
-            if look:
-                desc, digest = await self._look(ref, None)
-                if digest:
-                    digests.append(digest)
-            descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看）]")
-        body = quoted.fill(descriptions).strip()  # 引用的聊天记录只记作“[聊天记录]”
+        cached = self._observed_quotes.get(message_id)
+        if cached is not None:
+            cached_text, cached_digests = cached
+            digests.extend(d for d in cached_digests if d not in digests)
+            body = cached_text.strip()
+        else:
+            quoted = parse_segments(msg.get("message"), self.self_id)
+            descriptions = []
+            new_digests: list[str] = []
+            for ref in quoted.images[:4]:
+                label = "表情包" if ref.sticker else "图片"
+                desc = None
+                if look:
+                    desc, digest = await self._look(ref, None)
+                    if digest:
+                        digests.append(digest)
+                        new_digests.append(digest)
+                descriptions.append(f"[{label}：{desc}]" if desc else f"[{label}（没看）]")
+            for ref in quoted.images[4:]:
+                label = "表情包" if ref.sticker else "图片"
+                descriptions.append(f"[{label}（没看）]")
+            body = quoted.fill(descriptions).strip()  # 引用的聊天记录只记作“[聊天记录]”
+            if look and new_digests and "（没看" not in body:
+                if len(self._observed_quotes) >= 500:
+                    self._observed_quotes.pop(next(iter(self._observed_quotes)))
+                self._observed_quotes[message_id] = (body, new_digests)
         if len(body) > 120:
             body = body[:119] + "…"
         said = "你说的" if who == "你" else f"{who}的话"

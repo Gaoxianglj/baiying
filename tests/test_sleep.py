@@ -212,3 +212,79 @@ def test_familiarity_ceiling_and_step_rules():
     assert clamp_familiarity("初识", "亲近", "亲近") == "相熟"  # 单次最多升 1 档
     assert clamp_familiarity("相熟", "熟络", "相熟") == "相熟"  # 不能超过客观上限
     assert clamp_familiarity("熟络", "初识", "熟络") == "相熟"  # 单次最多降 1 档
+
+
+def test_reflect_person_handles_merged_pid_and_prevents_empty_wipe(tmp_path):
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+    config = load_config(tmp_path, environ={})
+    init_memory(MemoryLayout(config.memory_dir), "白璎", git=False)
+
+    # 返回不含有效 8 位编号的条目，触发 _validated 全空，应保留原有档案而不清空
+    gateway, _ = scripted_gateway(
+        lambda m, j: json.dumps(
+            {
+                "偏好": ["无编号编造条目"],
+                "关系与称呼": [],
+                "共同经历": [],
+                "只对 ta 使用的说法": [],
+            },
+            ensure_ascii=False,
+        )
+        if j
+        else "今天很安静。"
+    )
+    c = Companion(config, gateway=gateway, embedder=FakeEmbedder())
+    try:
+        old_pid = c.people.ensure("qq", "1111", "旧号")
+        main_pid = c.people.ensure("qq", "2222", "主号")
+        c.people.bind("qq", "1111", main_pid)  # old_pid -> merged_into main_pid
+        main_path = c.layout.person_path(main_pid)
+        main_path.write_text(
+            main_path.read_text("utf-8").replace("## 偏好\n", "## 偏好\n\n- 喜欢乌龙茶。\n"),
+            encoding="utf-8",
+        )
+        c.people.reload()
+
+        f = Fact(
+            subject=old_pid,
+            predicate="drink",
+            statement="主号也喜欢白桃乌龙",
+            valid_from=T0,
+            event_ids=["ev1"],
+        )
+        c.index.add_fact(f, now=T0)
+        sleeper = Sleeper(c)
+        # 1. 校验落空时不应清空原有“喜欢乌龙茶”，且不写坏旧 pid 文件导致 reload 崩
+        assert sleeper._reflect_person(old_pid, [], [f]) is False
+        c.people.reload()
+        assert "喜欢乌龙茶" in c.people.get(main_pid).body
+
+        # 2. 有合法编号时写回 canonical main_pid 文件，不触发 PeopleError
+        fid8 = f.id[:8]
+        c.gateway.fallback.client._http = None  # ensure scripted handler still used
+        c.gateway.fallback.client.chat = lambda msgs, **kw: type(  # type: ignore[method-assign]
+            "R",
+            (),
+            {
+                "text": json.dumps(
+                    {
+                        "偏好": [{"text": "喜欢白桃乌龙。", "sources": [fid8]}],
+                        "关系与称呼": [],
+                        "共同经历": [],
+                        "只对 ta 使用的说法": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                "backend": "fallback",
+                "model": "scripted",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "seconds": 0.0,
+                "raw": {},
+            },
+        )()
+        assert sleeper._reflect_person(old_pid, [], [f]) is True
+        c.people.reload()
+        assert "喜欢白桃乌龙" in c.people.get(main_pid).body
+    finally:
+        c.close()

@@ -364,13 +364,24 @@ class TaskControl(Skill):
         self.book, self.worker, self.resume = book, worker, resume
 
     def context(self, ctx: SkillContext) -> str:
+        return self._render_context(ctx, include_updated_at=True)
+
+    def session_context(self, ctx: SkillContext) -> str:
+        # 持久会话省略高频更新时间戳，只在任务状态或步数真正变化时刷新槽位。
+        return self._render_context(ctx, include_updated_at=False)
+
+    def _render_context(self, ctx: SkillContext, *, include_updated_at: bool) -> str:
         try:
             rows = self.book.visible(ctx)
             active = [r for r in rows if r["state"] in ACTIVE]
             latest = [r for r in rows if r["state"] not in ACTIVE][-1:]
             # 每轮只给真实状态水位；要求、旧结果与附件在显式查询时再读取。
             status = "\n".join(
-                f"任务 {r['id']}：{LABELS[r['state']]}；{r['steps']}步；更新 {r['updated_at']}"
+                (
+                    f"任务 {r['id']}：{LABELS[r['state']]}；{r['steps']}步；更新 {r['updated_at']}"
+                    if include_updated_at
+                    else f"任务 {r['id']}：{LABELS[r['state']]}；{r['steps']}步"
+                )
                 for r in [*active[:3], *latest]
             ) or "当前聊天没有已登记的后台任务，后台没有在继续执行。"
         except (OSError, ValueError, KeyError):
