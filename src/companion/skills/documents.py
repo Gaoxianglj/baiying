@@ -17,9 +17,33 @@ from companion.skills.base import SkillContext, SkillError
 _PDFIUM_LOCK = threading.RLock()  # PDFium 连不同文档也不能并发调用。
 
 
+def is_scanned_pdf(pages: list[str]) -> bool:
+    """判断 PDF 是否确实需要按扫描/图片件处理（避免正常长文本 PDF 因个别封面或空白页误判）。"""
+    if not pages:
+        return False
+    low = sum(1 for p in pages if len(p.strip()) < 20)
+    if low == 0:
+        return False
+    if len(pages) <= 2:
+        return True
+    return low >= 2 and (low / len(pages)) >= 0.3
+
+
 class Documents:
-    def __init__(self, folder: Path, vision: Callable[[Path, int], str] | None = None) -> None:
+    def __init__(
+        self,
+        folder: Path,
+        vision: Callable[[Path, int], str] | None = None,
+        *,
+        max_ocr_pages: int = 30,
+    ) -> None:
         self.folder, self.vision = folder, vision
+        self.max_ocr_pages = max(1, max_ocr_pages)
+
+    def close(self) -> None:
+        closer = getattr(self.vision, "close", None)
+        if callable(closer):
+            closer()
 
     @staticmethod
     def _check(ctx: SkillContext) -> None:
@@ -122,8 +146,10 @@ class Documents:
         self._json(cache, {"text": text, "method": "model-vision", "page": number})
         return text
 
-    def extract(self, data: bytes, ctx: SkillContext) -> str:
+    def extract(self, data: bytes, ctx: SkillContext, *, allow_ocr: bool = True) -> str:
         parts = []
+        folder = self._folder(data)
+        ocr_used = 0
         for number, raw in enumerate(self.pages(data), 1):
             self._check(ctx)
             if ctx.stop_event and ctx.stop_event.is_set():
@@ -131,7 +157,19 @@ class Documents:
             text = raw
             method = "文字层"
             if len(raw.strip()) < 20:
-                text, method = self.ocr(data, number, ctx), "视觉识别，疑难文字需核对页图"
+                if not allow_ocr:
+                    text = "（无文字层或空白页）"
+                else:
+                    cache = folder / f"ocr-{number:06}.json"
+                    cached = cache.exists()
+                    if not cached and ocr_used >= self.max_ocr_pages:
+                        raise SkillError(
+                            f"单次最多视觉识别 {self.max_ocr_pages} 页扫描页，"
+                            "已识别页面已缓存，如需继续请使用 /继续任务"
+                        )
+                    text, method = self.ocr(data, number, ctx), "视觉识别，疑难文字需核对页图"
+                    if not cached:
+                        ocr_used += 1
             parts.append(f"## PDF 第 {number} 页（{method}）\n\n{text}")
         return "\n\n".join(parts)
 
@@ -159,5 +197,5 @@ class Documents:
             images.append(self.render(data, number))
             text = pages[number - 1]
             parts.append(f"【PDF 第 {number}/{len(pages)} 页】\n"
-                         + (text[:18000] if text else "此页没有文字层，请根据附上的页图读取。"))
+                         + (text[:6000] if text else "此页没有文字层，请根据附上的页图读取。"))
         return "\n\n".join(parts), images

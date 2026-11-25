@@ -359,9 +359,9 @@
 - [x] REV-04 [P0] Codex `willRetry` 处理与 `pending` 落盘时机（2026-11-25）：忽略 `willRetry: true` 临时重连通知避免杀进程报废全天线程；`turn/start` 成功后才标 `pending`；修复 `start()` 失败残留未初始化进程与 `dynamicTools` 回退未同步更新 `policy`
 - [x] REV-05 [P0] `_reflect_person` 写盘防错/防清空 + `task_worker` 去重熔断 + 群活跃窗看图控费（2026-11-25）：`_reflect_person` 统一按主 `person.person_id` 写盘并补空校验兜底；`task_worker` 首段 system 设稳定 `event_id`、加步数/连续催促上限并兼容 ASCII 结束标记；`_chat_with_skills` 加连续失败与上限熔断；`_enrich` 在 `_not_for_me`/`_bot_paused` 后执行并限制单条看图张数，`_describe_quote` 缓存复用已看图描述
 - [x] REV-06 [P1] 约定清空状态覆盖 + 抽取补 `predicate` + `report()` 消除假 `<对方说>` + 空贴纸防落盘幽灵 `"…"`（2026-11-25，顺手修复）
-- [ ] REV-07 [P1] 行动约定异步化防阻塞 `_executor`、修正中途失败误报完成
+- [x] REV-07 [P1] 行动约定异步化防阻塞 `_executor`、修正中途失败误报完成（2026-11-25）：`QQBot` 拆分独立 `_promise_executor` 并加运行中防重集合，行动约定后台执行期间不阻塞正常收发；`_fulfill_action_promise` 区分实质写入/出图与只读步骤并补齐循环耗尽兜底
 - [x] REV-08 [P1] 持久会话槽位防抖（`ReadFile.session_context` 稳定排序、`TaskControl.session_context` 去高频时间戳）、建线 24h 历史条数上限与 `Life.prepare_activity` 停订不轮询 `read_rate_limits`（2026-11-25，顺手修复）
-- [ ] REV-09 [P1] PDF 扫描件误判收紧（避免单页空白/封面触发全页视觉）、单次返回字数上限与 `ExportText` 扫描页上限及复用视觉网关
+- [x] REV-09 [P1] PDF 扫描件误判收紧（避免单页空白/封面触发全页视觉）、单次返回字数上限与 `ExportText` 扫描页上限及复用视觉网关（2026-11-25）：新增 `is_scanned_pdf`、单次 OCR 上限 30 页可缓存续识、`read_pages` 限字数，`_PdfVision` 复用独立网关并在 `Skills.close()` 统一关闭，同时支持 `ExportText` 英文 `|` 分隔符
 - [ ] REV-10 [P2] `qq`/`web` 跨进程同步与并发锁：`PeopleRegistry` 读/重载加锁、原子写盘与按 mtime 刷新；`MemoryIndex` 读加锁；`PromiseBook._load` 区分 JSON 损坏与 Windows 锁冲突；`EventLog.redact`/`StickerBook` 跨进程防覆盖
 - [ ] REV-11 [P2] QQ 断线与异常健壮性：`OneBotClient.call()` 包装 `ConnectionClosed` 与退避重置、`_task_notification_loop` 异常保护、`backfill()` 离线回补游标竞态、`life_tick` 断线不空耗、`/任务`/`/继续任务` 补全 `SkillContext` 回调
 - [ ] REV-12 [P2] 杂项边界修复：`chime`/句中提及独立接话文案、`ChatHistory` 省略关键词解析、`GroupAgent` 启用时提示去重与提前停止退额、`OpenAICompatClient._post` JSON 解码包装、`ModelGateway._subscription_ready` 校验 `reset_time > now` 且不持锁阻塞 RPC、每周反思逐人容错避免单人失败整批重跑
@@ -431,6 +431,7 @@
 
 | 日期 | 变更 |
 | --- | --- |
+| 2026-11-25 | 完成两项 P1（`REV-07` 行动约定异步化与失败判定、`REV-09` PDF 扫描件防误判、OCR 页数上限与视觉网关复用）；新增专项回归测试，相关套件 137 项与 `ruff` 全部通过 |
 | 2026-11-25 | 全量 Review 登记阶段 1.9（`REV-01`～`REV-12`），并完成全部 5 项 P0（`REV-01`～`REV-05`）及顺手修复 `REV-06`/`REV-08`；新增 6 项专项回归单测，全量 897 项单元测试 + `ruff` + 隔离环境真实 GPT 拟真验证全部通过 |
 | 2026-11-11 | 完成跑团系统调研：核对群内约定、现有备团与记忆路径，并查阅Chaosium、海豹、Foundry官方资料；提出独立团务状态、角色与资料权限、检定事务、共享记忆适配及6项后续待办；未上线这些扩展 |
 | 2026-11-11 | E-23：真实骰子、CoC七版百分比与奖惩、聊天隔离审计和请求去重；71项专项测试，完整785通过、24跳过；保留原有记忆、睡眠和任务逻辑 |

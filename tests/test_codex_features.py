@@ -336,6 +336,48 @@ def test_scanned_export_can_stop_before_writing_output(tmp_path):
     assert book.get(call.task_id, GROUP)["state"] == "cancelled"
 
 
+def test_text_pdf_with_cover_page_not_scanned_and_ocr_cap_resumes_from_cache(tmp_path):
+    # 5 页正常文字 PDF（第 1 页是空白封面，后 4 页是正常文字）：不应误判为扫描件，不触发视觉 OCR
+    writer = PdfWriter()
+    writer.append(PdfReader(BytesIO(image_pdf())))
+    for _ in range(4):
+        writer.append(PdfReader(BytesIO(pdf_bytes())))
+    book_pdf = BytesIO()
+    writer.write(book_pdf)
+
+    ocr_calls: list[int] = []
+    docs = Documents(tmp_path / "cache1", lambda p, n: ocr_calls.append(n) or f"OCR-{n}")
+    access = FileAccess(FilesSkillConfig(), tmp_path, tmp_path / "ws", lambda: [])
+    reader = ReadFile(FilesSkillConfig(), access, docs)
+    exporter = ExportText(reader)
+    saved = access.save_new("电子书.pdf", book_pdf.getvalue(), replace(GROUP))
+
+    read_res = reader.run("读文件", str(saved), replace(GROUP))
+    assert not read_res.view and ocr_calls == []
+    # 同时验证 ExportText 支持英文竖线 | 分隔符，且直接同步导出无需视觉识别
+    exp_res = exporter.run("转存文件", f"{saved}|正文.md", replace(GROUP))
+    assert exp_res.later is None and exp_res.files and ocr_calls == []
+
+    # 4 页纯扫描 PDF 配 max_ocr_pages=2：首轮识别 1-2 页并缓存后暂停，次轮复用缓存完成 3-4 页
+    scan_writer = PdfWriter()
+    for _ in range(4):
+        scan_writer.append(PdfReader(BytesIO(image_pdf())))
+    scan_buf = BytesIO()
+    scan_writer.write(scan_buf)
+    scan_calls: list[int] = []
+    capped_docs = Documents(
+        tmp_path / "cache2",
+        lambda p, n: scan_calls.append(n) or f"扫描页{n}",
+        max_ocr_pages=2,
+    )
+    with pytest.raises(SkillError, match="单次最多视觉识别 2 页"):
+        capped_docs.extract(scan_buf.getvalue(), replace(GROUP))
+    assert scan_calls == [1, 2]
+    full = capped_docs.extract(scan_buf.getvalue(), replace(GROUP))
+    assert scan_calls == [1, 2, 3, 4]
+    assert "扫描页1" in full and "扫描页4" in full
+
+
 def test_group_shell_selection_changes_only_child_environment(tmp_path, monkeypatch):
     from companion.config import GroupAgentConfig, SubscriptionConfig
     from companion.skills.group_agent import GroupAgent

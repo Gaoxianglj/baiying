@@ -185,7 +185,9 @@ class QQBot:
         self.now = clock or (lambda: datetime.now(UTC))
         self.on_daily = on_daily
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="companion")
+        self._promise_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="promise")
         self._trpg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trpg")
+        self._running_promises: set[int] = set()
         self._trpg_busy: dict[str, bool] = {}
         self._followups: dict[str, int] = {}
         self._quote_authors: dict[str, str] = {}
@@ -274,9 +276,25 @@ class QQBot:
             return
         now = self.now()
         for reminder in await self._call(self.c.reminders.due, now):
+            if reminder.id in self._running_promises:
+                continue
             retry = self._reminder_retry.get(reminder.id)
             if retry is None or now >= retry[1]:
-                await self._fire_reminder(reminder, now)
+                if reminder.kind == "action":
+                    self._running_promises.add(reminder.id)
+                    task = asyncio.create_task(self._run_action_promise(reminder, now))
+                    self._jobs.add(task)
+                    task.add_done_callback(self._jobs.discard)
+                else:
+                    await self._fire_reminder(reminder, now)
+
+    async def _run_action_promise(self, reminder: Reminder, now: datetime) -> None:
+        try:
+            await self._fire_reminder(reminder, now, use_promise_pool=True)
+        except Exception:
+            log.exception("后台执行行动约定 %d 出错", reminder.id)
+        finally:
+            self._running_promises.discard(reminder.id)
 
     def _resolve_promise_target(self, reminder: Reminder) -> Source | None:
         """校验约定的目标频道与立约人权限（私聊归本人；群聊须在白名单且立约人为熟络以上或主人）。"""
@@ -301,7 +319,9 @@ class QQBot:
             return Source("group", "", group_id, "", None, Incoming(text=""))
         return None
 
-    async def _fire_reminder(self, reminder: Reminder, now: datetime) -> None:
+    async def _fire_reminder(
+        self, reminder: Reminder, now: datetime, *, use_promise_pool: bool = False
+    ) -> None:
         src = await self._call(self._resolve_promise_target, reminder)
         if src is None:
             log.error("约定/提醒 %d 的目标或权限不合法，已丢弃：%s", reminder.id, reminder.channel)
@@ -320,7 +340,12 @@ class QQBot:
 
         outcome = self._reminder_text.get(reminder.id)
         if outcome is None:  # 只执行一次：重发时不再重复调用模型或重画
-            outcome = await self._call(self.c.fulfill_promise, reminder, now)
+            if use_promise_pool:
+                outcome = await asyncio.get_running_loop().run_in_executor(
+                    self._promise_executor, partial(self.c.fulfill_promise, reminder, now)
+                )
+            else:
+                outcome = await self._call(self.c.fulfill_promise, reminder, now)
             if not outcome.ok:
                 wait_min = max(5, outcome.defer_minutes)
                 await self._call(
@@ -454,6 +479,7 @@ class QQBot:
         return await loop.run_in_executor(self._executor, partial(fn, *args, **kwargs))
 
     def close(self) -> None:
+        self._promise_executor.shutdown(wait=True)
         self._trpg_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
 

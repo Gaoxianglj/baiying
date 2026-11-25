@@ -910,6 +910,8 @@ class Companion:
             else None
         )
         result: ChatResult | None = None
+        loop_completed = False
+        model_error: ModelError | None = None
         try:
             for _ in range(8):
                 result = self.gateway.chat(
@@ -919,6 +921,7 @@ class Companion:
                 )
                 found = action_skills.find(result.text, ctx)
                 if found is None:
+                    loop_completed = True
                     break
                 before, skill, marker, arg = found
                 call, outcome = action_skills.run(skill, marker, arg, ctx)
@@ -932,22 +935,33 @@ class Companion:
                         images=tuple(outcome.view),
                     ),
                 ]
+            if not loop_completed:
+                result = self.gateway.chat(messages, purpose="promise")
+                loop_completed = action_skills.find(result.text, ctx) is None
         except ModelError as e:
+            model_error = e
             log.warning("执行约定 %d 失败：%s", promise.id, e)
-            if not any(c.ok for c in calls):
-                return PromiseOutcome(ok=False, defer_minutes=15)
 
         images = [p for c in calls for p in c.images]
         files = [p for c in calls for p in c.files]
-        wrote_ok = any(c.ok and c.skill in {"write_files", "pictures", "image"} for c in calls)
-        if paint_failed and not images and not files and not wrote_ok:
-            log.info("约定 %d 因画图暂未成功推迟重试", promise.id)
+        mutating = {"write_files", "pictures", "image", "export_text"}
+        mutating_ok = (
+            any(c.ok and c.skill in mutating for c in calls)
+            or bool(images)
+            or bool(files)
+        )
+        any_skill_failed = any(not c.ok for c in calls)
+        if model_error is not None and not mutating_ok:
+            return PromiseOutcome(ok=False, defer_minutes=15)
+        if (paint_failed or any_skill_failed or not loop_completed) and not mutating_ok:
+            log.info("约定 %d 尚未产生有效结果或工具失败，推迟重试", promise.id)
             return PromiseOutcome(ok=False, defer_minutes=20)
-        if result is None:
+        if result is None and not mutating_ok:
             return PromiseOutcome(ok=False, defer_minutes=15)
 
+        raw_source = result.text if result is not None else ""
         raw_text = self._take_mood(
-            action_skills.strip_markers(result.text), promise.channel, promise.person_id, now
+            action_skills.strip_markers(raw_source), promise.channel, promise.person_id, now
         )
         raw_text = IMAGE_REF_NOTE.sub("", raw_text)
         raw_text, wanted = split_sticker(raw_text)

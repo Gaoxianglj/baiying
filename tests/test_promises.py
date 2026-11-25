@@ -379,3 +379,90 @@ def test_group_promise_cannot_be_hijacked_and_session_context_clears_when_empty(
         assert "没有生效的约定" in skill.session_context(ctx_owner)
     finally:
         c.close()
+
+
+def test_action_promise_readonly_then_error_defers_and_runs_async_off_main_executor(tmp_path):
+    import asyncio
+    import threading
+
+    from companion.core.companion import PromiseOutcome
+    from companion.models.openai_compat import ModelError
+
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+    cfg = load_config(tmp_path, environ={})
+    init_memory(MemoryLayout(cfg.memory_dir), "白璎", git=False)
+
+    step = {"n": 0}
+
+    def flaky_brain(messages, json_mode):
+        step["n"] += 1
+        if step["n"] == 1:
+            return "【看目录：.】"
+        raise ModelError("模拟第二步网络断流", retryable=True)
+
+    gateway, _ = scripted_gateway(flaky_brain)
+    c = Companion(cfg, gateway=gateway, embedder=FakeEmbedder())
+    try:
+        pid = c.people.ensure("qq", "10001", "波奇")
+        due, rep = parse_when("每天 15:00", NOW)
+        p = c.reminders.add(
+            "private:10001",
+            pid,
+            "每天写一张词语小笺存进 小笺/ 里",
+            due,
+            rep,
+            kind="action",
+            now=NOW,
+        )
+        # 1. 第一步只读【看目录】成功、第二步模型报错：不能假报“今天做好啦”，应推迟重试
+        out = c.fulfill_promise(p, local(2026, 11, 24, 15, 0))
+        assert out.ok is False and out.defer_minutes == 15
+
+        # 2. 行动约定在独立线程池异步执行，不阻塞 QQBot 主 _executor，且不会在执行中被二次触发
+        started = threading.Event()
+        release = threading.Event()
+        calls = {"count": 0}
+
+        def slow_fulfill(promise, now):
+            calls["count"] += 1
+            started.set()
+            release.wait(timeout=5)
+            return PromiseOutcome(ok=True, text="今天的小笺写好了", summary="完成")
+
+        c.fulfill_promise = slow_fulfill  # type: ignore[method-assign]
+
+        class FakeClient:
+            def __init__(self):
+                self.connected = asyncio.Event()
+                self.connected.set()
+                self.sent = []
+
+            async def call(self, action, params):
+                self.sent.append((action, params))
+                return {"message_id": 1}
+
+        bot = QQBot(
+            c,
+            QQConfig(bot_account="1000", owner_accounts=["10001"], groups=[]),
+            client=FakeClient(),
+            clock=lambda: local(2026, 11, 24, 15, 5),
+        )
+
+        async def scenario():
+            await bot.reminder_tick()
+            assert await asyncio.to_thread(started.wait, 2.0)
+            # 行动约定卡住期间，主 _executor 依然可立刻响应普通请求
+            val = await asyncio.wait_for(bot._call(lambda: "main-free"), timeout=1.0)
+            assert val == "main-free"
+            # 再次 tick 不应重复触发同一个正在跑的行动约定
+            await bot.reminder_tick()
+            assert calls["count"] == 1
+            release.set()
+            await bot.drain()
+            assert calls["count"] == 1
+            assert any("今天的小笺写好了" in str(p) for _, p in bot.client.sent)
+
+        asyncio.run(scenario())
+        bot.close()
+    finally:
+        c.close()
