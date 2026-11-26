@@ -12,7 +12,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from companion.config import Config
-from companion.life.activities import KINDS, ActivityPrep, ActivityResult, QuotaSession, quota_check
+from companion.life.activities import (
+    WRITE_KINDS,
+    ActivityPrep,
+    ActivityResult,
+    QuotaSession,
+    quota_check,
+)
+from companion.life.appearance import AppearanceStore
 from companion.life.days import (
     DayBook,
     DayPlan,
@@ -58,6 +65,7 @@ class Life:
         self.gateway = gateway
         self.days = DayBook(layout.self_dir / "days", self.start_hour)
         self.owner = OwnerPolicy(self.cfg.owner_chat, self.days, log)
+        self.appearance = AppearanceStore(layout, self.name)
         self._plan_failed_at: datetime | None = None
         self._limits: tuple[datetime, RateLimits] | None = None
 
@@ -201,9 +209,17 @@ class Life:
         cfg = self.cfg.activities
         if not cfg.enabled:
             return None
-        kinds = [k for k in KINDS if getattr(cfg, k)]
-        if not owner_ok:
-            kinds = [k for k in kinds if k != "chat_owner"]
+        if cfg.require_owner_shareable and not owner_ok:
+            return None
+        weights = {
+            "draw": cfg.weight_draw if cfg.draw else 0,
+            "poem": cfg.weight_poem if cfg.write else 0,
+            "explore": cfg.weight_explore if cfg.explore else 0,
+            "chat_owner": cfg.weight_chat_owner if (cfg.chat_owner and owner_ok) else 0,
+            "essay": cfg.weight_essay if cfg.write else 0,
+        }
+        weights = {k: int(v) for k, v in weights.items() if int(v) > 0}
+        kinds = list(weights)
         if not kinds:
             return None
         last = self.index.get_meta(LAST_ACTIVITY_META)
@@ -224,12 +240,18 @@ class Life:
             log.debug("先不做自主活动：%s", why)
             return None
         self.index.set_meta(QUOTA_META, session.to_json())
+        recent_acts = self.days.entries(now, "activities", days=7)
+        recent_kinds = [str(a.get("kind", "")) for a in recent_acts[-4:] if a.get("kind")]
         return ActivityPrep(
             name=self.name,
             owner_name=owner_name if owner_ok else None,
             kinds=kinds,
             context=self._activity_context(now),
             now=now,
+            weights=weights,
+            recent_kinds=recent_kinds,
+            share_required=cfg.require_owner_shareable,
+            outfit_text=self.appearance.current_outfit_text(),
         )
 
     def activity_done(self, now: datetime) -> None:
@@ -252,7 +274,7 @@ class Life:
             "summary": _clip(result.text, 80),
         }
         saved = None
-        if result.kind == "write" and result.text:
+        if result.kind in WRITE_KINDS and result.text:
             folder = self.layout.self_dir / "writings"
             folder.mkdir(parents=True, exist_ok=True)
             saved = folder / f"{self.days.key(now)}-{now.astimezone():%H%M}.md"

@@ -41,7 +41,7 @@ class OwnerPolicy:
     # ---- 早安、晚安 ----
 
     def greeting_due(self, owner_id: str, channel: str, now: datetime) -> str | None:
-        """该说早安 / 晚安了就返回 morning / night。刚聊过或次数用完的，记为跳过。"""
+        """该说早安 / 晚安了就返回 morning / night。早晚安固定发送，不受分享次数与未回复影响。"""
         if not (self.cfg.enabled and self.cfg.greetings):
             return None
         today = self.days.entries(now, "proactive")
@@ -52,7 +52,7 @@ class OwnerPolicy:
             target = self.greeting_time(now, kind, clock)
             if not target <= now <= target + GREETING_WINDOW:
                 continue
-            if len(_sent(today)) >= self.cfg.max_per_day or self._chatted(channel, now):
+            if self._chatted(channel, now):
                 self.record(now, kind, "", skipped=True)
                 return None
             return kind
@@ -76,15 +76,15 @@ class OwnerPolicy:
             return False, "主动找主人已关闭"
         if in_quiet(now, cfg.quiet_start, cfg.quiet_end):
             return False, "安静时段"
-        if len(_sent(self.days.entries(now, "proactive"))) >= cfg.max_per_day:
+        if len(_sent_shares(self.days.entries(now, "proactive"))) >= cfg.max_per_day:
             return False, "今天主动找的次数用完了"
-        recent = _sent(self.days.entries(now, "proactive", days=2))
+        recent = _sent_shares(self.days.entries(now, "proactive", days=2))
         if recent:
             last = recent[-1]
             ts = datetime.fromisoformat(last["ts"])
             if now - ts < timedelta(minutes=cfg.min_gap_minutes):
                 return False, "离上次主动找太近"
-            if last.get("kind") not in GREETINGS and not self._answered(channel, owner_id, ts):
+            if not self._answered(channel, owner_id, ts):
                 return False, "上一条主人还没回"
         if self._chatted(channel, now):
             return False, "刚聊过"
@@ -115,3 +115,8 @@ class OwnerPolicy:
 
 def _sent(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [e for e in entries if not e.get("skipped") and e.get("ts")]
+
+
+def _sent_shares(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """非早晚安的主动分享/找主人消息。"""
+    return [e for e in _sent(entries) if e.get("kind") not in GREETINGS]

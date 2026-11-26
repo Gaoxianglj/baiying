@@ -118,8 +118,9 @@ def _share_note(result: ActivityResult, who: str, with_image: bool) -> str:
             f"（你想主动找{who}聊聊：{result.topic}（{result.why}）。"
             "自然地开个头，一两句话；不合适就只输出【不回复】。）"
         )
-    if result.kind == "write":
-        detail = f"你写的：\n{result.text}\n想拿给{who}看，可以把它贴出来，再随口说一句。"
+    if result.kind in ("write", "poem", "essay"):
+        label = {"poem": "你写的小诗", "essay": "你写的随笔"}.get(result.kind, "你写的")
+        detail = f"{label}：\n{result.text}\n想拿给{who}看，可以把它贴出来，再随口说一句。"
     elif with_image:
         detail = "画好了，图会跟着你的话一起发过去。"
     else:
@@ -175,7 +176,10 @@ class Companion:
         self.life = Life(
             config=config, layout=self.layout, index=self.index, gateway=self.gateway, log=self.log
         )
-        self.activities = ActivityRunner(self._life_backend_factory())
+        self.appearance = self.life.appearance
+        self.activities = ActivityRunner(
+            self._life_backend_factory(), appearance=self.appearance
+        )
         self.retriever = HybridRetriever(
             self.index,
             self.embedder,
@@ -210,7 +214,13 @@ class Companion:
         self.reminders: PromiseBook = ReminderBook(config.data_dir / "reminders.json")
         if skills is None:
             skills = build_skills(
-                config, self.gateway, self.reminders, self.log, self.media, people=self.people
+                config,
+                self.gateway,
+                self.reminders,
+                self.log,
+                self.media,
+                people=self.people,
+                appearance=self.appearance,
             )
         self.tasks = TaskBook(config.data_dir / "run" / "tasks.json")
         self.background_gateway_factory = lambda: build_gateway(self.config, task_mode=True)
@@ -244,10 +254,15 @@ class Companion:
                     self.log,
                     self.media,
                     people=self.people,
+                    appearance=self.appearance,
                 ),
                 Trpg(self.trpg),
             ],
         )
+
+    def refresh_outfit_sheet(self, now: datetime | None = None) -> Path | None:
+        """若穿搭描述变化且已有人物基础设定图，自动重生成当前服装设定图。"""
+        return self.activities.refresh_outfit(now=now)
 
     def _resume_task(self, row: dict, ctx: SkillContext) -> SkillResult:
         skill = next((s for s in self.skills.available(ctx) if s.name == row["skill"]), None)

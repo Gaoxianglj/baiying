@@ -83,7 +83,7 @@ class FakeLife:
                     "share": True, "mood": ""}  # fmt: skip
         return ChatResult(json.dumps(data, ensure_ascii=False), "life", "fake")
 
-    def generate_image(self, prompt):
+    def generate_image(self, prompt, references=()):
         self.calls.append("画：" + prompt)
         return self.image, "窗边的雪"
 
@@ -232,10 +232,14 @@ def test_prepare_activity_only_on_subscription(c):
 
 
 def test_prepare_activity_respects_gap(c):
-    assert c.prepare_activity(NOW) is not None
+    assert c.prepare_activity(NOW, owner_id=c.owner_id, owner_channel=CHANNEL) is not None
     c.finish_activity(None, NOW)
-    assert c.prepare_activity(NOW + timedelta(minutes=5)) is None
-    assert c.prepare_activity(NOW + timedelta(minutes=25)) is not None
+    assert c.prepare_activity(
+        NOW + timedelta(minutes=5), owner_id=c.owner_id, owner_channel=CHANNEL
+    ) is None
+    assert c.prepare_activity(
+        NOW + timedelta(minutes=25), owner_id=c.owner_id, owner_channel=CHANNEL
+    ) is not None
 
 
 # ---- 做事 ----
@@ -327,6 +331,9 @@ def test_bot_greets_and_shares_with_owner_only(c):
     assert sends[0]["user_id"] == int(OWNER)
 
     c.config.life.activities.enabled = True
+    c.config.life.activities.draw = False
+    c.config.life.activities.write = False
+    c.config.life.activities.chat_owner = False
     clock["now"] = NOW
     c.brain.reply = "我刚查到雪花为什么是六角形，好神奇"
     asyncio.run(_tick(bot))

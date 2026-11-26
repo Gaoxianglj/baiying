@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -22,12 +23,14 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from companion.config import ActivityConfig
+from companion.life.appearance import AppearanceStore
 from companion.models.codex_app_server import RateLimits, RateWindow
 from companion.models.openai_compat import ChatMessage, ChatResult, ModelError
 
 log = logging.getLogger(__name__)
 
-KINDS = ("explore", "write", "draw", "chat_owner")
+KINDS = ("draw", "poem", "explore", "chat_owner", "essay")
+WRITE_KINDS = ("write", "poem", "essay")
 
 LIFE_INSTRUCTIONS = """你在陪一个叫“{name}”的 AI 角色度过她的空闲时间：
 替她挑事情、查资料、写东西、画画。可以用联网搜索和生图工具；不要执行命令，不要读写文件。
@@ -117,11 +120,15 @@ class ActivityPrep:
     kinds: list[str]
     context: str
     now: datetime
+    weights: dict[str, int] = field(default_factory=dict)
+    recent_kinds: list[str] = field(default_factory=list)
+    share_required: bool = False
+    outfit_text: str = ""
 
 
 @dataclass
 class ActivityResult:
-    kind: str  # explore / write / draw / chat_owner / rest
+    kind: str  # draw / poem / essay / write / explore / chat_owner / rest
     topic: str = ""
     why: str = ""
     title: str = ""  # 一句话：做了什么
@@ -139,13 +146,22 @@ CHOOSE_PROMPT = """你是{name}，一个 AI。现在你有一段空闲时间，�
 - rest：什么都不做，发会儿呆。
 按【你的兴趣】【你的今天】【你现在的心情】来选，和【最近做过的事】别重复；
 可以从【最近大家在聊的】里找灵感。topic 要具体（比如“雪花为什么是六角形”，而不是“科学”）。
-json：{{"kind": "...", "topic": "...", "why": "一句话，为什么想做这个"}}"""
+如果选的是 draw 且画面里出现了{name}自己，请把 includes_self 设为 true，否则设为 false。
+json：{{"kind": "...", "topic": "...", "why": "一句话，为什么想做这个", "includes_self": false}}"""
 
 KIND_HELP = {
+    "draw": (
+        "- draw：画一张安静的小画（topic 写具体画面）。"
+        "默认优先画三类题材：1）风景（自然光影、四季、窗外、雪景夜色、街巷等）；"
+        "2）植物（花卉、草木、枝叶、果蔬、盆栽等）；"
+        "3）画你自己（{name}本人在安静日常场景里的样子，穿着当前的服装）。"
+        "如果此刻有别的心动题材也可以画，不做限制"
+    ),
+    "poem": "- poem：写一首很短的小诗（topic 写题目；分行短诗，6～14 行左右，不要写成散文片段）",
     "explore": "- explore：上网查一个你此刻真的好奇的东西，或者找点有趣的小事、冷知识",
-    "write": "- write：写一首很短的小诗或一小段随笔（topic 写题目）",
-    "draw": "- draw：画一张安静的小画（topic 写画面）",
     "chat_owner": "- chat_owner：主动找{owner}聊一个话题（topic 写想聊什么）",
+    "essay": "- essay：写一小段随笔或微片段（topic 写题目）",
+    "write": "- write：写一首很短的小诗或一小段随笔（topic 写题目）",
 }
 
 CHOOSE_SCHEMA: dict[str, Any] = {
@@ -154,8 +170,9 @@ CHOOSE_SCHEMA: dict[str, Any] = {
         "kind": {"type": "string"},
         "topic": {"type": "string"},
         "why": {"type": "string"},
+        "includes_self": {"type": "boolean"},
     },
-    "required": ["kind", "topic", "why"],
+    "required": ["kind", "topic", "why", "includes_self"],
     "additionalProperties": False,
 }
 
@@ -166,6 +183,22 @@ EXPLORE_PROMPT = """你是{name}。你想查一查：{topic}（{why}）。
 - sources：参考的网址，一两个；
 - share：值不值得随口跟{owner}分享（真的有趣才 true）；
 - mood：查完后的心情，写成“词｜原因”；没什么变化就留空。"""
+
+POEM_PROMPT = """你是{name}，一个安静、喜欢读书的文学少女 AI。请写一首短诗：{topic}（{why}）。
+要求：现代短诗，分节分行（6～14 行左右），意象干净克制、留白自然，不要堆砌辞藻，
+也不要写成散文段子。输出 json：
+- title：诗的题目；
+- text：诗的正文（用换行分行）；
+- share：想不想拿给{owner}看（写得满意才 true）；
+- mood：写完后的心情，写成“词｜原因”；没什么变化就留空。"""
+
+ESSAY_PROMPT = """你是{name}，一个安静、喜欢读书的文学少女 AI。
+请写一小段随笔或微片段：{topic}（{why}）。
+250 字以内，用你自己的语气，细腻自然，不要堆砌辞藻。输出 json：
+- title：题目；
+- text：正文；
+- share：想不想拿给{owner}看（写得满意才 true）；
+- mood：写完后的心情，写成“词｜原因”；没什么变化就留空。"""
 
 WRITE_PROMPT = """你是{name}，一个安静、喜欢读书的文学少女 AI。请写：{topic}（{why}）。
 一首很短的小诗或一小段随笔，300 字以内，用你自己的语气，不要堆砌辞藻。输出 json：
@@ -190,10 +223,22 @@ RESULT_SCHEMA: dict[str, Any] = {
 DRAW_STYLE = "安静、柔和的插画风格，白色与浅色为主，画面干净，不要文字"
 
 
+def _topic_mentions_self(topic: str, name: str) -> bool:
+    return any(tok in topic for tok in (name, "自己", "自画像", "银白长发", "白发少女"))
+
+
 class ActivityRunner:
-    def __init__(self, make_backend: Callable[[], LifeBackend] | None) -> None:
+    def __init__(
+        self,
+        make_backend: Callable[[], LifeBackend] | None,
+        *,
+        appearance: AppearanceStore | None = None,
+        rng: random.Random | None = None,
+    ) -> None:
         self._make = make_backend
         self._backend: LifeBackend | None = None
+        self.appearance = appearance
+        self.rng = rng or random.Random()
 
     @property
     def available(self) -> bool:
@@ -203,6 +248,17 @@ class ActivityRunner:
         if self._backend is not None:
             self._backend.close()
             self._backend = None
+
+    def refresh_outfit(self, now: datetime | None = None) -> Path | None:
+        """若穿搭发生变化，复用做事进程按基础设定图重新生成当前服装设定图。"""
+        if self.appearance is None or not self.available:
+            return None
+        if not self.appearance.needs_outfit_refresh():
+            return self.appearance.outfit_path()
+        if self._backend is None:
+            assert self._make is not None
+            self._backend = self._make()
+        return self.appearance.refresh_outfit(self._backend, now=now)
 
     def perform(self, prep: ActivityPrep) -> ActivityResult | None:
         """挑一件事并做完（几十秒到几分钟）；出错返回 None。"""
@@ -219,35 +275,87 @@ class ActivityRunner:
         log.info("自主活动（%s，%.0f 秒）：%s", result.kind, result.seconds, result.title or "发呆")
         return result
 
+    def _pick_kind(self, weights: dict[str, int], recent_kinds: list[str]) -> str | None:
+        items = [(k, float(w)) for k, w in weights.items() if w > 0 and k in KIND_HELP]
+        if not items:
+            return None
+        if len(items) > 1 and recent_kinds:
+            last = recent_kinds[-1]
+            recent = set(recent_kinds[-3:])
+            adjusted: list[tuple[str, float]] = []
+            for k, w in items:
+                if k == last:
+                    w *= 0.4
+                elif k in recent:
+                    w *= 0.75
+                adjusted.append((k, w))
+            items = adjusted
+        keys = [k for k, _ in items]
+        vals = [w for _, w in items]
+        return self.rng.choices(keys, weights=vals, k=1)[0]
+
     def _perform(self, prep: ActivityPrep) -> ActivityResult:
         if self._backend is None:
             assert self._make is not None
             self._backend = self._make()
         b = self._backend
         owner = prep.owner_name or "主人"
-        kinds = "\n".join(KIND_HELP[k].format(owner=owner) for k in prep.kinds)
+        allowed_kinds = list(prep.kinds)
+        if prep.weights:
+            picked = self._pick_kind(prep.weights, prep.recent_kinds)
+            if picked is None:
+                return ActivityResult("rest")
+            allowed_kinds = [picked]
+        kinds = "\n".join(
+            KIND_HELP[k].format(owner=owner, name=prep.name)
+            for k in allowed_kinds
+            if k in KIND_HELP
+        )
         choice = self._json(
             b, CHOOSE_PROMPT.format(name=prep.name, kinds=kinds), prep.context, CHOOSE_SCHEMA
         )
         kind = str(choice.get("kind", "rest"))
         topic = str(choice.get("topic", "")).strip()[:80]
         why = str(choice.get("why", "")).strip()[:80]
-        if kind not in prep.kinds or not topic:
+        if kind not in allowed_kinds or not topic:
             return ActivityResult("rest")
         if kind == "chat_owner":
             return ActivityResult(kind, topic, why, title=f"想和{owner}聊聊{topic}", share=True)
         if kind == "draw":
-            path, revised = b.generate_image(f"{topic}。{DRAW_STYLE}")
+            includes_self = bool(choice.get("includes_self")) or _topic_mentions_self(
+                topic, prep.name
+            )
+            ref = (
+                self.appearance.self_draw_reference(b, now=prep.now)
+                if includes_self and self.appearance is not None
+                else None
+            )
+            if ref is not None:
+                outfit_hint = f"当前穿搭参考：{prep.outfit_text}。" if prep.outfit_text else ""
+                prompt = (
+                    f"{topic}。画面中人物「{prep.name}」的外貌、银白色长发、神态与服装必须严格保持与参考图一致。"
+                    f"{outfit_hint}{DRAW_STYLE}"
+                )
+                path, revised = b.generate_image(prompt, [ref])
+            else:
+                path, revised = b.generate_image(f"{topic}。{DRAW_STYLE}")
             return ActivityResult(
                 kind, topic, why, title=f"画了{topic}", text=revised[:200], share=True, image=path
             )
-        prompt = EXPLORE_PROMPT if kind == "explore" else WRITE_PROMPT
+        prompt_map = {
+            "explore": EXPLORE_PROMPT,
+            "poem": POEM_PROMPT,
+            "essay": ESSAY_PROMPT,
+            "write": WRITE_PROMPT,
+        }
+        prompt = prompt_map[kind]
         data = self._json(
             b, prompt.format(name=prep.name, topic=topic, why=why, owner=owner), "", RESULT_SCHEMA
         )
         title = str(data.get("title", "")).strip()[:60] or topic
-        if kind == "write":
+        if kind in WRITE_KINDS:
             title = f"写了《{title.strip('《》')}》"
+        want_share = bool(data.get("share")) or prep.share_required
         return ActivityResult(
             kind,
             topic,
@@ -255,7 +363,7 @@ class ActivityRunner:
             title=title,
             text=str(data.get("text", "")).strip()[:600],
             sources=[str(s) for s in data.get("sources") or []][:3],
-            share=bool(data.get("share")) and prep.owner_name is not None,
+            share=want_share and prep.owner_name is not None,
             mood=_mood(data.get("mood")),
         )
 

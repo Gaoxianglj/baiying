@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 from companion.config import Config
+from companion.life.appearance import AppearanceStore
 from companion.media import MediaStore
 from companion.memory.events import EventLog
 from companion.memory.people import PeopleRegistry
@@ -37,6 +38,7 @@ def build_skills(
     store: MediaStore,
     *,
     people: PeopleRegistry | None = None,
+    appearance: AppearanceStore | None = None,
 ) -> list[Skill]:
     sub = config.models.subscription
     painter = None
@@ -126,6 +128,7 @@ def build_skills(
             quota_ok=gateway.subscription_available,
             images=images,
             access=access,
+            appearance=appearance,
         ),
         CodexAgent(
             config.skills.agent,

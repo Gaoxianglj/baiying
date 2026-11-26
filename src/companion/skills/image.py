@@ -25,6 +25,7 @@ from uuid import uuid4
 
 from companion import media
 from companion.config import ImageSkillConfig
+from companion.life.appearance import AppearanceStore
 from companion.models.openai_compat import ModelError
 from companion.skills.access import FileAccess
 from companion.skills.base import Skill, SkillContext, SkillError, SkillResult
@@ -61,6 +62,7 @@ class _Job:
     references: tuple[Path, ...]
     save_to: str | None
     stamp: datetime | None  # 占用的群聊限额（没画出来要退）
+    use_self_ref: bool = False
 
 
 class ImageGen(Skill):
@@ -85,6 +87,7 @@ class ImageGen(Skill):
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         images: ChatImages | None = None,
         access: FileAccess | None = None,
+        appearance: AppearanceStore | None = None,
     ) -> None:
         self.cfg = cfg
         self._make_painter = painter
@@ -94,6 +97,7 @@ class ImageGen(Skill):
         self.now = clock
         self.images = images
         self.access = access
+        self.appearance = appearance
         self._lock = threading.Lock()
         self._paint_lock = threading.Lock()  # 一次只画一张，后面的排队
         self._queued = 0
@@ -102,6 +106,13 @@ class ImageGen(Skill):
 
     def enabled(self) -> bool:
         return self.cfg.enabled and self._make_painter is not None
+
+    def context(self, ctx: SkillContext) -> str | None:
+        if self.appearance is not None and (
+            self.appearance.outfit_path() is not None or self.appearance.base_path() is not None
+        ):
+            return "画你自己时，请加｜参考：设定图，保持你的外貌、银白色长发和当前服装一致。"
+        return None
 
     def status(self) -> str:
         if self._make_painter is None:
@@ -119,7 +130,7 @@ class ImageGen(Skill):
             raise SkillError("没说要画什么")
         if not self.quota_ok():
             raise SkillError("GPT 订阅额度快用完了，暂时不能画画，等额度恢复再说")
-        references = self._references(refs, ctx)
+        references, use_self_ref = self._references(refs, ctx)
         with self._lock:
             if self._queued >= self.cfg.queue_limit:
                 raise SkillError(f"已经排了 {self._queued} 张了，等前面的画完再说")
@@ -137,7 +148,7 @@ class ImageGen(Skill):
                 self._save_group_times([*times, stamp])
             ahead = self._queued
             self._queued += 1
-        job = _Job(prompt, marker == "画动图", references, save_to, stamp)
+        job = _Job(prompt, marker == "画动图", references, save_to, stamp, use_self_ref)
         queue = f"前面还有 {ahead} 张在画，" if ahead else ""
         return SkillResult(
             f"已经开始画了，{queue}大约半分钟到一分钟一张，画好会自动发给对方。"
@@ -145,14 +156,27 @@ class ImageGen(Skill):
             later=lambda: self._paint(job, ctx),
         )
 
-    def _references(self, refs: list[str], ctx: SkillContext) -> tuple[Path, ...]:
+    def _references(self, refs: list[str], ctx: SkillContext) -> tuple[tuple[Path, ...], bool]:
         if not refs:
-            return ()
-        if self.images is None:
-            raise SkillError("现在不能用参考图")
+            return (), False
         if len(refs) > MAX_REFERENCES:
             raise SkillError(f"参考图最多 {MAX_REFERENCES} 张")
-        return tuple(self.images.find(ref, ctx).view for ref in refs)
+        self_tokens = {"设定图", "自己", "自我"}
+        if self.appearance is not None:
+            self_tokens.add(self.appearance.name)
+        use_self_ref = False
+        normal_refs: list[str] = []
+        for ref in refs:
+            if ref in self_tokens and self.appearance is not None:
+                if self.appearance.outfit_path() is None and self.appearance.base_path() is None:
+                    raise SkillError("还没有放入人物设定图")
+                use_self_ref = True
+            else:
+                normal_refs.append(ref)
+        if normal_refs and self.images is None:
+            raise SkillError("现在不能用参考图")
+        resolved = tuple(self.images.find(ref, ctx).view for ref in normal_refs) if normal_refs else ()
+        return resolved, use_self_ref
 
     def _paint(self, job: _Job, ctx: SkillContext) -> SkillResult:
         try:
@@ -160,8 +184,13 @@ class ImageGen(Skill):
                 if self._painter is None:
                     assert self._make_painter is not None
                     self._painter = self._make_painter()
+                refs = list(job.references)
+                if job.use_self_ref and self.appearance is not None:
+                    self_ref = self.appearance.self_draw_reference(self._painter, now=self.now())
+                    if self_ref is not None:
+                        refs.insert(0, self_ref)
                 prompt = GIF_PROMPT.format(prompt=job.prompt) if job.animated else job.prompt
-                path, revised = self._painter.generate_image(prompt, job.references)
+                path, revised = self._painter.generate_image(prompt, refs)
             description = revised
             if job.animated:
                 path = self._to_gif(path)

@@ -235,9 +235,9 @@ class OwnerChatConfig(_Section):
     morning: str = "08:30"  # 本地时间；每天前后随机 jitter_minutes 分钟
     night: str = "23:30"
     jitter_minutes: float = 20.0
-    max_per_day: int = 4  # 每天最多主动找几次（含早晚安）
-    min_gap_minutes: float = 120.0  # 两次主动找之间至少隔多久
-    quiet_start: str = "00:30"  # 这段时间不主动找（晚安除外）
+    max_per_day: int = 4  # 每天最多主动分享几次（不含早晚安，早晚安按设定时间固定发送）
+    min_gap_minutes: float = 120.0  # 两次主动分享之间至少隔多久
+    quiet_start: str = "00:30"  # 这段时间不主动分享（早晚安除外）
     quiet_end: str = "08:00"
     skip_if_chatted_minutes: float = 60.0  # 刚聊过就不主动找
 
@@ -258,6 +258,7 @@ class ActivityConfig(_Section):
     """
 
     enabled: bool = True
+    require_owner_shareable: bool = True  # 绑定主动找主人：只在当前能发给主人时才做事，避免浪费
     trigger_used_below: float = 15.0  # 5 小时窗口用量低于这个百分比才开始
     trigger_minutes_before_reset: float = 90.0  # 距离 5 小时窗口重置不到这么久才开始
     budget_percent: float = 15.0  # 每个 5 小时窗口里，自主活动最多花掉多少
@@ -265,9 +266,14 @@ class ActivityConfig(_Section):
     min_gap_minutes: float = 20.0  # 两件事之间至少隔多久
     max_per_window: int = 8  # 每个窗口最多做几件（额度读数不准时的保险）
     explore: bool = True  # 联网查感兴趣的东西、收集趣事
-    write: bool = True  # 写短诗、随笔
+    write: bool = True  # 写短诗、随笔（总开关）
     draw: bool = True  # 画画
     chat_owner: bool = True  # 找主人聊天（还受“主动找主人”的限制）
+    weight_draw: int = 5  # 画画优先度（0 = 不选，1~10 越高越优先）
+    weight_poem: int = 3  # 写诗优先度
+    weight_explore: int = 2  # 查资料、收集趣事优先度
+    weight_chat_owner: int = 2  # 找主人聊天优先度
+    weight_essay: int = 1  # 散文与小片段优先度
     timeout_seconds: float = 600.0  # 后台做事，慢一点没关系；画图偶尔要三四分钟
 
 

@@ -265,6 +265,15 @@ class Sleeper:
             except ModelError as e:
                 weekly_ok = False
                 report.errors.append(f"喜好审视：{e}")
+            if (
+                report.preferences_reflected
+                and self.c.appearance.needs_outfit_refresh()
+                and self.c.gateway.subscription_available(now)
+            ):
+                try:
+                    self.c.refresh_outfit_sheet(now=now)
+                except (ModelError, OSError) as e:
+                    report.errors.append(f"服装设定图更新：{e}")
             try:
                 report.style_reflected = self._reflect_style(since)
             except ModelError as e:
