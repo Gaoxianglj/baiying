@@ -111,7 +111,10 @@ class ImageGen(Skill):
         if self.appearance is not None and (
             self.appearance.outfit_path() is not None or self.appearance.base_path() is not None
         ):
-            return "画你自己时，请加｜参考：设定图，保持你的外貌、银白色长发和当前服装一致。"
+            return (
+                "画你自己时，请加｜参考：设定图，保持动漫形象、银白色长发与当前服装一致；"
+                "画面追求自然光影、浅景深与抓拍照片感，不要水彩绘画感。"
+            )
         return None
 
     def status(self) -> str:

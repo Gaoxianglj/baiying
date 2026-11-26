@@ -221,6 +221,11 @@ RESULT_SCHEMA: dict[str, Any] = {
 }
 
 DRAW_STYLE = "安静、柔和的插画风格，白色与浅色为主，画面干净，不要文字"
+SELF_DRAW_STYLE = (
+    "精致日系二次元动漫人物与写实电影感自然光影结合，富有日常抓拍的照片感："
+    "真实柔和的自然光与逆光发丝高光、光学浅景深虚化、真实的环境材质与光影反射、"
+    "自然构图，不要水彩手绘感或平面绘画感，不要文字"
+)
 
 
 def _topic_mentions_self(topic: str, name: str) -> bool:
@@ -333,8 +338,9 @@ class ActivityRunner:
             if ref is not None:
                 outfit_hint = f"当前穿搭参考：{prep.outfit_text}。" if prep.outfit_text else ""
                 prompt = (
-                    f"{topic}。画面中人物「{prep.name}」的外貌、银白色长发、神态与服装必须严格保持与参考图一致。"
-                    f"{outfit_hint}{DRAW_STYLE}"
+                    f"{topic}。画面中动漫角色「{prep.name}」的五官、银白色长发、侧编发、"
+                    "瞳色与服装必须严格保持与参考图一致。"
+                    f"{outfit_hint}{SELF_DRAW_STYLE}"
                 )
                 path, revised = b.generate_image(prompt, [ref])
             else:
