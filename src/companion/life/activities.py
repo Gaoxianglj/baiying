@@ -338,7 +338,7 @@ class ActivityRunner:
             if ref is not None:
                 outfit_hint = f"当前穿搭参考：{prep.outfit_text}。" if prep.outfit_text else ""
                 prompt = (
-                    f"{topic}。画面中动漫角色「{prep.name}」的五官、银白色长发、侧编发、"
+                    f"{topic}。画面中动漫角色「{prep.name}」的五官、银白色长发与发饰、"
                     "瞳色与服装必须严格保持与参考图一致。"
                     f"{outfit_hint}{SELF_DRAW_STYLE}"
                 )
