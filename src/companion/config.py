@@ -178,7 +178,7 @@ class QQConfig(_Section):
             return [v.strip() for v in value.split(",") if v.strip()]
         return value
 
-    conversation_followups: int = Field(default=2, ge=0, le=20)
+    conversation_followups: int = Field(default=7, ge=0, le=20)
 
 
 class VisionConfig(_Section):

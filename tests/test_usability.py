@@ -162,12 +162,24 @@ def test_active_group_does_not_answer_other_mentions_gossip_or_acknowledgments(b
 
 def test_auto_followup_budget_requires_a_new_direct_invitation(bot):  # noqa: F811
     bot.cfg.unsolicited_probability = 0
+    assert bot.cfg.conversation_followups == 7
+    bot.cfg.conversation_followups = 2
     run(bot, msg("白璎在吗", group="4000", at_bot=True, mid=10))
     for i in range(3):
         run(bot, msg("你还在吗", group="4000", mid=11 + i))
     assert len(bot.chat.requests) == 3
     run(bot, msg("白璎帮我看看", group="4000", at_bot=True, mid=20))
     assert len(bot.chat.requests) == 4
+
+
+def test_active_partner_continues_without_fixed_keywords(bot):  # noqa: F811
+    bot.cfg.unsolicited_probability = 0
+    run(bot, msg("把图中三人换成群里三人", group="4000", at_bot=True, mid=30))
+    before = len(bot.chat.requests)
+    run(bot, msg("在说话的三个", group="4000", mid=31))
+    assert len(bot.chat.requests) == before + 1
+    run(bot, msg("自己想哪个合适自己换", group="4000", mid=32))
+    assert len(bot.chat.requests) == before + 2
 
 
 def test_prepare_associates_rules_template_and_card_and_resolves_qq_identity(game):  # noqa: F811
@@ -408,6 +420,7 @@ def test_active_campaign_keeps_ordinary_lunch_chatter_out_of_host_but_accepts_ac
     c, s, gm, pc, cid = qq_host(bot)
     bot.cfg.unsolicited_probability = 0
     run(bot, msg("团外：白璎早上好", group="4000", mid=201))
+    bot._last_spoke.clear()  # 90 秒活跃期外：群里普通闲聊既不进团务也不触发日常续聊
     before = len(bot.chat.requests)
     run(bot, msg("今天的午饭还不错", group="4000", mid=202))
     assert len(bot.chat.requests) == before and not c.store.metrics(cid)

@@ -635,16 +635,27 @@ class QQBot:
         seen = partners.get(src.user_id)
         text = src.incoming.text
         if seen is not None and self.now() - seen <= window:
-            if re.search(
-                r"你|刚才|刚刚|这个|那个|这样|那样|然后|继续|为什么|怎么|还在|在吗|^嘿$", text
-            ):
-                return "partner"
-            return None
+            if self._meta_tech_gossip(text):
+                return None
+            return "partner"
         if self.cfg.others_join_conversation and re.search(
             r"^(?:我也|也想|你们|你刚|那首|这首|刚刚|刚才)", text.strip()
         ):
             return "other"
         return None
+
+    def _meta_tech_gossip(self, text: str) -> bool:
+        """群里不含“你”或她名字、纯议论模型/后台/设置的元讨论，活跃期内也不误接。"""
+        if "你" in text or any(name in text for name in self.cfg.aliases):
+            return False
+        return bool(
+            re.search(
+                r"\b(?:gpt|codex|deepseek|gemini|claude|openai|llm|api|token)\b"
+                r"|模型|后台|设置|参数|配置|接口|额度",
+                text,
+                re.IGNORECASE,
+            )
+        )
 
     def _not_for_me(self, src: Source) -> bool:
         inc = src.incoming
