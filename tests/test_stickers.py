@@ -432,6 +432,53 @@ def test_qq_sends_jpeg_for_old_sticker(companion, tmp_path):
     assert Image.open(io.BytesIO(sent)).format == "JPEG"
 
 
+def test_sticker_only_reply_has_no_ghost_text_and_bypasses_drop_prob(companion, tmp_path):
+    companion.stickers.add(jpg(tmp_path, "s", "red"), "sigh", "一只摊手的猫", "无奈", None)
+    companion.config.stickers.send_probability = 0.0  # 纯表情回复不应被随机概率静默吞掉
+    old = Brain.reply
+    Brain.reply = "【表情：无奈】"
+    try:
+        r = companion.reply(body="cli", channel="cli:x", account="x", text="哈哈", now=T0)
+        assert r.text == "" and r.sticker is not None and r.sticker.digest == "sigh"
+        mine = [e.content for e in companion.log.iter_events() if e.actor.person_id == "self"]
+        assert mine == ["[表情包：一只摊手的猫]"]
+    finally:
+        Brain.reply = old
+
+
+def test_look_collects_unlabelled_animated_gif_and_reuses_cache(companion):
+    gif = animated_bytes()
+    desc, digest = companion.look(gif, sticker=False, person_id="p1")
+    assert desc == "一只摊手的猫"
+    assert companion.stickers.get(digest) is not None
+    calls = len(companion.chat.requests)
+    # 再次作为普通图片发来时直接复用缓存，不再调视觉模型
+    desc2, digest2 = companion.look(gif, sticker=False, person_id="p2")
+    assert desc2 == desc and digest2 == digest
+    assert len(companion.chat.requests) == calls
+    assert companion.stickers.get(digest).seen == 2
+
+
+def test_look_collects_unlabelled_static_meme_but_skips_character_sheet(companion):
+    def fake_vision(messages, json_mode):
+        if json_mode:
+            return json.dumps(
+                {"description": "一只举爪说好的小猫", "emotion": "应允", "usable": True},
+                ensure_ascii=False,
+            )
+        return fake_vision.desc
+
+    fake_vision.desc = "一只脸颊泛红的卡通小猫举起爪子，气泡写着好的。这张表情包表达了俏皮的应允。"
+    companion.gateway.fallback.client.handler = fake_vision
+    _, digest_meme = companion.look(png_bytes("yellow"), sticker=False, person_id="p1")
+    assert companion.stickers.get(digest_meme) is not None
+    assert companion.stickers.get(digest_meme).emotion == "应允"
+
+    fake_vision.desc = "这是一张角色设定图与三视图，旁边贴了三张猫猫虫表情包。"
+    _, digest_sheet = companion.look(png_bytes("purple"), sticker=False, person_id="p1")
+    assert companion.stickers.get(digest_sheet) is None
+
+
 async def _handle_and_drain(bot, ev):
     await bot.handle_event(ev)
     await bot.drain()

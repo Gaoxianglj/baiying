@@ -44,7 +44,7 @@ from companion.skills.native import NativeSkills
 from companion.skills.reminder import Promise, PromiseBook, Reminder, ReminderBook
 from companion.skills.tasks import TaskBook, TaskControl
 from companion.skills.trpg import Trpg
-from companion.stickers import Sticker, StickerBook, split_sticker
+from companion.stickers import Sticker, StickerBook, is_animated, split_sticker
 from companion.trpg.controller import Controller as TrpgController
 
 log = logging.getLogger(__name__)
@@ -109,6 +109,34 @@ def _said(text: str, actions: Actions) -> str:
     if actions.poke:
         parts.append("[戳了戳对方]")
     return " ".join(parts) or "…"
+
+
+_NON_STICKER_HINTS = (
+    "截图",
+    "帖子",
+    "网页",
+    "聊天记录",
+    "设定图",
+    "立绘",
+    "三视图",
+    "照片",
+    "自拍",
+    "海报",
+    "宣传",
+    "公告",
+    "界面",
+)
+
+
+def _looks_like_sticker_desc(description: str) -> bool:
+    """普通看图未带 sub_type=1 时，根据画面描述判断是否明显是日常表情包/梗图。"""
+    if any(bad in description for bad in _NON_STICKER_HINTS):
+        return False
+    return (
+        "表情包" in description
+        or "梗图" in description
+        or ("表情" in description and "表达" in description)
+    )
 
 
 def _share_note(result: ActivityResult, who: str, with_image: bool) -> str:
@@ -375,7 +403,12 @@ class Companion:
             text, wanted = "", None
         images = [p for c in calls for p in c.images]
         files = [p for c in calls for p in c.files]
-        sticker = self._choose_sticker(channel, wanted, now) if wanted and emotions else None
+        sticker_only = not (text.strip() or actions or images or files)
+        sticker = (
+            self._choose_sticker(channel, wanted, now, force_prob=sticker_only)
+            if wanted and emotions
+            else None
+        )
         if not images and not files and not actions and not text.strip() and sticker is None:
             return Reply("", result, bundle, incoming, None, silent=True, skill_calls=calls,
                          skill_ctx=skill_ctx)  # fmt: skip
@@ -390,12 +423,16 @@ class Companion:
             meta["skills"] = [{"skill": c.skill, "arg": c.arg[:200], "ok": c.ok} for c in calls]
             if any(c.skill == "trpg" for c in calls):
                 meta["fiction"] = True
-        event = self.ingest.record_self(
-            body=body, channel=channel, content=_said(text, actions), ts=now, meta=meta
-        )
-        self.gateway.note_response(result, event.id)
-        if sticker is not None:
-            self._record_sticker(body, channel, sticker, now)
+        if not text and not actions and sticker is not None:
+            event = self._record_sticker(body, channel, sticker, now, extra_meta=meta)
+            self.gateway.note_response(result, event.id)
+        else:
+            event = self.ingest.record_self(
+                body=body, channel=channel, content=_said(text, actions), ts=now, meta=meta
+            )
+            self.gateway.note_response(result, event.id)
+            if sticker is not None:
+                self._record_sticker(body, channel, sticker, now)
         self._record_sent_images(body, channel, images, now)
         self._record_files(body, channel, files, now)
         return Reply(text, result, bundle, event, sticker, skill_calls=calls, images=images,
@@ -1160,14 +1197,22 @@ class Companion:
         return make
 
     def _record_sticker(
-        self, body: str, channel: str, sticker: Sticker, now: datetime | None
-    ) -> None:
-        self.ingest.record_self(
+        self,
+        body: str,
+        channel: str,
+        sticker: Sticker,
+        now: datetime | None,
+        *,
+        extra_meta: dict[str, object] | None = None,
+    ) -> Event:
+        meta = dict(extra_meta or {})
+        meta.update({"sticker": sticker.digest, "emotion": sticker.emotion})
+        return self.ingest.record_self(
             body=body,
             channel=channel,
             content=f"[表情包：{sticker.description}]",
             ts=now,
-            meta={"sticker": sticker.digest, "emotion": sticker.emotion},
+            meta=meta,
         )
 
     def _take_mood(
@@ -1179,13 +1224,20 @@ class Companion:
             self.life.note_mood(*mood, channel=channel, person_id=person_id, now=now)
         return text
 
-    def _choose_sticker(self, channel: str, emotion: str, now: datetime | None) -> Sticker | None:
+    def _choose_sticker(
+        self,
+        channel: str,
+        emotion: str,
+        now: datetime | None,
+        *,
+        force_prob: bool = False,
+    ) -> Sticker | None:
         cfg = self.config.stickers
         now = now or datetime.now(UTC)
         last = self._last_sticker.get(channel)
         if last is not None and (now - last).total_seconds() < cfg.min_interval_seconds:
             return None
-        if self._rng.random() >= cfg.send_probability:
+        if not force_prob and self._rng.random() >= cfg.send_probability:
             return None
         sticker = self.stickers.pick(emotion, embed=self._embed_quietly, rng=self._rng)
         if sticker is not None:
@@ -1283,13 +1335,15 @@ class Companion:
     ) -> tuple[str, str]:
         """保存并让主模型看一张图，返回（描述，图片哈希）。
 
-        表情包会同时判断情绪和是否适合收藏；适合的收进表情包库（群聊私聊共用）。
+        表情包（含未标 sub_type=1 的动图或明显表情包/梗图）会判断情绪与是否适合收藏；
+        适合的收进表情包库（群聊私聊共用）。
         """
         stored = self.media.save(data)
-        if sticker and self.config.stickers.enabled:
-            original = self.media.original_for(stored.digest)
+        stickers_on = self.config.stickers.enabled
+        original = self.media.original_for(stored.digest) if stickers_on else None
+        if stickers_on:
             known = self.stickers.get(stored.digest)
-            if known is not None:  # 收藏过的表情不用再看一遍
+            if known is not None:  # 收藏过的表情即使本次未带 sub_type=1 也直接复用
                 self.stickers.add(
                     stored.path,
                     stored.digest,
@@ -1299,6 +1353,10 @@ class Companion:
                     original=original,
                 )
                 return known.description, stored.digest
+        is_sticker_candidate = sticker or (
+            stickers_on and original is not None and is_animated(original)
+        )
+        if is_sticker_candidate and stickers_on:
             description, emotion, usable = media.describe_sticker(self.gateway, stored.path)
             log.info("看表情包（%s，%s）：%s", emotion, "收藏" if usable else "不收藏", description)
             if usable:
@@ -1308,6 +1366,20 @@ class Companion:
             return description, stored.digest
         description, backend = media.describe(self.gateway, stored.path)
         log.info("看图（%s）：%s", backend, description)
+        if stickers_on and _looks_like_sticker_desc(description):
+            try:
+                s_desc, emotion, usable = media.describe_sticker(self.gateway, stored.path)
+            except ModelError as e:
+                log.debug("静态表情包补判失败：%s", e)
+            else:
+                log.info(
+                    "补判表情包（%s，%s）：%s", emotion, "收藏" if usable else "不收藏", s_desc
+                )
+                if usable:
+                    self.stickers.add(
+                        stored.path, stored.digest, s_desc, emotion, person_id, original=original
+                    )
+                return s_desc or description, stored.digest
         return description, stored.digest
 
     def _drop_orphan_images(self, removed: list[Event]) -> None:

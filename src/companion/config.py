@@ -200,7 +200,7 @@ class StickerConfig(_Section):
     enabled: bool = True
     capacity: int = 300  # 库里最多存多少张，满了淘汰见得少、很久没见的
     min_library: int = 3  # 库里至少有这么多张，才告诉她可以发表情包
-    send_probability: float = 0.6  # 她想发时，真的发出去的概率
+    send_probability: float = 0.8  # 她想发时，真的发出去的概率（纯表情包回复不随机丢弃）
     min_interval_seconds: float = 120.0  # 同一个聊天里两次发表情的最短间隔
 
 
