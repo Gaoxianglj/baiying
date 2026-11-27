@@ -873,24 +873,47 @@ class QQBot:
                         src, call.task_id, text, list(dict.fromkeys([*result.files, *files]))
                     )
                 else:
-                    await self._send_reply(src, text)
+                    delivered = await self._send_reply(src, text)
                     for path in dict.fromkeys([*result.files, *files]):
-                        await self._send_file(src, path)
+                        delivered = (await self._send_file(src, path)) or delivered
+                    if delivered:
+                        await self._refresh_partner(src, ctx.person_id)
                 return
             if not result.ok:
                 log.warning("%s：后台技能没成功：%s", src.channel, result.text)
                 sent = await self._send(src, "（" + result.text[:80] + "）")
                 if call.task_id:
                     self.c.tasks.update(call.task_id, notified=sent)
+                if sent:
+                    await self._refresh_partner(src, ctx.person_id)
                 return
             paths = await self._call(self.c.deliver, "qq", src.channel, result, self.now())
             for path in paths:
                 await self._send_image(src, path)
+            if paths:
+                await self._refresh_partner(src, ctx.person_id)
             if call.task_id:
                 self.c.tasks.update(call.task_id, notified=True)
         finally:
             if call.task_id:
                 self._task_reporting.discard(call.task_id)
+
+    async def _refresh_partner(self, src: Source, person_id: str | None = None) -> None:
+        """群里交付后台任务、画图或提醒后，重新打开发起人的续聊窗口。"""
+        if src.message_type != "group":
+            return
+        user_ids: list[str] = [src.user_id] if src.user_id else []
+        if not user_ids and person_id:
+            person = await self._call(self.c.people.get, person_id)
+            if person is not None:
+                user_ids = [acc for acc in (person.accounts.get("qq") or []) if acc]
+        if not user_ids:
+            return
+        now = self.now()
+        partners = self._partners.setdefault(src.channel, {})
+        for uid in user_ids:
+            partners[uid] = now
+        self._followups[src.channel] = 0
 
     # ---- 防止和别的机器人无限对聊 ----
 
@@ -1437,12 +1460,14 @@ class QQBot:
         state = book.delivery_part(task_id, "text")
         if state in {"unknown", "sending"}:
             return
+        delivered = False
         if state != "sent":
             book.delivery_part(task_id, "text", "sending")
             sent = await self._send_reply(src, text)
             book.delivery_part(task_id, "text", "sent" if sent else "unknown")
             if not sent:
                 return
+            delivered = True
         row = book.get(
             task_id, SkillContext("qq", src.channel, "", src.message_type == "private", False)
         )
@@ -1474,7 +1499,10 @@ class QQBot:
             book.delivery_part(task_id, part, "sending")
             sent = await self._send_file(src, path)
             book.delivery_part(task_id, part, "sent" if sent else "unknown")
+            delivered = delivered or sent
             complete = complete and sent
+        if delivered:
+            await self._refresh_partner(src, row["person_id"])
         book.update(task_id, notified=bool(complete))
 
     async def _send_file(self, src: Source, path: Path) -> bool:

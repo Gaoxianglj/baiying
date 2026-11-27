@@ -479,3 +479,94 @@ def test_group_batch_keeps_primary_speaker_and_not_for_me_blocks_at_other(bot):
 
     asyncio.run(scenario())
     assert seen_ctx and seen_ctx[-1] == ("波奇", True)
+
+
+def test_group_background_task_delivery_refreshes_partner_window(bot):
+    from companion.skills.base import SkillCall, SkillResult
+
+    bot.cfg.unsolicited_probability = 0
+    # 1. 下单：主人 @白璎 发起后台任务，白璎先回一句排队中
+    run(bot, msg("帮我全文翻译", group=GROUP, user=OWNER, name="波奇", at_bot=True, mid=40))
+    sent_after_order = len(bot.client.sent)
+    assert sent_after_order == 1
+
+    # 2. 后台任务跑了 86 秒（快接近 90 秒，交付后再过 13 秒即超过下单时的 90 秒）
+    pid = bot.c.people.resolve("qq", OWNER)
+    assert pid is not None
+    src = bot._source(
+        msg("帮我全文翻译", group=GROUP, user=OWNER, name="波奇", at_bot=True, mid=40)
+    )
+    assert src is not None
+
+    async def deliver_task():
+        ctx = bot._make_skill_ctx(src, pid)
+        task_id = bot.c.tasks.create("后台任务", "后台任务", "翻译", ctx)
+        bot.c.tasks.update(task_id, state="completed", result="已译完")
+
+        def finish_later():
+            bot.clock["now"] = T0 + timedelta(seconds=86)
+            return SkillResult(text="已译完", ok=True, report=True)
+
+        bot._followups[src.channel] = bot.cfg.conversation_followups
+        call = SkillCall(
+            "后台任务", "后台任务", "翻译", True, 0.1, later=finish_later, task_id=task_id
+        )
+        await bot._run_later(src, ctx, call)
+
+    asyncio.run(deliver_task())
+    sent_after_delivery = len(bot.client.sent)
+    assert sent_after_delivery > sent_after_order
+
+    # 3. 交稿 13 秒后（距下单已 99 秒 > 90 秒），主人说“谢谢”不 @：仍应立刻接话
+    bot.clock["now"] = T0 + timedelta(seconds=99)
+    run(bot, msg("谢谢", group=GROUP, user=OWNER, name="波奇", mid=41))
+    assert len(bot.client.sent) == sent_after_delivery + 1
+
+
+def test_group_background_image_and_retry_notification_refresh_partner_window(bot, tmp_path):
+    from companion.skills.base import SkillCall, SkillResult
+
+    bot.cfg.unsolicited_probability = 0
+    pid = bot.c.people.ensure("qq", OWNER, "波奇")
+    img = tmp_path / "out.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    # 1. 后台画图耗时 120 秒交付：无需之前还在 90 秒窗口内，交图后立刻刷新发起人窗口
+    bot.clock["now"] = T0 + timedelta(seconds=120)
+    src = bot._source(msg("画一张", group=GROUP, user=OWNER, name="波奇", at_bot=True, mid=50))
+    assert src is not None
+
+    async def deliver_image():
+        ctx = bot._make_skill_ctx(src, pid)
+        bot.c.deliver = lambda body, channel, result, now: [img]
+        call = SkillCall(
+            "画画", "画画", "一株薄荷", True, 0.1, later=lambda: SkillResult(text="画好了", ok=True)
+        )
+        await bot._run_later(src, ctx, call)
+
+    asyncio.run(deliver_image())
+    sent_after_img = len(bot.client.sent)
+
+    bot.clock["now"] = T0 + timedelta(seconds=135)
+    run(bot, msg("好看，谢谢", group=GROUP, user=OWNER, name="波奇", mid=51))
+    assert len(bot.client.sent) == sent_after_img + 1
+
+    # 2. 模拟重启后 _task_notification_loop 补发（src.user_id 为空），按 person_id 还原发起人 QQ
+    bot._partners.clear()
+    bot.clock["now"] = T0 + timedelta(seconds=400)
+    loop_src = bot._source(msg("x", group=GROUP, user=OWNER, mid=52))
+    assert loop_src is not None
+
+    async def deliver_notification():
+        ctx = bot._make_skill_ctx(loop_src, pid)
+        task_id = bot.c.tasks.create("后台任务", "后台任务", "整理笔记", ctx)
+        bot.c.tasks.update(task_id, state="completed", result="整理好了")
+        loop_src.user_id = ""
+        await bot._send_task_result(loop_src, task_id, "任务完成：整理好了", [])
+
+    asyncio.run(deliver_notification())
+    sent_after_notify = len(bot.client.sent)
+
+    bot.clock["now"] = T0 + timedelta(seconds=415)
+    run(bot, msg("收到，辛苦了", group=GROUP, user=OWNER, name="波奇", mid=53))
+    assert len(bot.client.sent) == sent_after_notify + 1
